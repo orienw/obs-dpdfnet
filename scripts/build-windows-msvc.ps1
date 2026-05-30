@@ -5,7 +5,8 @@ param(
     [string]$OnnxRuntimeVersion = "1.26.0",
     [string]$ModelName = "dpdfnet8_48khz_hr",
     [string]$ObsInstallDir = "C:\Program Files\obs-studio",
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    [string]$PluginVersion = "0.2.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -198,6 +199,12 @@ Set-Content -Encoding ASCII -Path (Join-Path $GeneratedObs "obsconfig.h") -Value
 #define OBS_BETA 0
 "@
 
+Set-Content -Encoding ASCII -Path (Join-Path $GeneratedObs "plugin-version.h") -Value @"
+#pragma once
+#define PLUGIN_NAME "obs-dpdfnet"
+#define PLUGIN_VERSION "$PluginVersion"
+"@
+
 Import-VcVars64
 
 $obsDll = Join-Path $ObsInstallDir "bin\64bit\obs.dll"
@@ -251,6 +258,7 @@ $compileArgs = @(
     "/nologo",
     "/std:c++17",
     "/EHsc",
+    "/FI$(Join-Path $GeneratedObs 'plugin-version.h')",
     "/MD",
     "/O2",
     "/Zi",
