@@ -8,12 +8,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <deque>
-#include <filesystem>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -26,9 +26,88 @@ constexpr const char *SETTING_BYPASS = "bypass";
 
 constexpr uint64_t NS_PER_SECOND = 1000000000ULL;
 
+// Generous fixed capacity (~340 ms at 48 kHz) so the audio-thread ring buffers
+// never reallocate in steady state; the grow path only fires for a pathological
+// oversized packet.
+constexpr size_t RING_RESERVE_SAMPLES = 16384;
+constexpr size_t INFO_RESERVE = 256;
+
 struct PacketInfo {
   uint32_t frames = 0;
   uint64_t timestamp = 0;
+};
+
+// Fixed-capacity FIFO over a contiguous buffer. Unlike std::deque it allocates
+// and frees no node blocks under steady push/pop, so it is safe to drive from
+// the OBS audio callback. T must be trivially copyable (float, PacketInfo).
+template <typename T> class Ring {
+  static_assert(std::is_trivially_copyable_v<T>,
+                "Ring requires a trivially copyable element type");
+
+public:
+  void reserve(size_t cap) {
+    if (cap <= buf_.size())
+      return;
+    std::vector<T> next(cap);
+    if (count_) {
+      const size_t cur = buf_.size();
+      const size_t first = std::min(count_, cur - head_);
+      std::memcpy(next.data(), &buf_[head_], first * sizeof(T));
+      if (count_ > first)
+        std::memcpy(next.data() + first, buf_.data(),
+                    (count_ - first) * sizeof(T));
+    }
+    buf_.swap(next);
+    head_ = 0;
+  }
+
+  void clear() {
+    head_ = 0;
+    count_ = 0;
+  }
+
+  size_t size() const { return count_; }
+  size_t capacity() const { return buf_.size(); }
+  bool empty() const { return count_ == 0; }
+  const T &front() const { return buf_[head_]; }
+
+  void push(const T *src, size_t n) {
+    if (!n)
+      return;
+    ensure(count_ + n);
+    const size_t cap = buf_.size();
+    const size_t tail = (head_ + count_) % cap;
+    const size_t first = std::min(n, cap - tail);
+    std::memcpy(&buf_[tail], src, first * sizeof(T));
+    if (n > first)
+      std::memcpy(buf_.data(), src + first, (n - first) * sizeof(T));
+    count_ += n;
+  }
+
+  void push(const T &value) { push(&value, 1); }
+
+  void peek(T *dst, size_t n) const {
+    const size_t cap = buf_.size();
+    const size_t first = std::min(n, cap - head_);
+    std::memcpy(dst, &buf_[head_], first * sizeof(T));
+    if (n > first)
+      std::memcpy(dst + first, buf_.data(), (n - first) * sizeof(T));
+  }
+
+  void pop(size_t n) {
+    head_ = (head_ + n) % buf_.size();
+    count_ -= n;
+  }
+
+private:
+  void ensure(size_t need) {
+    if (need > buf_.size())
+      reserve(std::max(need, buf_.size() * 2 + 64));
+  }
+
+  std::vector<T> buf_;
+  size_t head_ = 0;
+  size_t count_ = 0;
 };
 
 std::string default_model_path() {
@@ -45,60 +124,112 @@ float db_to_amp(double db) {
   return static_cast<float>(std::pow(10.0, db / 20.0));
 }
 
-void clear_deque(std::deque<float> &queue) {
-  std::deque<float> empty;
-  queue.swap(empty);
-}
-
-void clear_packet_queue(std::deque<PacketInfo> &queue) {
-  std::deque<PacketInfo> empty;
-  queue.swap(empty);
-}
-
 class DpdfnetFilter {
 public:
   explicit DpdfnetFilter(obs_source_t *) {}
 
   void update(obs_data_t *settings) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // Serialize updates with each other (never with the audio thread, which
+    // only takes mutex_) so a slow model build cannot be clobbered by a newer
+    // update that finishes first.
+    std::lock_guard<std::mutex> update_lock(update_mutex_);
 
     const char *model_path = obs_data_get_string(settings, SETTING_MODEL_PATH);
-    model_path_ = model_path ? model_path : "";
-    if (model_path_.empty())
-      model_path_ = default_model_path();
+    std::string new_model_path = model_path ? model_path : "";
+    if (new_model_path.empty())
+      new_model_path = default_model_path();
 
-    attenuation_limit_db_ =
+    const double atten =
         obs_data_get_double(settings, SETTING_ATTENUATION_LIMIT_DB);
-    input_channel_ = static_cast<int>(
-        obs_data_get_int(settings, SETTING_INPUT_CHANNEL));
-    wet_mix_ = std::clamp(
+    const int channel =
+        static_cast<int>(obs_data_get_int(settings, SETTING_INPUT_CHANNEL));
+    const double wet = std::clamp(
         obs_data_get_double(settings, SETTING_WET_MIX) / 100.0, 0.0, 1.0);
-    output_gain_ =
+    const float gain =
         db_to_amp(obs_data_get_double(settings, SETTING_OUTPUT_GAIN_DB));
-    bypass_ = obs_data_get_bool(settings, SETTING_BYPASS);
+    const bool bypass = obs_data_get_bool(settings, SETTING_BYPASS);
 
     const uint32_t obs_rate = audio_output_get_sample_rate(obs_get_audio());
     const size_t obs_channels = std::clamp<size_t>(
         audio_output_get_channels(obs_get_audio()), 1, MAX_AV_PLANES);
-    if (obs_rate != sample_rate_ || obs_channels != channels_ ||
-        dry_buffers_.size() != obs_channels ||
-        output_storage_.size() != obs_channels) {
-      sample_rate_ = obs_rate;
-      channels_ = obs_channels;
-      resize_channel_buffers();
-      reset_stream_locked();
-      rate_warning_logged_ = false;
+
+    bool need_load;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      need_load = new_model_path != loaded_model_path_;
     }
 
-    if (model_path_ != loaded_model_path_) {
-      load_model_locked();
+    // Build the new session OFF the audio lock: constructing an Ort::Session
+    // for a multi-MB model is slow, and holding mutex_ through it would stall
+    // the OBS audio callback for the entire load on every settings change.
+    std::unique_ptr<DpdfnetModel> new_model;
+    std::unique_ptr<StreamingStft> new_stft;
+    bool load_attempted = false;
+    if (need_load && !new_model_path.empty()) {
+      load_attempted = true;
+      try {
+        new_model = std::make_unique<DpdfnetModel>(new_model_path);
+        new_stft = std::make_unique<StreamingStft>(new_model->n_fft(),
+                                                   new_model->hop_size());
+      } catch (const std::exception &ex) {
+        new_model.reset();
+        new_stft.reset();
+        blog(LOG_ERROR, "[obs-dpdfnet] failed to load model '%s': %s",
+             new_model_path.c_str(), ex.what());
+      }
     }
 
-    blog(LOG_INFO,
-         "[obs-dpdfnet] settings: input=%d max_suppression=%.1f dB "
-         "wet=%.0f%% gain=%.2f bypass=%s",
-         input_channel_, attenuation_limit_db_, wet_mix_ * 100.0,
-         output_gain_, bypass_ ? "true" : "false");
+    // Old session objects are moved out under the lock and destroyed AFTER it
+    // releases: ~Ort::Session / IoBinding teardown is not instant, and running
+    // it under mutex_ would stall the audio callback the same way the load did.
+    std::unique_ptr<DpdfnetModel> old_model;
+    std::unique_ptr<StreamingStft> old_stft;
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+
+      model_path_ = new_model_path;
+      attenuation_limit_db_ = atten;
+      input_channel_ = channel;
+      wet_mix_ = wet;
+      output_gain_ = gain;
+      bypass_ = bypass;
+      recompute_mix_locked();
+
+      if (obs_rate != sample_rate_ || obs_channels != channels_ ||
+          dry_buffers_.size() != obs_channels ||
+          output_storage_.size() != obs_channels) {
+        sample_rate_ = obs_rate;
+        channels_ = obs_channels;
+        resize_channel_buffers();
+        reset_stream_locked();
+        rate_warning_logged_ = false;
+      }
+
+      if (load_attempted) {
+        old_model = std::move(model_);
+        old_stft = std::move(stft_);
+        if (new_model) {
+          model_ = std::move(new_model);
+          stft_ = std::move(new_stft);
+          loaded_model_path_ = new_model_path;
+          resize_model_buffers_locked();
+          recompute_latency_locked();
+          reset_stream_locked();
+          blog(LOG_INFO, "[obs-dpdfnet] loaded %s (%s, %d Hz, hop %d)",
+               loaded_model_path_.c_str(), model_->profile().c_str(),
+               model_->sample_rate(), model_->hop_size());
+        } else {
+          loaded_model_path_.clear();
+        }
+      }
+
+      blog(LOG_INFO,
+           "[obs-dpdfnet] settings: input=%d max_suppression=%.1f dB "
+           "wet=%.0f%% gain=%.2f bypass=%s",
+           input_channel_, attenuation_limit_db_, wet_mix_ * 100.0,
+           output_gain_, bypass_ ? "true" : "false");
+    }
   }
 
   struct obs_audio_data *filter_audio(struct obs_audio_data *audio) {
@@ -125,7 +256,16 @@ public:
       reset_stream_locked();
     last_timestamp_ = audio->timestamp;
 
-    info_queue_.push_back(PacketInfo{audio->frames, audio->timestamp});
+    // Never grow a ring on the audio thread. If this packet would not fit the
+    // preallocated capacity (a pathological multi-hundred-ms packet, or a
+    // backlog that never drained), drop the buffered state and pass it through
+    // dry rather than allocate inside the callback.
+    if (!buffers_can_accept(audio->frames)) {
+      reset_stream_locked();
+      return audio;
+    }
+
+    info_queue_.push(PacketInfo{audio->frames, audio->timestamp});
     push_input(audio);
 
     try {
@@ -139,7 +279,7 @@ public:
     if (info_queue_.empty())
       return nullptr;
 
-    const PacketInfo &info = info_queue_.front();
+    const PacketInfo info = info_queue_.front();
     if (output_mono_.size() < info.frames ||
         !dry_buffers_have_frames(info.frames))
       return nullptr;
@@ -163,18 +303,54 @@ private:
     return diff > NS_PER_SECOND;
   }
 
+  void recompute_mix_locked() {
+    const double limit = std::clamp(attenuation_limit_db_, 0.0, 60.0);
+    attenuation_alpha_ = db_to_amp(-limit);
+    dry_gain_ = static_cast<float>((1.0 - wet_mix_) * output_gain_);
+    wet_gain_ = static_cast<float>(wet_mix_ * output_gain_);
+  }
+
+  void recompute_latency_locked() {
+    if (model_)
+      hop_latency_ns_ = static_cast<uint64_t>(
+          static_cast<double>(model_->hop_size()) /
+          static_cast<double>(model_->sample_rate()) * NS_PER_SECOND);
+  }
+
   void resize_channel_buffers() {
+    input_mono_.reserve(RING_RESERVE_SAMPLES);
+    output_mono_.reserve(RING_RESERVE_SAMPLES);
+    info_queue_.reserve(INFO_RESERVE);
+
     dry_buffers_.assign(channels_, {});
+    for (auto &buffer : dry_buffers_)
+      buffer.reserve(RING_RESERVE_SAMPLES);
+
     output_storage_.assign(channels_, {});
+    for (auto &storage : output_storage_)
+      storage.reserve(RING_RESERVE_SAMPLES);
+
+    mono_scratch_.reserve(RING_RESERVE_SAMPLES);
+    dry_scratch_.reserve(RING_RESERVE_SAMPLES);
+    enhanced_scratch_.reserve(RING_RESERVE_SAMPLES);
+    zero_scratch_.assign(RING_RESERVE_SAMPLES, 0.0f);
+
     output_audio_ = {};
   }
 
+  void resize_model_buffers_locked() {
+    if (!model_)
+      return;
+    frame_.assign(static_cast<size_t>(model_->n_fft()), 0.0f);
+    enhanced_hop_.assign(static_cast<size_t>(model_->hop_size()), 0.0f);
+  }
+
   void reset_stream_locked() {
-    clear_deque(input_mono_);
-    clear_deque(output_mono_);
+    input_mono_.clear();
+    output_mono_.clear();
     for (auto &buffer : dry_buffers_)
-      clear_deque(buffer);
-    clear_packet_queue(info_queue_);
+      buffer.clear();
+    info_queue_.clear();
 
     if (model_)
       model_->reset();
@@ -194,137 +370,130 @@ private:
     return true;
   }
 
-  void load_model_locked() {
-    model_.reset();
-    stft_.reset();
-    loaded_model_path_.clear();
-
-    try {
-      model_ = std::make_unique<DpdfnetModel>(model_path_);
-      stft_ =
-          std::make_unique<StreamingStft>(model_->n_fft(), model_->hop_size());
-      loaded_model_path_ = model_path_;
-      reset_stream_locked();
-
-      blog(LOG_INFO, "[obs-dpdfnet] loaded %s (%s, %d Hz, hop %d)",
-           loaded_model_path_.c_str(), model_->profile().c_str(),
-           model_->sample_rate(), model_->hop_size());
-    } catch (const std::exception &ex) {
-      model_.reset();
-      stft_.reset();
-      loaded_model_path_.clear();
-      blog(LOG_ERROR, "[obs-dpdfnet] failed to load model '%s': %s",
-           model_path_.c_str(), ex.what());
-    }
+  // True if buffering this packet stays within every ring's preallocated
+  // capacity, so no push() reallocates on the audio thread.
+  bool buffers_can_accept(uint32_t frames) const {
+    if (info_queue_.size() + 1 > info_queue_.capacity())
+      return false;
+    if (input_mono_.size() + frames > input_mono_.capacity())
+      return false;
+    // Upper bound on what synthesis can append before this packet drains.
+    if (output_mono_.size() + input_mono_.size() + frames >
+        output_mono_.capacity())
+      return false;
+    for (size_t channel = 0; channel < channels_; ++channel)
+      if (dry_buffers_[channel].size() + frames >
+          dry_buffers_[channel].capacity())
+        return false;
+    return true;
   }
 
   void push_input(struct obs_audio_data *audio) {
-    for (uint32_t frame = 0; frame < audio->frames; ++frame) {
+    const uint32_t frames = audio->frames;
+    const float *ch0 = reinterpret_cast<const float *>(audio->data[0]);
+
+    if (zero_scratch_.size() < frames)
+      zero_scratch_.assign(frames, 0.0f);
+
+    for (size_t channel = 0; channel < channels_; ++channel) {
+      const float *data =
+          reinterpret_cast<const float *>(audio->data[channel]);
+      if (data)
+        dry_buffers_[channel].push(data, frames);
+      else if (ch0)
+        dry_buffers_[channel].push(ch0, frames);
+      else
+        dry_buffers_[channel].push(zero_scratch_.data(), frames);
+    }
+
+    mono_scratch_.resize(frames);
+    const size_t selected_channel =
+        input_channel_ < 0 ? channels_ : static_cast<size_t>(input_channel_);
+
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+      const float fallback = ch0 ? ch0[frame] : 0.0f;
+      float selected = fallback;
+      bool have_selected = false;
       float mixed = 0.0f;
       size_t mixed_channels = 0;
-      float fallback_sample = 0.0f;
-      if (audio->data[0])
-        fallback_sample = reinterpret_cast<const float *>(audio->data[0])[frame];
-
-      float selected_sample = fallback_sample;
-      bool have_selected = false;
-      const size_t selected_channel =
-          input_channel_ < 0 ? channels_ : static_cast<size_t>(input_channel_);
 
       for (size_t channel = 0; channel < channels_; ++channel) {
-        const float *channel_data =
+        const float *data =
             reinterpret_cast<const float *>(audio->data[channel]);
-        const float sample = channel_data ? channel_data[frame] : fallback_sample;
-        dry_buffers_[channel].push_back(sample);
+        const float sample = data ? data[frame] : fallback;
         if (channel == selected_channel) {
-          selected_sample = sample;
+          selected = sample;
           have_selected = true;
         }
-        if (channel_data) {
+        if (data) {
           mixed += sample;
           ++mixed_channels;
         }
       }
 
-      if (input_channel_ >= 0 && have_selected)
-        input_mono_.push_back(selected_sample);
-      else
-        input_mono_.push_back(
-            mixed_channels ? mixed / static_cast<float>(mixed_channels)
-                           : fallback_sample);
+      mono_scratch_[frame] =
+          (input_channel_ >= 0 && have_selected)
+              ? selected
+              : (mixed_channels ? mixed / static_cast<float>(mixed_channels)
+                                : fallback);
     }
+
+    input_mono_.push(mono_scratch_.data(), frames);
   }
 
   void process_available_hops() {
     const size_t hop_size = static_cast<size_t>(model_->hop_size());
     const size_t window_size = static_cast<size_t>(model_->n_fft());
+    const size_t spec_n = model_->spectrum_size();
+    float *noisy_spec = model_->input_spectrum();
+    float *enhanced_spec = model_->output_spectrum();
+    const float alpha = attenuation_alpha_;
+    const float beta = 1.0f - alpha;
+
     while (input_mono_.size() >= window_size) {
-      std::vector<float> frame(window_size);
-      auto it = input_mono_.begin();
-      for (size_t i = 0; i < window_size; ++i, ++it)
-        frame[i] = *it;
+      input_mono_.peek(frame_.data(), window_size);
 
-      std::vector<float> noisy_spec;
-      std::vector<float> enhanced_spec;
-      std::vector<float> enhanced_hop;
+      stft_->analysis(frame_, noisy_spec);
+      model_->enhance();
+      for (size_t i = 0; i < spec_n; ++i)
+        enhanced_spec[i] = alpha * noisy_spec[i] + beta * enhanced_spec[i];
+      stft_->synthesis(enhanced_spec, enhanced_hop_);
 
-      stft_->analysis(frame, noisy_spec);
-      model_->enhance_spectrum(noisy_spec, enhanced_spec);
-      apply_attenuation_limit(noisy_spec, enhanced_spec);
-      stft_->synthesis(enhanced_spec, enhanced_hop);
-
-      for (float sample : enhanced_hop)
-        output_mono_.push_back(sample);
-      for (size_t i = 0; i < hop_size; ++i)
-        input_mono_.pop_front();
+      output_mono_.push(enhanced_hop_.data(), hop_size);
+      input_mono_.pop(hop_size);
     }
-  }
-
-  void apply_attenuation_limit(const std::vector<float> &noisy_spec,
-                               std::vector<float> &enhanced_spec) const {
-    const double limit = std::clamp(attenuation_limit_db_, 0.0, 60.0);
-    const float alpha = db_to_amp(-limit);
-
-    for (size_t i = 0; i < enhanced_spec.size(); ++i)
-      enhanced_spec[i] =
-          alpha * noisy_spec[i] + (1.0f - alpha) * enhanced_spec[i];
   }
 
   struct obs_audio_data *pop_output_packet(const PacketInfo &info) {
-    std::vector<float> enhanced(info.frames);
-    for (uint32_t i = 0; i < info.frames; ++i) {
-      enhanced[i] = output_mono_.front();
-      output_mono_.pop_front();
-    }
+    enhanced_scratch_.resize(info.frames);
+    output_mono_.peek(enhanced_scratch_.data(), info.frames);
+    output_mono_.pop(info.frames);
 
+    dry_scratch_.resize(info.frames);
     output_audio_ = {};
 
     for (size_t channel = 0; channel < channels_; ++channel) {
       output_storage_[channel].resize(info.frames);
-      for (uint32_t frame = 0; frame < info.frames; ++frame) {
-        const float dry = dry_buffers_[channel].front();
-        dry_buffers_[channel].pop_front();
+      dry_buffers_[channel].peek(dry_scratch_.data(), info.frames);
+      dry_buffers_[channel].pop(info.frames);
 
-        const float wet = enhanced[frame];
-        output_storage_[channel][frame] = static_cast<float>(
-            ((1.0 - wet_mix_) * dry + wet_mix_ * wet) * output_gain_);
-      }
+      for (uint32_t frame = 0; frame < info.frames; ++frame)
+        output_storage_[channel][frame] =
+            enhanced_scratch_[frame] * wet_gain_ + dry_scratch_[frame] * dry_gain_;
+
       output_audio_.data[channel] =
           reinterpret_cast<uint8_t *>(output_storage_[channel].data());
     }
 
     output_audio_.frames = info.frames;
-    output_audio_.timestamp =
-        info.timestamp - static_cast<uint64_t>(
-                             (static_cast<double>(model_->hop_size()) /
-                              static_cast<double>(model_->sample_rate())) *
-                             static_cast<double>(NS_PER_SECOND));
+    output_audio_.timestamp = info.timestamp - hop_latency_ns_;
 
-    info_queue_.pop_front();
+    info_queue_.pop(1);
     return &output_audio_;
   }
 
   std::mutex mutex_;
+  std::mutex update_mutex_;
 
   std::string model_path_;
   std::string loaded_model_path_;
@@ -334,6 +503,7 @@ private:
   uint32_t sample_rate_ = 0;
   size_t channels_ = 0;
   uint64_t last_timestamp_ = 0;
+  uint64_t hop_latency_ns_ = 0;
 
   double attenuation_limit_db_ = 24.0;
   int input_channel_ = 0;
@@ -342,11 +512,23 @@ private:
   bool bypass_ = false;
   bool rate_warning_logged_ = false;
 
-  std::deque<PacketInfo> info_queue_;
-  std::deque<float> input_mono_;
-  std::deque<float> output_mono_;
-  std::vector<std::deque<float>> dry_buffers_;
+  float attenuation_alpha_ = 0.0f;
+  float dry_gain_ = 0.0f;
+  float wet_gain_ = 1.0f;
+
+  Ring<PacketInfo> info_queue_;
+  Ring<float> input_mono_;
+  Ring<float> output_mono_;
+  std::vector<Ring<float>> dry_buffers_;
   std::vector<std::vector<float>> output_storage_;
+
+  std::vector<float> frame_;
+  std::vector<float> enhanced_hop_;
+  std::vector<float> mono_scratch_;
+  std::vector<float> dry_scratch_;
+  std::vector<float> enhanced_scratch_;
+  std::vector<float> zero_scratch_;
+
   struct obs_audio_data output_audio_ = {};
 };
 

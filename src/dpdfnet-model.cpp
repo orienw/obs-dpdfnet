@@ -3,7 +3,6 @@
 #include "dpdfnet-model.hpp"
 
 #include <algorithm>
-#include <array>
 #include <charconv>
 #include <cmath>
 #include <stdexcept>
@@ -82,60 +81,54 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
 
   spec_shape_ = {1, 1, freq_bins_, 2};
   state_shape_ = {state_size};
+
+  memory_info_ = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+  const size_t spec_n = static_cast<size_t>(freq_bins_) * 2;
+  in_spec_.assign(spec_n, 0.0f);
+  out_spec_.assign(spec_n, 0.0f);
+  state_a_ = initial_state_;
+  state_b_ = initial_state_;
+
+  spec_in_val_ = Ort::Value::CreateTensor<float>(
+      memory_info_, in_spec_.data(), in_spec_.size(), spec_shape_.data(),
+      spec_shape_.size());
+  spec_out_val_ = Ort::Value::CreateTensor<float>(
+      memory_info_, out_spec_.data(), out_spec_.size(), spec_shape_.data(),
+      spec_shape_.size());
+  state_a_val_ = Ort::Value::CreateTensor<float>(
+      memory_info_, state_a_.data(), state_a_.size(), state_shape_.data(),
+      state_shape_.size());
+  state_b_val_ = Ort::Value::CreateTensor<float>(
+      memory_info_, state_b_.data(), state_b_.size(), state_shape_.data(),
+      state_shape_.size());
+
+  // Two static bindings: enhance() alternates between them so the recurrent
+  // state output of one hop is the state input of the next without a copy.
+  binding_a_.emplace(*session_);
+  binding_a_->BindInput(in_spec_name_.c_str(), spec_in_val_);
+  binding_a_->BindInput(in_state_name_.c_str(), state_a_val_);
+  binding_a_->BindOutput(out_spec_name_.c_str(), spec_out_val_);
+  binding_a_->BindOutput(out_state_name_.c_str(), state_b_val_);
+
+  binding_b_.emplace(*session_);
+  binding_b_->BindInput(in_spec_name_.c_str(), spec_in_val_);
+  binding_b_->BindInput(in_state_name_.c_str(), state_b_val_);
+  binding_b_->BindOutput(out_spec_name_.c_str(), spec_out_val_);
+  binding_b_->BindOutput(out_state_name_.c_str(), state_a_val_);
+
   reset();
 }
 
-void DpdfnetModel::reset() { state_ = initial_state_; }
+void DpdfnetModel::reset() {
+  std::copy(initial_state_.begin(), initial_state_.end(), state_a_.begin());
+  parity_ = 0;
+}
 
-void DpdfnetModel::enhance_spectrum(const std::vector<float> &spec,
-                                    std::vector<float> &enhanced_spec) {
-  const size_t expected_spec = static_cast<size_t>(freq_bins_) * 2;
-  if (spec.size() != expected_spec)
-    throw std::runtime_error(
-        "DPDFNet spectrum size does not match model metadata");
-  if (state_.size() != initial_state_.size())
-    throw std::runtime_error("DPDFNet state was corrupted");
-
-  auto memory_info =
-      Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-  auto spec_input = Ort::Value::CreateTensor<float>(
-      memory_info, const_cast<float *>(spec.data()), spec.size(),
-      spec_shape_.data(), spec_shape_.size());
-  auto state_input =
-      Ort::Value::CreateTensor<float>(memory_info, state_.data(), state_.size(),
-                                      state_shape_.data(), state_shape_.size());
-
-  std::array<const char *, 2> input_names = {in_spec_name_.c_str(),
-                                             in_state_name_.c_str()};
-  std::array<const char *, 2> output_names = {out_spec_name_.c_str(),
-                                              out_state_name_.c_str()};
-  std::array<Ort::Value, 2> inputs = {std::move(spec_input),
-                                      std::move(state_input)};
-
-  auto outputs =
-      session_->Run(Ort::RunOptions{nullptr}, input_names.data(), inputs.data(),
-                    inputs.size(), output_names.data(), output_names.size());
-  if (outputs.size() != 2)
-    throw std::runtime_error(
-        "DPDFNet ONNX inference returned an unexpected output count");
-
-  auto spec_info = outputs[0].GetTensorTypeAndShapeInfo();
-  const size_t spec_count = spec_info.GetElementCount();
-  if (spec_count != expected_spec)
-    throw std::runtime_error(
-        "DPDFNet enhanced spectrum shape does not match input spectrum");
-
-  const float *spec_out = outputs[0].GetTensorData<float>();
-  enhanced_spec.assign(spec_out, spec_out + spec_count);
-
-  auto state_info = outputs[1].GetTensorTypeAndShapeInfo();
-  const size_t state_count = state_info.GetElementCount();
-  if (state_count != state_.size())
-    throw std::runtime_error(
-        "DPDFNet state output shape does not match input state");
-
-  const float *state_out = outputs[1].GetTensorData<float>();
-  std::copy(state_out, state_out + state_count, state_.begin());
+void DpdfnetModel::enhance() {
+  Ort::IoBinding &binding = parity_ == 0 ? *binding_a_ : *binding_b_;
+  session_->Run(Ort::RunOptions{nullptr}, binding);
+  parity_ ^= 1;
 }
 
 std::string DpdfnetModel::metadata_value(Ort::ModelMetadata &metadata,

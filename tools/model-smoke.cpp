@@ -17,8 +17,6 @@ int main(int argc, char **argv) {
     DpdfnetModel model(argv[1]);
     StreamingStft stft(model.n_fft(), model.hop_size());
 
-    std::vector<float> spec;
-    std::vector<float> enhanced_spec;
     std::vector<float> enhanced_hop;
 
     const size_t window_size = static_cast<size_t>(model.n_fft());
@@ -35,9 +33,9 @@ int main(int argc, char **argv) {
          start += hop_size) {
       std::vector<float> frame(input.begin() + start,
                                input.begin() + start + window_size);
-      stft.analysis(frame, spec);
-      model.enhance_spectrum(spec, enhanced_spec);
-      stft.synthesis(enhanced_spec, enhanced_hop);
+      stft.analysis(frame, model.input_spectrum());
+      model.enhance();
+      stft.synthesis(model.output_spectrum(), enhanced_hop);
     }
 
     double energy = 0.0;

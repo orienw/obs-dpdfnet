@@ -83,13 +83,11 @@ int main(int argc, char **argv) {
       while (input_buffer.size() >= window_size) {
         std::vector<float> frame(input_buffer.begin(),
                                  input_buffer.begin() + window_size);
-        std::vector<float> noisy_spec;
-        std::vector<float> enhanced_spec;
         std::vector<float> enhanced_hop;
 
-        stft.analysis(frame, noisy_spec);
-        model.enhance_spectrum(noisy_spec, enhanced_spec);
-        stft.synthesis(enhanced_spec, enhanced_hop);
+        stft.analysis(frame, model.input_spectrum());
+        model.enhance();
+        stft.synthesis(model.output_spectrum(), enhanced_hop);
 
         output.insert(output.end(), enhanced_hop.begin(), enhanced_hop.end());
         input_buffer.erase(
@@ -101,13 +99,11 @@ int main(int argc, char **argv) {
 
     if (!input_buffer.empty()) {
       input_buffer.resize(window_size, 0.0f);
-      std::vector<float> noisy_spec;
-      std::vector<float> enhanced_spec;
       std::vector<float> enhanced_hop;
 
-      stft.analysis(input_buffer, noisy_spec);
-      model.enhance_spectrum(noisy_spec, enhanced_spec);
-      stft.synthesis(enhanced_spec, enhanced_hop);
+      stft.analysis(input_buffer, model.input_spectrum());
+      model.enhance();
+      stft.synthesis(model.output_spectrum(), enhanced_hop);
       output.insert(output.end(), enhanced_hop.begin(), enhanced_hop.end());
     }
 

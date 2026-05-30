@@ -35,3 +35,6 @@ third_party/
 *.f32
 *.pcm
 *.wav
+
+# Local agent/tool state
+.context/

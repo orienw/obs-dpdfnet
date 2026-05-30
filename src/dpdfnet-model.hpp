@@ -4,8 +4,10 @@
 
 #include <onnxruntime_cxx_api.h>
 
+#include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -14,8 +16,17 @@ public:
   explicit DpdfnetModel(const std::filesystem::path &model_path);
 
   void reset();
-  void enhance_spectrum(const std::vector<float> &spec,
-                        std::vector<float> &enhanced_spec);
+
+  // Run one hop. The caller fills input_spectrum() with the noisy spectrum
+  // (interleaved [r,i]), calls enhance(), then reads the enhanced spectrum from
+  // output_spectrum(). Both buffers are bound as the ONNX tensors via IoBinding,
+  // so there is no per-hop tensor allocation or output copy; the recurrent state
+  // ping-pongs between two preallocated buffers instead of being copied back.
+  void enhance();
+
+  float *input_spectrum() { return in_spec_.data(); }
+  float *output_spectrum() { return out_spec_.data(); }
+  size_t spectrum_size() const { return in_spec_.size(); }
 
   int sample_rate() const { return sample_rate_; }
   int n_fft() const { return n_fft_; }
@@ -37,6 +48,7 @@ private:
   Ort::AllocatorWithDefaultOptions allocator_;
   Ort::SessionOptions session_options_;
   std::unique_ptr<Ort::Session> session_;
+  Ort::MemoryInfo memory_info_{nullptr};
 
   std::string in_spec_name_;
   std::string in_state_name_;
@@ -44,9 +56,20 @@ private:
   std::string out_state_name_;
 
   std::vector<float> initial_state_;
-  std::vector<float> state_;
+  std::vector<float> in_spec_;
+  std::vector<float> out_spec_;
+  std::vector<float> state_a_;
+  std::vector<float> state_b_;
   std::vector<int64_t> spec_shape_;
   std::vector<int64_t> state_shape_;
+
+  Ort::Value spec_in_val_{nullptr};
+  Ort::Value spec_out_val_{nullptr};
+  Ort::Value state_a_val_{nullptr};
+  Ort::Value state_b_val_{nullptr};
+  std::optional<Ort::IoBinding> binding_a_;
+  std::optional<Ort::IoBinding> binding_b_;
+  int parity_ = 0;
 
   int sample_rate_ = 48000;
   int n_fft_ = 960;
