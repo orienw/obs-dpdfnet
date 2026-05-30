@@ -1,0 +1,37 @@
+# Build outputs
+build/
+cmake-build-*/
+out/
+install/
+_deps/
+CMakeCache.txt
+CMakeFiles/
+Testing/
+
+# Downloaded dependencies and scratch downloads
+third_party/
+*.download
+
+# Visual Studio and local IDE state
+.vs/
+*.user
+*.suo
+*.opensdf
+*.VC.db
+
+# Native build artifacts
+*.dll
+*.dylib
+*.exe
+*.exp
+*.ilk
+*.lib
+*.map
+*.obj
+*.pdb
+*.so
+
+# Local audio/debug dumps
+*.f32
+*.pcm
+*.wav

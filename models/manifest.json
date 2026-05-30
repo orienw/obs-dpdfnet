@@ -1,0 +1,20 @@
+{
+    "updatedAt":  "2026-05-30T03:56:40.3253535Z",
+    "source":  "Ceva-IP/DPDFNet",
+    "revision":  "e3efebcb54d75b76681ad74f8c65ff8ae175cbfb",
+    "defaultModel":  "dpdfnet8_48khz_hr",
+    "models":  [
+                   {
+                       "name":  "dpdfnet8_48khz_hr",
+                       "file":  "onnx/dpdfnet8_48khz_hr.onnx",
+                       "sha256":  "7b3afbb260a08fe9af3d16e3bda992971be1e7e951d1dee7c2d235f5c43f5631",
+                       "size":  14857107
+                   },
+                   {
+                       "name":  "dpdfnet2_48khz_hr",
+                       "file":  "onnx/dpdfnet2_48khz_hr.onnx",
+                       "sha256":  "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+                       "size":  10493337
+                   }
+               ]
+}

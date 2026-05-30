@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.onnx binary
+*.dll binary
+*.dylib binary
+*.exe binary
+*.lib binary
+*.pdb binary
+*.so binary
+*.wav binary
