@@ -8,14 +8,13 @@
 
 namespace {
 std::vector<float> vorbis_window(int n_fft) {
-  constexpr double pi = 3.141592653589793238462643383279502884;
   std::vector<float> window(static_cast<size_t>(n_fft));
   const double half = static_cast<double>(n_fft) / 2.0;
 
   for (int i = 0; i < n_fft; ++i) {
-    const double s = std::sin(0.5 * pi * (static_cast<double>(i) + 0.5) / half);
+    const double s = std::sin(0.5 * kPi * (static_cast<double>(i) + 0.5) / half);
     window[static_cast<size_t>(i)] =
-        static_cast<float>(std::sin(0.5 * pi * s * s));
+        static_cast<float>(std::sin(0.5 * kPi * s * s));
   }
 
   return window;
@@ -25,7 +24,6 @@ std::vector<float> vorbis_window(int n_fft) {
 StreamingStft::StreamingStft(int n_fft, int hop_size)
     : n_fft_(n_fft), hop_size_(hop_size), freq_bins_(n_fft / 2 + 1),
       window_(vorbis_window(n_fft)),
-      input_buffer_(static_cast<size_t>(n_fft), 0.0f),
       time_frame_(static_cast<size_t>(n_fft), 0.0f),
       ola_buffer_(static_cast<size_t>(n_fft), 0.0f),
       spectrum_(static_cast<size_t>(freq_bins_)) {
@@ -46,36 +44,11 @@ StreamingStft::~StreamingStft() {
 }
 
 void StreamingStft::reset() {
-  std::fill(input_buffer_.begin(), input_buffer_.end(), 0.0f);
   std::fill(ola_buffer_.begin(), ola_buffer_.end(), 0.0f);
 }
 
-void StreamingStft::analysis(const std::vector<float> &hop,
+void StreamingStft::analysis(const std::vector<float> &frame,
                              std::vector<float> &spec_ri) {
-  if (hop.size() != static_cast<size_t>(hop_size_))
-    throw std::runtime_error("DPDFNet STFT received an unexpected hop size");
-
-  std::move(input_buffer_.begin() + hop_size_, input_buffer_.end(),
-            input_buffer_.begin());
-  std::copy(hop.begin(), hop.end(),
-            input_buffer_.begin() + (n_fft_ - hop_size_));
-
-  for (int i = 0; i < n_fft_; ++i)
-    time_frame_[static_cast<size_t>(i)] =
-        input_buffer_[static_cast<size_t>(i)] * window_[static_cast<size_t>(i)];
-
-  kiss_fftr(forward_, time_frame_.data(), spectrum_.data());
-
-  spec_ri.resize(static_cast<size_t>(freq_bins_) * 2);
-  for (int i = 0; i < freq_bins_; ++i) {
-    spec_ri[static_cast<size_t>(i) * 2] = spectrum_[static_cast<size_t>(i)].r;
-    spec_ri[static_cast<size_t>(i) * 2 + 1] =
-        spectrum_[static_cast<size_t>(i)].i;
-  }
-}
-
-void StreamingStft::analysis_frame(const std::vector<float> &frame,
-                                   std::vector<float> &spec_ri) {
   if (frame.size() != static_cast<size_t>(n_fft_))
     throw std::runtime_error("DPDFNet STFT received an unexpected frame size");
 

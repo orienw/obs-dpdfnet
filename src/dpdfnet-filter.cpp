@@ -25,8 +25,6 @@ constexpr const char *SETTING_OUTPUT_GAIN_DB = "output_gain_db";
 constexpr const char *SETTING_BYPASS = "bypass";
 
 constexpr uint64_t NS_PER_SECOND = 1000000000ULL;
-constexpr size_t MAX_DIAGNOSTIC_PACKETS = 8;
-constexpr size_t MAX_DIAGNOSTIC_WINDOWS = 60;
 
 struct PacketInfo {
   uint32_t frames = 0;
@@ -59,7 +57,7 @@ void clear_packet_queue(std::deque<PacketInfo> &queue) {
 
 class DpdfnetFilter {
 public:
-  explicit DpdfnetFilter(obs_source_t *source) : source_(source) {}
+  explicit DpdfnetFilter(obs_source_t *) {}
 
   void update(obs_data_t *settings) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -177,8 +175,6 @@ private:
     for (auto &buffer : dry_buffers_)
       clear_deque(buffer);
     clear_packet_queue(info_queue_);
-    diagnostic_packets_logged_ = 0;
-    reset_diagnostic_window();
 
     if (model_)
       model_->reset();
@@ -272,7 +268,7 @@ private:
       std::vector<float> enhanced_spec;
       std::vector<float> enhanced_hop;
 
-      stft_->analysis_frame(frame, noisy_spec);
+      stft_->analysis(frame, noisy_spec);
       model_->enhance_spectrum(noisy_spec, enhanced_spec);
       apply_attenuation_limit(noisy_spec, enhanced_spec);
       stft_->synthesis(enhanced_spec, enhanced_hop);
@@ -303,9 +299,6 @@ private:
 
     output_audio_ = {};
 
-    log_packet_stats(info, enhanced);
-    accumulate_window_stats(info, enhanced);
-
     for (size_t channel = 0; channel < channels_; ++channel) {
       output_storage_[channel].resize(info.frames);
       for (uint32_t frame = 0; frame < info.frames; ++frame) {
@@ -331,125 +324,6 @@ private:
     return &output_audio_;
   }
 
-  void log_packet_stats(const PacketInfo &info,
-                        const std::vector<float> &enhanced) {
-    if (diagnostic_packets_logged_ >= MAX_DIAGNOSTIC_PACKETS || channels_ == 0)
-      return;
-
-    double input_energy = 0.0;
-    double output_energy = 0.0;
-    const bool use_selected =
-        input_channel_ >= 0 && static_cast<size_t>(input_channel_) < channels_;
-
-    for (uint32_t frame = 0; frame < info.frames; ++frame) {
-      float input = 0.0f;
-
-      if (use_selected) {
-        input = dry_buffers_[static_cast<size_t>(input_channel_)][frame];
-      } else {
-        for (size_t channel = 0; channel < channels_; ++channel)
-          input += dry_buffers_[channel][frame];
-        input /= static_cast<float>(channels_);
-      }
-
-      const float output = enhanced[frame];
-      input_energy += static_cast<double>(input) * input;
-      output_energy += static_cast<double>(output) * output;
-    }
-
-    const double frames = static_cast<double>(std::max<uint32_t>(info.frames, 1));
-    const double input_rms = std::sqrt(input_energy / frames);
-    const double output_rms = std::sqrt(output_energy / frames);
-    const double change_db =
-        20.0 * std::log10((output_rms + 1.0e-12) / (input_rms + 1.0e-12));
-
-    blog(LOG_INFO,
-         "[obs-dpdfnet] output packet %zu: frames=%u input_rms=%.6f "
-         "output_rms=%.6f change=%.1f dB input=%d max_suppression=%.1f "
-         "wet=%.0f%% queued_hops=%zu",
-         diagnostic_packets_logged_ + 1, info.frames, input_rms, output_rms,
-         change_db, input_channel_, attenuation_limit_db_, wet_mix_ * 100.0,
-         output_mono_.size() / static_cast<size_t>(model_->hop_size()));
-
-    ++diagnostic_packets_logged_;
-  }
-
-  void reset_diagnostic_window() {
-    diagnostic_window_frames_ = 0;
-    diagnostic_window_input_energy_ = 0.0;
-    diagnostic_window_output_energy_ = 0.0;
-    diagnostic_window_channel_energy_.assign(channels_, 0.0);
-    diagnostic_windows_logged_ = 0;
-  }
-
-  void accumulate_window_stats(const PacketInfo &info,
-                               const std::vector<float> &enhanced) {
-    if (diagnostic_windows_logged_ >= MAX_DIAGNOSTIC_WINDOWS ||
-        channels_ == 0 || sample_rate_ == 0)
-      return;
-
-    if (diagnostic_window_channel_energy_.size() != channels_)
-      diagnostic_window_channel_energy_.assign(channels_, 0.0);
-
-    const bool use_selected =
-        input_channel_ >= 0 && static_cast<size_t>(input_channel_) < channels_;
-
-    for (uint32_t frame = 0; frame < info.frames; ++frame) {
-      float input = 0.0f;
-
-      if (use_selected) {
-        input = dry_buffers_[static_cast<size_t>(input_channel_)][frame];
-      } else {
-        for (size_t channel = 0; channel < channels_; ++channel)
-          input += dry_buffers_[channel][frame];
-        input /= static_cast<float>(channels_);
-      }
-
-      for (size_t channel = 0; channel < channels_; ++channel) {
-        const float sample = dry_buffers_[channel][frame];
-        diagnostic_window_channel_energy_[channel] +=
-            static_cast<double>(sample) * sample;
-      }
-
-      const float output = enhanced[frame];
-      diagnostic_window_input_energy_ += static_cast<double>(input) * input;
-      diagnostic_window_output_energy_ += static_cast<double>(output) * output;
-      ++diagnostic_window_frames_;
-    }
-
-    if (diagnostic_window_frames_ < sample_rate_)
-      return;
-
-    const double frames = static_cast<double>(diagnostic_window_frames_);
-    const double input_rms = std::sqrt(diagnostic_window_input_energy_ / frames);
-    const double output_rms =
-        std::sqrt(diagnostic_window_output_energy_ / frames);
-    const double change_db =
-        20.0 * std::log10((output_rms + 1.0e-12) / (input_rms + 1.0e-12));
-    const double ch1_rms =
-        channels_ > 0 ? std::sqrt(diagnostic_window_channel_energy_[0] / frames)
-                      : 0.0;
-    const double ch2_rms =
-        channels_ > 1 ? std::sqrt(diagnostic_window_channel_energy_[1] / frames)
-                      : 0.0;
-
-    blog(LOG_INFO,
-         "[obs-dpdfnet] live window %zu: frames=%zu selected_rms=%.6f "
-         "output_rms=%.6f change=%.1f dB ch1_rms=%.6f ch2_rms=%.6f "
-         "input=%d max_suppression=%.1f wet=%.0f%%",
-         diagnostic_windows_logged_ + 1, diagnostic_window_frames_, input_rms,
-         output_rms, change_db, ch1_rms, ch2_rms, input_channel_,
-         attenuation_limit_db_, wet_mix_ * 100.0);
-
-    ++diagnostic_windows_logged_;
-    diagnostic_window_frames_ = 0;
-    diagnostic_window_input_energy_ = 0.0;
-    diagnostic_window_output_energy_ = 0.0;
-    std::fill(diagnostic_window_channel_energy_.begin(),
-              diagnostic_window_channel_energy_.end(), 0.0);
-  }
-
-  obs_source_t *source_ = nullptr;
   std::mutex mutex_;
 
   std::string model_path_;
@@ -461,18 +335,12 @@ private:
   size_t channels_ = 0;
   uint64_t last_timestamp_ = 0;
 
-  double attenuation_limit_db_ = 6.0;
+  double attenuation_limit_db_ = 24.0;
   int input_channel_ = 0;
   double wet_mix_ = 1.0;
   float output_gain_ = 1.0f;
   bool bypass_ = false;
   bool rate_warning_logged_ = false;
-  size_t diagnostic_packets_logged_ = 0;
-  size_t diagnostic_windows_logged_ = 0;
-  size_t diagnostic_window_frames_ = 0;
-  double diagnostic_window_input_energy_ = 0.0;
-  double diagnostic_window_output_energy_ = 0.0;
-  std::vector<double> diagnostic_window_channel_energy_;
 
   std::deque<PacketInfo> info_queue_;
   std::deque<float> input_mono_;

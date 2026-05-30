@@ -13,8 +13,6 @@
 #include <vector>
 
 namespace {
-constexpr double kPi = 3.141592653589793238462643383279502884;
-
 std::vector<float> synthetic_input(int sample_rate, int seconds) {
   const size_t frames = static_cast<size_t>(sample_rate) *
                         static_cast<size_t>(seconds);
@@ -89,7 +87,7 @@ int main(int argc, char **argv) {
         std::vector<float> enhanced_spec;
         std::vector<float> enhanced_hop;
 
-        stft.analysis_frame(frame, noisy_spec);
+        stft.analysis(frame, noisy_spec);
         model.enhance_spectrum(noisy_spec, enhanced_spec);
         stft.synthesis(enhanced_spec, enhanced_hop);
 
@@ -107,7 +105,7 @@ int main(int argc, char **argv) {
       std::vector<float> enhanced_spec;
       std::vector<float> enhanced_hop;
 
-      stft.analysis_frame(input_buffer, noisy_spec);
+      stft.analysis(input_buffer, noisy_spec);
       model.enhance_spectrum(noisy_spec, enhanced_spec);
       stft.synthesis(enhanced_spec, enhanced_hop);
       output.insert(output.end(), enhanced_hop.begin(), enhanced_hop.end());

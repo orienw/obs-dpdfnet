@@ -5,7 +5,6 @@
 
 #include <cmath>
 #include <iostream>
-#include <numeric>
 #include <vector>
 
 int main(int argc, char **argv) {
@@ -22,17 +21,21 @@ int main(int argc, char **argv) {
     std::vector<float> enhanced_spec;
     std::vector<float> enhanced_hop;
 
-    for (int block = 0; block < 4; ++block) {
-      std::vector<float> hop(static_cast<size_t>(model.hop_size()));
-      for (size_t i = 0; i < hop.size(); ++i) {
-        const size_t absolute = static_cast<size_t>(block) * hop.size() + i;
-        const double t = static_cast<double>(absolute) /
-                         static_cast<double>(model.sample_rate());
-        hop[i] = static_cast<float>(
-            0.04 * std::sin(2.0 * 3.14159265358979323846 * 180.0 * t));
-      }
+    const size_t window_size = static_cast<size_t>(model.n_fft());
+    const size_t hop_size = static_cast<size_t>(model.hop_size());
 
-      stft.analysis(hop, spec);
+    std::vector<float> input(window_size * 4);
+    for (size_t i = 0; i < input.size(); ++i) {
+      const double t =
+          static_cast<double>(i) / static_cast<double>(model.sample_rate());
+      input[i] = static_cast<float>(0.04 * std::sin(2.0 * kPi * 180.0 * t));
+    }
+
+    for (size_t start = 0; start + window_size <= input.size();
+         start += hop_size) {
+      std::vector<float> frame(input.begin() + start,
+                               input.begin() + start + window_size);
+      stft.analysis(frame, spec);
       model.enhance_spectrum(spec, enhanced_spec);
       stft.synthesis(enhanced_spec, enhanced_hop);
     }
