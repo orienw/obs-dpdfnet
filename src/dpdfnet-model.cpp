@@ -20,6 +20,10 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
     throw std::runtime_error("ONNX model file does not exist: " +
                              model_path_.string());
 
+  name_ = model_path_.stem().string();
+  if (name_.empty())
+    name_ = model_path_.filename().string();
+
   session_options_.SetIntraOpNumThreads(1);
   session_options_.SetInterOpNumThreads(1);
   session_options_.SetGraphOptimizationLevel(

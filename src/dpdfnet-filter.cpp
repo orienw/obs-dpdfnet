@@ -188,7 +188,6 @@ public:
     {
       std::lock_guard<std::mutex> lock(mutex_);
 
-      model_path_ = new_model_path;
       attenuation_limit_db_ = atten;
       input_channel_ = channel;
       wet_mix_ = wet;
@@ -207,20 +206,26 @@ public:
       }
 
       if (load_attempted) {
-        old_model = std::move(model_);
-        old_stft = std::move(stft_);
         if (new_model) {
+          old_model = std::move(model_);
+          old_stft = std::move(stft_);
           model_ = std::move(new_model);
           stft_ = std::move(new_stft);
           loaded_model_path_ = new_model_path;
           resize_model_buffers_locked();
           recompute_latency_locked();
           reset_stream_locked();
-          blog(LOG_INFO, "[obs-dpdfnet] loaded %s (%s, %d Hz, hop %d)",
-               loaded_model_path_.c_str(), model_->profile().c_str(),
-               model_->sample_rate(), model_->hop_size());
+          blog(LOG_INFO,
+               "[obs-dpdfnet] loaded %s (model %s, metadata profile %s, %d Hz, "
+               "hop %d)",
+               loaded_model_path_.c_str(), model_->name().c_str(),
+               model_->profile().c_str(), model_->sample_rate(),
+               model_->hop_size());
         } else {
-          loaded_model_path_.clear();
+          blog(LOG_WARNING,
+               "[obs-dpdfnet] keeping previously loaded model after failed load: "
+               "%s",
+               loaded_model_path_.empty() ? "(none)" : loaded_model_path_.c_str());
         }
       }
 
@@ -406,14 +411,23 @@ private:
         dry_buffers_[channel].push(zero_scratch_.data(), frames);
     }
 
-    mono_scratch_.resize(frames);
-    const size_t selected_channel =
-        input_channel_ < 0 ? channels_ : static_cast<size_t>(input_channel_);
+    if (input_channel_ >= 0 &&
+        static_cast<size_t>(input_channel_) < channels_) {
+      const auto selected_channel = static_cast<size_t>(input_channel_);
+      const float *selected =
+          reinterpret_cast<const float *>(audio->data[selected_channel]);
+      if (selected)
+        input_mono_.push(selected, frames);
+      else if (ch0)
+        input_mono_.push(ch0, frames);
+      else
+        input_mono_.push(zero_scratch_.data(), frames);
+      return;
+    }
 
+    mono_scratch_.resize(frames);
     for (uint32_t frame = 0; frame < frames; ++frame) {
       const float fallback = ch0 ? ch0[frame] : 0.0f;
-      float selected = fallback;
-      bool have_selected = false;
       float mixed = 0.0f;
       size_t mixed_channels = 0;
 
@@ -421,10 +435,6 @@ private:
         const float *data =
             reinterpret_cast<const float *>(audio->data[channel]);
         const float sample = data ? data[frame] : fallback;
-        if (channel == selected_channel) {
-          selected = sample;
-          have_selected = true;
-        }
         if (data) {
           mixed += sample;
           ++mixed_channels;
@@ -432,10 +442,7 @@ private:
       }
 
       mono_scratch_[frame] =
-          (input_channel_ >= 0 && have_selected)
-              ? selected
-              : (mixed_channels ? mixed / static_cast<float>(mixed_channels)
-                                : fallback);
+          mixed_channels ? mixed / static_cast<float>(mixed_channels) : fallback;
     }
 
     input_mono_.push(mono_scratch_.data(), frames);
@@ -469,24 +476,43 @@ private:
     output_mono_.peek(enhanced_scratch_.data(), info.frames);
     output_mono_.pop(info.frames);
 
-    dry_scratch_.resize(info.frames);
     output_audio_ = {};
+    const bool mix_dry = dry_gain_ != 0.0f;
+    if (mix_dry)
+      dry_scratch_.resize(info.frames);
 
     for (size_t channel = 0; channel < channels_; ++channel) {
       output_storage_[channel].resize(info.frames);
-      dry_buffers_[channel].peek(dry_scratch_.data(), info.frames);
-      dry_buffers_[channel].pop(info.frames);
 
-      for (uint32_t frame = 0; frame < info.frames; ++frame)
-        output_storage_[channel][frame] =
-            enhanced_scratch_[frame] * wet_gain_ + dry_scratch_[frame] * dry_gain_;
+      if (mix_dry) {
+        dry_buffers_[channel].peek(dry_scratch_.data(), info.frames);
+        dry_buffers_[channel].pop(info.frames);
+
+        for (uint32_t frame = 0; frame < info.frames; ++frame) {
+          output_storage_[channel][frame] = enhanced_scratch_[frame] * wet_gain_ +
+                                           dry_scratch_[frame] * dry_gain_;
+        }
+      } else {
+        dry_buffers_[channel].pop(info.frames);
+        if (wet_gain_ == 1.0f) {
+          std::copy(enhanced_scratch_.begin(), enhanced_scratch_.end(),
+                    output_storage_[channel].begin());
+        } else {
+          for (uint32_t frame = 0; frame < info.frames; ++frame)
+            output_storage_[channel][frame] =
+                enhanced_scratch_[frame] * wet_gain_;
+        }
+      }
 
       output_audio_.data[channel] =
           reinterpret_cast<uint8_t *>(output_storage_[channel].data());
     }
 
     output_audio_.frames = info.frames;
-    output_audio_.timestamp = info.timestamp - hop_latency_ns_;
+    // Guard against unsigned underflow if a source stamps timestamps near zero.
+    output_audio_.timestamp = info.timestamp > hop_latency_ns_
+                                  ? info.timestamp - hop_latency_ns_
+                                  : 0;
 
     info_queue_.pop(1);
     return &output_audio_;
@@ -495,7 +521,6 @@ private:
   std::mutex mutex_;
   std::mutex update_mutex_;
 
-  std::string model_path_;
   std::string loaded_model_path_;
   std::unique_ptr<DpdfnetModel> model_;
   std::unique_ptr<StreamingStft> stft_;

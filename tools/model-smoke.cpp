@@ -44,7 +44,8 @@ int main(int argc, char **argv) {
     const double rms =
         std::sqrt(energy / static_cast<double>(enhanced_hop.size()));
 
-    std::cout << "profile=" << model.profile() << "\n";
+    std::cout << "model_name=" << model.name() << "\n";
+    std::cout << "metadata_profile=" << model.profile() << "\n";
     std::cout << "sample_rate=" << model.sample_rate() << "\n";
     std::cout << "n_fft=" << model.n_fft() << "\n";
     std::cout << "hop_size=" << model.hop_size() << "\n";
