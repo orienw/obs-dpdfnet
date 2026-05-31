@@ -23,6 +23,34 @@ Current filter:
 - Controls: model path, input channel, suppression limit, wet mix, output gain,
   bypass, reset state
 
+## Install A Release Build
+
+Requirements:
+
+- Windows 10/11 64-bit
+- OBS Studio x64
+- OBS audio sample rate set to 48 kHz
+
+Download the Windows x64 zip and `.sha256` file from the
+[GitHub releases](https://github.com/orienw/obs-dpdfnet/releases) page.
+
+To install:
+
+1. Close OBS Studio.
+2. Extract `obs-dpdfnet-<version>-windows-x64.zip`.
+3. Copy the extracted `obs-dpdfnet` folder into
+   `%ProgramData%\obs-studio\plugins\`.
+4. Confirm this file exists:
+   `%ProgramData%\obs-studio\plugins\obs-dpdfnet\bin\64bit\obs-dpdfnet.dll`
+5. Start OBS, then add the filter:
+   `Audio Mixer -> mic gear -> Filters -> + -> DPDFNet Noise Suppression`
+
+Optional checksum verification from PowerShell:
+
+```powershell
+Get-FileHash .\obs-dpdfnet-<version>-windows-x64.zip -Algorithm SHA256
+```
+
 ## Quick Start On Windows
 
 From PowerShell in this directory:
@@ -120,6 +148,32 @@ To refresh, rebuild, and install:
 ```powershell
 .\scripts\update-windows.ps1 -Build -Install
 ```
+
+## Release Workflow
+
+The Windows release flow is split in two: Windows PowerShell builds and stages
+the Windows artifact, then WSL publishes the GitHub tag and release with the
+GitHub auth configured for this checkout.
+
+From Windows PowerShell:
+
+```powershell
+.\scripts\release-windows.ps1 -Version 0.3.1 `
+  -Changelog @(
+    "Improved realtime audio processing."
+    "Fixed a model reload edge case."
+  )
+```
+
+That writes the zip, checksum, and release notes under `build/`.
+
+From WSL:
+
+```bash
+./scripts/publish-release-wsl.sh 0.3.1
+```
+
+For a draft release, add `--draft` to the WSL publish command.
 
 ## License
 

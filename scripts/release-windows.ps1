@@ -1,25 +1,25 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# End-to-end Windows release: build -> stage -> zip -> checksum -> notes ->
-# tag -> push -> GitHub release.
+# Windows release artifact staging: build -> stage -> zip -> checksum -> notes.
 #
-# Stages everything locally by default (dry run). Pass -Publish to actually
-# tag, push, and create the GitHub release. The version you pass is the single
-# source of truth: it is compiled into the DLL, names the zip, and becomes the
-# tag, so those three can never drift.
+# Run this from Windows PowerShell to produce the release zip and notes. Publish
+# from WSL with scripts/publish-release-wsl.sh so git/gh use the WSL GitHub auth
+# that is already configured for this checkout.
 #
-#   .\scripts\release-windows.ps1 -Version 0.2.1                 # dry run
-#   .\scripts\release-windows.ps1 -Version 0.2.1 -Publish        # ship it
-#   .\scripts\release-windows.ps1 -Version 0.2.1 -SkipBuild -Publish
+#   .\scripts\release-windows.ps1 -Version 0.3.1
+#   .\scripts\release-windows.ps1 -Version 0.3.1 -SkipBuild
+#   ./scripts/publish-release-wsl.sh 0.3.1
 
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$ObsVersion = "32.1.2",
     [string]$OnnxRuntimeVersion = "1.26.0",
     [string]$Repo = "orienw/obs-dpdfnet",
+    [string[]]$Changelog = @(),
     [switch]$PreRelease,
-    [switch]$Draft,
     [switch]$SkipBuild,
+    [switch]$Draft,
     [switch]$Publish
 )
 
@@ -27,6 +27,10 @@ $ErrorActionPreference = "Stop"
 
 if ($Version -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
     throw "Version '$Version' must look like 0.2.1 or 0.3.0-rc1."
+}
+
+if ($Publish -or $Draft) {
+    throw "Publishing moved to WSL. First run this script without -Publish/-Draft, then run: ./scripts/publish-release-wsl.sh $Version"
 }
 
 # 0.x or a -suffix is a pre-release unless this is a clean 1.0.0+ tag.
@@ -112,21 +116,33 @@ Compress-Archive -Path $PluginStage, (Join-Path $Staging "INSTALL.txt") -Destina
 $Sha = (Get-FileHash -Algorithm SHA256 -Path $ZipPath).Hash.ToLowerInvariant()
 "$Sha  $ZipName" | Set-Content -Encoding ASCII "$ZipPath.sha256"
 
-# 6. Release notes.
+# 6. Release notes. Keep reusable install instructions in README.md.
 $Kind = if ($IsPreRelease) { "Early pre-release" } else { "Release" }
+$CleanChangelog = @($Changelog | Where-Object { ![string]::IsNullOrWhiteSpace($_) })
+$ChangelogSection = ""
+if ($CleanChangelog.Count -gt 0) {
+    $ChangelogLines = ($CleanChangelog | ForEach-Object {
+        $Item = $_.Trim()
+        if ($Item.StartsWith("- ")) { $Item } else { "- $Item" }
+    }) -join "`r`n"
+
+    $ChangelogSection = @"
+
+## What's Changed
+
+$ChangelogLines
+"@
+}
+
+$ReadmeInstallUrl = "https://github.com/$Repo#install-a-release-build"
 $Notes = @"
 $Kind of **obs-dpdfnet**, a native OBS audio filter for local DPDFNet speech enhancement. Audio is processed locally; the plugin makes no network requests at runtime.
+$ChangelogSection
 
-## Install (Windows x64)
+## Install
 
-1. Close OBS Studio.
-2. Extract ``$ZipName`` and copy the ``obs-dpdfnet`` folder into ``%ProgramData%\obs-studio\plugins\``.
-3. Start OBS and add: **Audio Mixer -> mic gear -> Filters -> + -> DPDFNet Noise Suppression**.
-
-## Requirements
-
-- OBS Studio $ObsVersion (x64), Windows 10/11 64-bit
-- OBS audio sample rate set to **48 kHz**
+See the Windows release install instructions in the README:
+$ReadmeInstallUrl
 
 ## Notes
 
@@ -154,44 +170,6 @@ Write-Host "  zip:    $ZipPath"
 Write-Host "  sha256: $Sha"
 Write-Host "  notes:  $NotesPath"
 Write-Host "  tag:    $Tag (prerelease=$IsPreRelease)"
-
-if (-not $Publish) {
-    Write-Host ""
-    Write-Host "Dry run. Re-run with -Publish to tag, push, and create the GitHub release."
-    return
-}
-
-# 7. Publish preconditions: clean tree, HEAD pushed, tag free.
-if (git -C $Root status --porcelain) {
-    throw "Working tree is not clean. Commit or stash before publishing."
-}
-$Branch = (git -C $Root rev-parse --abbrev-ref HEAD).Trim()
-git -C $Root fetch origin $Branch 2>$null | Out-Null
-$Head = (git -C $Root rev-parse HEAD).Trim()
-$RemoteHead = (git -C $Root rev-parse "origin/$Branch").Trim()
-if ($Head -ne $RemoteHead) {
-    throw "HEAD ($Head) is not pushed to origin/$Branch ($RemoteHead). Push first."
-}
-if (git -C $Root tag -l $Tag) {
-    throw "Tag $Tag already exists. Bump the version or delete the tag."
-}
-
-# 8. Tag + push.
-git -C $Root tag -a $Tag -m "obs-dpdfnet $Version"
-git -C $Root push origin $Tag
-
-# 9. GitHub release.
-$GhArgs = @(
-    "release", "create", $Tag,
-    "-R", $Repo,
-    "--title", "obs-dpdfnet $Version",
-    "--notes-file", $NotesPath
-)
-if ($IsPreRelease) { $GhArgs += "--prerelease" }
-if ($Draft) { $GhArgs += "--draft" }
-$GhArgs += $ZipPath
-$GhArgs += "$ZipPath.sha256"
-
-& gh @GhArgs
 Write-Host ""
-Write-Host "Released $Tag"
+Write-Host "Publish from WSL with:"
+Write-Host "  ./scripts/publish-release-wsl.sh $Version"
