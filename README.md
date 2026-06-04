@@ -94,6 +94,10 @@ filter bypasses and logs a warning. The bundled models expect 48 kHz.
 
 ## CMake Build
 
+The PowerShell scripts above are the tested Windows release path. CMake is the
+manual source-build path for contributors, custom OBS development builds, and
+Linux/macOS experiments.
+
 Requirements:
 
 - OBS Studio development files with `libobsConfig.cmake`
@@ -106,6 +110,14 @@ The official OBS installer may not include the development CMake package. If
 CMake cannot find `libobs`, build against an OBS source/build tree or an OBS
 plugin development package.
 
+By default, CMake installs into OBS's source-build style layout:
+`obs-plugins/64bit` and `data/obs-plugins/obs-dpdfnet`. Override
+`DPDFNET_PLUGIN_DESTINATION` and `DPDFNET_DATA_DESTINATION` if your OBS package
+uses different paths. CMake also copies the ONNX Runtime shared libraries it
+finds next to built targets and installs them with the plugin; disable that with
+`-DDPDFNET_COPY_RUNTIME_DEPENDENCIES=OFF` or
+`-DDPDFNET_INSTALL_RUNTIME_DEPENDENCIES=OFF`.
+
 Example Windows configure:
 
 ```powershell
@@ -117,6 +129,17 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
 
 cmake --build build --config Release
 .\scripts\install-windows.ps1 -BuildDir .\build
+```
+
+Example Linux/macOS configure:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -Dlibobs_DIR="/path/to/obs-studio/build/libobs" \
+  -DONNXRUNTIME_ROOT="/path/to/onnxruntime"
+
+cmake --build build
+cmake --install build --prefix "/path/to/obs-prefix"
 ```
 
 Optional standalone model smoke test:
