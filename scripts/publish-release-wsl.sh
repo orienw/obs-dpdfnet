@@ -85,6 +85,7 @@ zip_name="obs-dpdfnet-$version-windows-x64.zip"
 zip_path="$root/build/$zip_name"
 sha_path="$zip_path.sha256"
 notes_path="$root/build/release-notes-v$version.md"
+commit_path="$root/build/release-commit-v$version.txt"
 
 command -v git >/dev/null || die "git is required"
 command -v gh >/dev/null || die "GitHub CLI is required"
@@ -92,6 +93,7 @@ command -v gh >/dev/null || die "GitHub CLI is required"
 [[ -f "$zip_path" ]] || die "missing release zip: $zip_path"
 [[ -f "$sha_path" ]] || die "missing checksum file: $sha_path"
 [[ -f "$notes_path" ]] || die "missing release notes: $notes_path"
+[[ -f "$commit_path" ]] || die "missing release commit file: $commit_path"
 
 expected_sha="$(awk '{print $1; exit}' "$sha_path")"
 actual_sha="$(sha256sum "$zip_path" | awk '{print $1}')"
@@ -104,9 +106,15 @@ actual_sha="$(sha256sum "$zip_path" | awk '{print $1}')"
 branch="$(git -C "$root" rev-parse --abbrev-ref HEAD)"
 [[ "$branch" != "HEAD" ]] || die "cannot publish from a detached HEAD"
 
+staged_commit="$(tr -d '[:space:]' < "$commit_path")"
+[[ -n "$staged_commit" ]] ||
+  die "release commit file is empty: $commit_path"
+
 git -C "$root" fetch origin "$branch" >/dev/null
 head_sha="$(git -C "$root" rev-parse HEAD)"
 remote_sha="$(git -C "$root" rev-parse "origin/$branch")"
+[[ "$staged_commit" == "$head_sha" ]] ||
+  die "staged zip was built from a different commit ($staged_commit); current HEAD is $head_sha. Re-run scripts/release-windows.ps1."
 [[ "$head_sha" == "$remote_sha" ]] ||
   die "HEAD ($head_sha) is not pushed to origin/$branch ($remote_sha)"
 

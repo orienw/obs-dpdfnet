@@ -258,6 +258,7 @@ $compileArgs = @(
     "/nologo",
     "/std:c++17",
     "/EHsc",
+    "/W4",
     "/FI$(Join-Path $GeneratedObs 'plugin-version.h')",
     "/MD",
     "/O2",
@@ -284,5 +285,28 @@ if ($LASTEXITCODE -ne 0) {
 Remove-Item (Join-Path $OutputDir "onnxruntime.dll") -Force -ErrorAction SilentlyContinue
 Copy-Item $onnxDll -Destination (Join-Path $OutputDir $onnxRenamedDll) -Force
 Copy-Item (Join-Path $onnxRoot "lib\onnxruntime_providers_shared.dll") -Destination $OutputDir -Force
+
+# Record which commit produced this DLL so release staging can stamp the
+# artifact truthfully even with -SkipBuild. A dirty tree is recorded as such
+# and release-windows.ps1 refuses to stage it.
+$SourceCommitFile = Join-Path $OutputDir "source-commit.txt"
+Remove-Item $SourceCommitFile -Force -ErrorAction SilentlyContinue
+$Git = Get-Command git.exe -ErrorAction SilentlyContinue
+if ($Git) {
+    # Capture before selecting: an inline `| Select-Object -First 1` stops the
+    # pipeline early and clobbers git's exit code with -1.
+    $GitOutput = & $Git.Source -C $Root rev-parse HEAD
+    if ($LASTEXITCODE -eq 0 -and $GitOutput) {
+        $GitSha = @($GitOutput)[0].Trim().ToLowerInvariant()
+        $GitDirty = & $Git.Source -C $Root status --porcelain
+        if ($LASTEXITCODE -eq 0) {
+            if ($GitDirty) { $GitSha = "$GitSha-dirty" }
+            Set-Content -Encoding ASCII -Path $SourceCommitFile -Value $GitSha
+        }
+    }
+}
+if (!(Test-Path $SourceCommitFile)) {
+    Write-Warning "Could not record the build's source commit; release staging will require -SourceCommit."
+}
 
 Write-Host "Built $pluginDll"

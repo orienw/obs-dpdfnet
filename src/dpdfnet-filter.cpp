@@ -3,6 +3,11 @@
 #include "dpdfnet-model.hpp"
 #include "stft.hpp"
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <pmmintrin.h>
+#include <xmmintrin.h>
+#endif
+
 #include <obs-module.h>
 
 #include <algorithm>
@@ -36,6 +41,24 @@ struct PacketInfo {
   uint32_t frames = 0;
   uint64_t timestamp = 0;
 };
+
+#if defined(_M_X64) || defined(__x86_64__)
+constexpr unsigned int MXCSR_FLUSH_ZERO = 0x8000;
+constexpr unsigned int MXCSR_DENORMALS_ZERO = 0x0040;
+
+struct DenormalModeGuard {
+  DenormalModeGuard() : mxcsr_(_mm_getcsr()) {
+    _mm_setcsr(mxcsr_ | MXCSR_FLUSH_ZERO | MXCSR_DENORMALS_ZERO);
+  }
+
+  ~DenormalModeGuard() { _mm_setcsr(mxcsr_); }
+
+private:
+  unsigned int mxcsr_;
+};
+#else
+struct DenormalModeGuard {};
+#endif
 
 // Fixed-capacity FIFO over a contiguous buffer. Unlike std::deque it allocates
 // and frees no node blocks under steady push/pop, so it is safe to drive from
@@ -154,9 +177,15 @@ public:
         audio_output_get_channels(obs_get_audio()), 1, MAX_AV_PLANES);
 
     bool need_load;
+    bool skip_failed_model_load;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      if (!failed_model_path_.empty() &&
+          new_model_path != failed_model_path_)
+        failed_model_path_.clear();
       need_load = new_model_path != loaded_model_path_;
+      skip_failed_model_load =
+          need_load && new_model_path == failed_model_path_;
     }
 
     // Build the new session OFF the audio lock: constructing an Ort::Session
@@ -165,7 +194,7 @@ public:
     std::unique_ptr<DpdfnetModel> new_model;
     std::unique_ptr<StreamingStft> new_stft;
     bool load_attempted = false;
-    if (need_load && !new_model_path.empty()) {
+    if (need_load && !skip_failed_model_load && !new_model_path.empty()) {
       load_attempted = true;
       try {
         new_model = std::make_unique<DpdfnetModel>(new_model_path);
@@ -179,11 +208,26 @@ public:
       }
     }
 
+    std::string loaded_model_name;
+    std::string loaded_model_profile;
+    int loaded_model_rate = 0;
+    int loaded_model_hop = 0;
+    if (new_model) {
+      loaded_model_name = new_model->name();
+      loaded_model_profile = new_model->profile();
+      loaded_model_rate = new_model->sample_rate();
+      loaded_model_hop = new_model->hop_size();
+    }
+
     // Old session objects are moved out under the lock and destroyed AFTER it
     // releases: ~Ort::Session / IoBinding teardown is not instant, and running
     // it under mutex_ would stall the audio callback the same way the load did.
     std::unique_ptr<DpdfnetModel> old_model;
     std::unique_ptr<StreamingStft> old_stft;
+    bool log_model_loaded = false;
+    bool log_keep_model = false;
+    std::string log_loaded_model_path;
+    std::string log_keep_model_path;
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -212,36 +256,60 @@ public:
           model_ = std::move(new_model);
           stft_ = std::move(new_stft);
           loaded_model_path_ = new_model_path;
+          failed_model_path_.clear();
           resize_model_buffers_locked();
           recompute_latency_locked();
           reset_stream_locked();
-          blog(LOG_INFO,
-               "[obs-dpdfnet] loaded %s (model %s, metadata profile %s, %d Hz, "
-               "hop %d)",
-               loaded_model_path_.c_str(), model_->name().c_str(),
-               model_->profile().c_str(), model_->sample_rate(),
-               model_->hop_size());
+          process_error_logged_ = false;
+          log_model_loaded = true;
+          log_loaded_model_path = loaded_model_path_;
         } else {
-          blog(LOG_WARNING,
-               "[obs-dpdfnet] keeping previously loaded model after failed load: "
-               "%s",
-               loaded_model_path_.empty() ? "(none)" : loaded_model_path_.c_str());
+          failed_model_path_ = new_model_path;
+          log_keep_model = true;
+          log_keep_model_path =
+              loaded_model_path_.empty() ? "(none)" : loaded_model_path_;
         }
       }
-
-      blog(LOG_INFO,
-           "[obs-dpdfnet] settings: input=%d max_suppression=%.1f dB "
-           "wet=%.0f%% gain=%.2f bypass=%s",
-           input_channel_, attenuation_limit_db_, wet_mix_ * 100.0,
-           output_gain_, bypass_ ? "true" : "false");
     }
+
+    if (log_model_loaded) {
+      blog(LOG_INFO,
+           "[obs-dpdfnet] loaded %s (model %s, metadata profile %s, %d Hz, "
+           "hop %d)",
+           log_loaded_model_path.c_str(), loaded_model_name.c_str(),
+           loaded_model_profile.c_str(), loaded_model_rate, loaded_model_hop);
+    } else if (log_keep_model) {
+      blog(LOG_WARNING,
+           "[obs-dpdfnet] keeping previously loaded model after failed load: %s",
+           log_keep_model_path.c_str());
+    }
+
+    blog(LOG_INFO,
+         "[obs-dpdfnet] settings: input=%d max_suppression=%.1f dB "
+         "wet=%.0f%% gain=%.2f bypass=%s",
+         channel, atten, wet * 100.0, gain, bypass ? "true" : "false");
   }
 
   struct obs_audio_data *filter_audio(struct obs_audio_data *audio) {
+    [[maybe_unused]] DenormalModeGuard denormal_guard;
+
     if (!audio || !audio->frames)
       return audio;
 
     std::lock_guard<std::mutex> lock(mutex_);
+
+    const uint32_t obs_rate = audio_output_get_sample_rate(obs_get_audio());
+    const size_t obs_channels = std::clamp<size_t>(
+        audio_output_get_channels(obs_get_audio()), 1, MAX_AV_PLANES);
+    if (obs_rate != sample_rate_ || obs_channels != channels_) {
+      // OBS rebuilds the audio graph on settings changes; this resize only runs
+      // on that rare reconfiguration, not during steady-state packets.
+      sample_rate_ = obs_rate;
+      channels_ = obs_channels;
+      resize_channel_buffers();
+      reset_stream_locked();
+      rate_warning_logged_ = false;
+    }
 
     if (bypass_ || !model_ || !stft_)
       return audio;
@@ -274,9 +342,14 @@ public:
     push_input(audio);
 
     try {
-      process_available_hops();
+      const size_t processed_hops = process_available_hops();
+      if (processed_hops)
+        process_error_logged_ = false;
     } catch (const std::exception &ex) {
-      blog(LOG_ERROR, "[obs-dpdfnet] processing failed: %s", ex.what());
+      if (!process_error_logged_) {
+        blog(LOG_ERROR, "[obs-dpdfnet] processing failed: %s", ex.what());
+        process_error_logged_ = true;
+      }
       reset_stream_locked();
       return audio;
     }
@@ -294,6 +367,11 @@ public:
 
   void reset_state() {
     std::lock_guard<std::mutex> lock(mutex_);
+    // The reset button doubles as the retry affordance: forget a failed model
+    // path and a logged processing failure so the next update() or packet gets
+    // a fresh attempt (and a fresh log line) without toggling paths.
+    failed_model_path_.clear();
+    process_error_logged_ = false;
     reset_stream_locked();
   }
 
@@ -448,7 +526,7 @@ private:
     input_mono_.push(mono_scratch_.data(), frames);
   }
 
-  void process_available_hops() {
+  size_t process_available_hops() {
     const size_t hop_size = static_cast<size_t>(model_->hop_size());
     const size_t window_size = static_cast<size_t>(model_->n_fft());
     const size_t spec_n = model_->spectrum_size();
@@ -456,6 +534,7 @@ private:
     float *enhanced_spec = model_->output_spectrum();
     const float alpha = attenuation_alpha_;
     const float beta = 1.0f - alpha;
+    size_t processed_hops = 0;
 
     while (input_mono_.size() >= window_size) {
       input_mono_.peek(frame_.data(), window_size);
@@ -468,7 +547,10 @@ private:
 
       output_mono_.push(enhanced_hop_.data(), hop_size);
       input_mono_.pop(hop_size);
+      ++processed_hops;
     }
+
+    return processed_hops;
   }
 
   struct obs_audio_data *pop_output_packet(const PacketInfo &info) {
@@ -522,6 +604,7 @@ private:
   std::mutex update_mutex_;
 
   std::string loaded_model_path_;
+  std::string failed_model_path_;
   std::unique_ptr<DpdfnetModel> model_;
   std::unique_ptr<StreamingStft> stft_;
 
@@ -536,6 +619,7 @@ private:
   float output_gain_ = 1.0f;
   bool bypass_ = false;
   bool rate_warning_logged_ = false;
+  bool process_error_logged_ = false;
 
   float attenuation_alpha_ = 0.0f;
   float dry_gain_ = 0.0f;

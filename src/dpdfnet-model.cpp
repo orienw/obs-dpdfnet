@@ -69,6 +69,18 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
     throw std::runtime_error(
         "DPDFNet model metadata has inconsistent state dimensions");
   }
+  if (sample_rate_ < 8000 || sample_rate_ > 384000)
+    throw std::runtime_error(
+        "DPDFNet model metadata sample_rate is out of supported range");
+  if (n_fft_ < 64 || n_fft_ > 8192)
+    throw std::runtime_error(
+        "DPDFNet model metadata n_fft is out of supported range");
+  if (hop_size_ > n_fft_)
+    throw std::runtime_error(
+        "DPDFNet model metadata hop_length is larger than n_fft");
+  if (state_size > 8'000'000)
+    throw std::runtime_error(
+        "DPDFNet model metadata state_size is out of supported range");
 
   initial_state_.assign(static_cast<size_t>(state_size), 0.0f);
 

@@ -2,14 +2,6 @@
 
 #include <obs-module.h>
 
-#ifndef PLUGIN_NAME
-#define PLUGIN_NAME "obs-dpdfnet"
-#endif
-
-#ifndef PLUGIN_VERSION
-#define PLUGIN_VERSION "0.2.0"
-#endif
-
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 

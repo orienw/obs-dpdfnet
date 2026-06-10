@@ -125,7 +125,7 @@ function Update-DpdfnetModels {
             Write-Host "Downloading $modelName"
             $tmpPath = "$modelPath.download"
             Invoke-WebRequest `
-                -Uri "https://huggingface.co/Ceva-IP/DPDFNet/resolve/main/$repoFile" `
+                -Uri "https://huggingface.co/Ceva-IP/DPDFNet/resolve/$($repo.sha)/$repoFile" `
                 -OutFile $tmpPath
 
             $downloadHash = Get-Sha256 -Path $tmpPath
