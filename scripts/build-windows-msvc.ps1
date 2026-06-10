@@ -6,7 +6,7 @@ param(
     [string]$ModelName = "dpdfnet8_48khz_hr",
     [string]$ObsInstallDir = "C:\Program Files\obs-studio",
     [string]$Configuration = "Release",
-    [string]$PluginVersion = "0.3.0"
+    [string]$PluginVersion = "0.3.1"
 )
 
 $ErrorActionPreference = "Stop"
