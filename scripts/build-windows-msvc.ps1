@@ -1,23 +1,25 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 param(
-    [string]$ObsVersion = "32.1.2",
-    [string]$OnnxRuntimeVersion = "1.26.0",
-    [string]$ModelName = "dpdfnet8_48khz_hr",
+    [string]$ObsVersion = "",
+    [string]$OnnxRuntimeVersion = "",
+    [string]$ModelName = "",
     [string]$ObsInstallDir = "C:\Program Files\obs-studio",
     [string]$Configuration = "Release",
-    [string]$PluginVersion = "0.3.1"
+    [string]$PluginVersion = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-$KnownOnnxRuntimeHashes = @{
-    "1.26.0" = "6ebe99b5564bf4d029b6e93eac9ff423682b6212eade769e9ca3f685eaf500b4"
-}
+. (Join-Path $PSScriptRoot "dependency-versions.ps1")
 
-$KnownObsArchiveHashes = @{
-    "32.1.2" = "21cba22292985cf0da967d5c618999b40eaa32b73d2ab8b06154b5ea1b3d3798"
-}
+if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetDefaultObsVersion }
+if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $DpdfnetDefaultOnnxRuntimeVersion }
+if ([string]::IsNullOrWhiteSpace($ModelName)) { $ModelName = $DpdfnetDefaultModelName }
+if ([string]::IsNullOrWhiteSpace($PluginVersion)) { $PluginVersion = $DpdfnetDefaultPluginVersion }
+
+$KnownOnnxRuntimeHashes = $DpdfnetKnownOnnxRuntimeHashes
+$KnownObsArchiveHashes = $DpdfnetKnownObsArchiveHashes
 
 $KissArchiveSha256 = "9c2e19cc34ed910dcb509fd8ab561a523b923b6578703ace8c8f37f5a286bb25"
 $SimdeCommit = "f3e8262173b7089db9a9d57a9ecef8dd07ad9c97"

@@ -160,11 +160,13 @@ The `models/` directory contains DPDFNet ONNX artifacts from
 `Ceva-IP/DPDFNet`. `models/manifest.json` records the source revision, file
 names, sizes, and SHA-256 hashes.
 
-To refresh ONNX Runtime and the DPDFNet models with hash checks:
+To refresh the pinned ONNX Runtime and DPDFNet model artifacts with hash checks:
 
 ```powershell
 .\scripts\update-windows.ps1
 ```
+
+To probe a newer ONNX Runtime release, pass `-OnnxRuntimeVersion latest`.
 
 To refresh, rebuild, and install:
 
@@ -181,7 +183,7 @@ GitHub auth configured for this checkout.
 From Windows PowerShell:
 
 ```powershell
-.\scripts\release-windows.ps1 -Version 0.3.1 `
+.\scripts\release-windows.ps1 -Version 0.3.2 `
   -Changelog @(
     "Improved realtime audio processing."
     "Fixed a model reload edge case."
@@ -193,7 +195,7 @@ That writes the zip, checksum, and release notes under `build/`.
 From WSL:
 
 ```bash
-./scripts/publish-release-wsl.sh 0.3.1
+./scripts/publish-release-wsl.sh 0.3.2
 ```
 
 For a draft release, add `--draft` to the WSL publish command.

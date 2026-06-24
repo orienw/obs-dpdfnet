@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 param(
-    [string]$OnnxRuntimeVersion = "1.26.0",
-    [string]$DefaultModelName = "dpdfnet8_48khz_hr",
-    [string[]]$ModelNames = @("dpdfnet8_48khz_hr", "dpdfnet2_48khz_hr")
+    [string]$OnnxRuntimeVersion = "",
+    [string]$DefaultModelName = "",
+    [string[]]$ModelNames = @()
 )
 
 $ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "dependency-versions.ps1")
+
+if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $DpdfnetDefaultOnnxRuntimeVersion }
+if ([string]::IsNullOrWhiteSpace($DefaultModelName)) { $DefaultModelName = $DpdfnetDefaultModelName }
+if ($ModelNames.Count -eq 0) { $ModelNames = $DpdfnetDefaultModelNames }
 
 & (Join-Path $PSScriptRoot "update-windows.ps1") `
     -OnnxRuntimeVersion $OnnxRuntimeVersion `

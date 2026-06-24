@@ -6,15 +6,15 @@
 # from WSL with scripts/publish-release-wsl.sh so git/gh use the WSL GitHub auth
 # that is already configured for this checkout.
 #
-#   .\scripts\release-windows.ps1 -Version 0.3.1
-#   .\scripts\release-windows.ps1 -Version 0.3.1 -SkipBuild
-#   ./scripts/publish-release-wsl.sh 0.3.1
+#   .\scripts\release-windows.ps1 -Version 0.3.2
+#   .\scripts\release-windows.ps1 -Version 0.3.2 -SkipBuild
+#   ./scripts/publish-release-wsl.sh 0.3.2
 
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Mandatory = $true)][string]$Version,
-    [string]$ObsVersion = "32.1.2",
-    [string]$OnnxRuntimeVersion = "1.26.0",
+    [string]$ObsVersion = "",
+    [string]$OnnxRuntimeVersion = "",
     [string]$Repo = "orienw/obs-dpdfnet",
     [string[]]$Changelog = @(),
     [string]$SourceCommit = "",
@@ -25,6 +25,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "dependency-versions.ps1")
+
+if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetDefaultObsVersion }
+if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $DpdfnetDefaultOnnxRuntimeVersion }
 
 if ($Version -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
     throw "Version '$Version' must look like 0.2.1 or 0.3.0-rc1."

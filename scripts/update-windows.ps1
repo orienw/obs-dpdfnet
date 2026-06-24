@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 param(
-    [string]$OnnxRuntimeVersion = "latest",
-    [string]$DefaultModelName = "dpdfnet8_48khz_hr",
-    [string[]]$ModelNames = @("dpdfnet8_48khz_hr", "dpdfnet2_48khz_hr"),
-    [string]$ObsVersion = "32.1.2",
+    [string]$OnnxRuntimeVersion = "",
+    [string]$DefaultModelName = "",
+    [string[]]$ModelNames = @(),
+    [string]$ObsVersion = "",
     [string]$BuildDir = "",
     [switch]$Force,
     [switch]$Build,
@@ -13,6 +13,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+. (Join-Path $PSScriptRoot "dependency-versions.ps1")
+
+if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $DpdfnetDefaultOnnxRuntimeVersion }
+if ([string]::IsNullOrWhiteSpace($DefaultModelName)) { $DefaultModelName = $DpdfnetDefaultModelName }
+if ($ModelNames.Count -eq 0) { $ModelNames = $DpdfnetDefaultModelNames }
+if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetDefaultObsVersion }
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ThirdParty = Join-Path $Root "third_party"
