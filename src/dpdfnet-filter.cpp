@@ -8,6 +8,7 @@
 #include <xmmintrin.h>
 #endif
 
+#include <media-io/audio-resampler.h>
 #include <obs-module.h>
 
 #include <algorithm>
@@ -36,6 +37,17 @@ constexpr uint64_t NS_PER_SECOND = 1000000000ULL;
 // oversized packet.
 constexpr size_t RING_RESERVE_SAMPLES = 16384;
 constexpr size_t INFO_RESERVE = 256;
+
+// Cap on one packet through the resampled path; anything bigger is the same
+// pathological-packet case the ring capacity check already drops. Keeping it
+// at half the probe block guarantees audio_resampler_resample never sees a
+// larger request at runtime than the one that sized its buffer at creation.
+constexpr uint32_t MAX_RESAMPLE_INPUT_FRAMES = 8192;
+// Headroom added to rate-scaled ring bounds. swresample can drain its standing
+// delay on top of the rate-scaled estimate (libobs sizes its own buffer as
+// ceil((swr_get_delay + in) * ratio)), so this must exceed delay * ratio for
+// any plausible pair, not just the sub-sample fractional carry.
+constexpr size_t RESAMPLE_BOUND_SLACK = 256;
 
 struct PacketInfo {
   uint32_t frames = 0;
@@ -147,9 +159,140 @@ float db_to_amp(double db) {
   return static_cast<float>(std::pow(10.0, db / 20.0));
 }
 
+audio_resampler_t *create_mono_resampler(uint32_t src_rate,
+                                         uint32_t dst_rate) {
+  struct resample_info src = {};
+  src.samples_per_sec = src_rate;
+  src.format = AUDIO_FORMAT_FLOAT;
+  src.speakers = SPEAKERS_MONO;
+
+  struct resample_info dst = src;
+  dst.samples_per_sec = dst_rate;
+  return audio_resampler_create(&dst, &src);
+}
+
+struct ResampleProbe {
+  size_t delay_frames = 0;
+  uint64_t delay_ns = 0;
+  bool ok = false;
+};
+
+// Trace an impulse through in -> out. Two constants fall out: the impulse
+// peak index (the pair's content delay from a fresh stream head) and the
+// standing holdback (frames fed minus frames emitted, the filter tail swr
+// keeps buffered). Live audio starts AFTER this probe, so the wet lane lags
+// the dry lane by holdback + peak; that sum is the alignment constant used to
+// delay the dry lane and compensate output timestamps. The oversized blocks
+// double as priming: audio_resampler_resample only grows its internal output
+// buffer when a call's estimate exceeds every previous call, so feeding more
+// here than the runtime cap ever allows keeps the audio callback
+// reallocation-free (the block scales with the model hop so the out-resampler
+// priming call also always exceeds the per-hop runtime calls).
+ResampleProbe probe_resampler_pair(audio_resampler_t *in, audio_resampler_t *out,
+                                   uint32_t native_rate, uint32_t model_rate,
+                                   int model_hop) {
+  constexpr size_t MIN_PRIME_FRAMES = 16384;
+  constexpr size_t FLUSH_FRAMES = 4096;
+  constexpr size_t MAX_PLAUSIBLE_DELAY = 4096;
+
+  const size_t hop = model_hop > 0 ? static_cast<size_t>(model_hop) : 0;
+  const size_t hop_native =
+      (2 * hop * native_rate + model_rate - 1) / model_rate;
+  const size_t prime_frames = std::max(MIN_PRIME_FRAMES, hop_native);
+
+  std::vector<float> block(prime_frames, 0.0f);
+  std::vector<float> collected;
+  collected.reserve(prime_frames + 2 * FLUSH_FRAMES);
+
+  const auto feed = [&](const float *data, uint32_t frames) {
+    uint8_t *mid[MAX_AV_PLANES] = {};
+    uint32_t mid_frames = 0;
+    uint64_t ts_offset = 0;
+    const uint8_t *input[MAX_AV_PLANES] = {
+        reinterpret_cast<const uint8_t *>(data)};
+    if (!audio_resampler_resample(in, mid, &mid_frames, &ts_offset, input,
+                                  frames))
+      return false;
+    if (!mid_frames)
+      return true;
+
+    uint8_t *fin[MAX_AV_PLANES] = {};
+    uint32_t fin_frames = 0;
+    const uint8_t *mid_input[MAX_AV_PLANES] = {mid[0]};
+    if (!audio_resampler_resample(out, fin, &fin_frames, &ts_offset, mid_input,
+                                  mid_frames))
+      return false;
+
+    const float *samples = reinterpret_cast<const float *>(fin[0]);
+    collected.insert(collected.end(), samples, samples + fin_frames);
+    return true;
+  };
+
+  block[0] = 1.0f;
+  if (!feed(block.data(), static_cast<uint32_t>(prime_frames)))
+    return {};
+  block[0] = 0.0f;
+  if (!feed(block.data(), FLUSH_FRAMES))
+    return {};
+
+  const size_t fed = prime_frames + FLUSH_FRAMES;
+  if (collected.size() > fed)
+    return {};
+  const size_t holdback = fed - collected.size();
+
+  size_t peak = 0;
+  float magnitude = 0.0f;
+  for (size_t i = 0; i < collected.size(); ++i) {
+    const float a = std::fabs(collected[i]);
+    if (a > magnitude) {
+      magnitude = a;
+      peak = i;
+    }
+  }
+
+  // A polyphase round trip keeps most of the impulse's energy at the peak.
+  // The trip is a lowpass at min(native, model)/2, so the expected peak scales
+  // with the passband fraction; a response far below that, or wildly late,
+  // means the pair is not behaving like a plain resampler and cannot be
+  // trusted for alignment.
+  const float passband =
+      std::min(1.0f, static_cast<float>(model_rate) /
+                         static_cast<float>(native_rate));
+  if (magnitude < 0.5f * passband || peak > MAX_PLAUSIBLE_DELAY ||
+      holdback > MAX_PLAUSIBLE_DELAY)
+    return {};
+
+  // Everything past the kernel must be silence: residual energy in the tail
+  // means the pair still has probe content queued and its steady state cannot
+  // be trusted for the live stream.
+  float tail = 0.0f;
+  for (size_t i = peak + 512; i < collected.size(); ++i)
+    tail = std::max(tail, std::fabs(collected[i]));
+  if (tail > 1e-3f)
+    return {};
+
+  ResampleProbe probe;
+  probe.delay_frames = holdback + peak;
+  probe.delay_ns = static_cast<uint64_t>(
+      static_cast<double>(holdback + peak) /
+          static_cast<double>(native_rate) *
+          static_cast<double>(NS_PER_SECOND) +
+      0.5);
+  probe.ok = true;
+  return probe;
+}
+
 class DpdfnetFilter {
 public:
   explicit DpdfnetFilter(obs_source_t *) {}
+
+  ~DpdfnetFilter() {
+    audio_resampler_destroy(resampler_in_);
+    audio_resampler_destroy(resampler_out_);
+  }
+
+  DpdfnetFilter(const DpdfnetFilter &) = delete;
+  DpdfnetFilter &operator=(const DpdfnetFilter &) = delete;
 
   void update(obs_data_t *settings) {
     // Serialize updates with each other (never with the audio thread, which
@@ -219,11 +362,71 @@ public:
       loaded_model_hop = new_model->hop_size();
     }
 
+    // Resolve the model rate this update leaves in place. Reading model_ and
+    // the resampler members here without mutex_ is safe: updates are
+    // serialized by update_mutex_ and the audio thread never writes them.
+    int target_model_rate = 0;
+    int target_model_hop = 0;
+    if (new_model) {
+      target_model_rate = new_model->sample_rate();
+      target_model_hop = new_model->hop_size();
+    } else if (model_) {
+      target_model_rate = model_->sample_rate();
+      target_model_hop = model_->hop_size();
+    }
+
+    const bool want_resample =
+        target_model_rate > 0 && obs_rate > 0 &&
+        obs_rate != static_cast<uint32_t>(target_model_rate);
+    const bool pair_current = resampler_in_ && resampler_out_ &&
+                              resampler_native_rate_ == obs_rate &&
+                              resampler_model_rate_ == target_model_rate;
+    const bool drop_resamplers =
+        !want_resample && (resampler_in_ || resampler_out_);
+
+    // Like the model session, the resampler pair is built and probed OFF the
+    // audio lock: creation runs swr_init plus the impulse probe, and the probe
+    // also forces both resamplers to allocate their steady-state output
+    // buffers here rather than inside the audio callback.
+    audio_resampler_t *new_in = nullptr;
+    audio_resampler_t *new_out = nullptr;
+    uint64_t new_delay_ns = 0;
+    size_t new_prefill = 0;
+    bool swap_resamplers = false;
+    if (want_resample && !pair_current) {
+      new_in = create_mono_resampler(
+          obs_rate, static_cast<uint32_t>(target_model_rate));
+      new_out = create_mono_resampler(
+          static_cast<uint32_t>(target_model_rate), obs_rate);
+      ResampleProbe probe;
+      if (new_in && new_out)
+        probe = probe_resampler_pair(new_in, new_out, obs_rate,
+                                     static_cast<uint32_t>(target_model_rate),
+                                     target_model_hop);
+      if (probe.ok) {
+        new_delay_ns = probe.delay_ns;
+        new_prefill = probe.delay_frames;
+        swap_resamplers = true;
+      } else {
+        audio_resampler_destroy(new_in);
+        audio_resampler_destroy(new_out);
+        new_in = nullptr;
+        new_out = nullptr;
+        blog(LOG_ERROR,
+             "[obs-dpdfnet] failed to create %u <-> %d Hz resamplers; the "
+             "filter will pass audio through until the rates match",
+             obs_rate, target_model_rate);
+      }
+    }
+
     // Old session objects are moved out under the lock and destroyed AFTER it
     // releases: ~Ort::Session / IoBinding teardown is not instant, and running
     // it under mutex_ would stall the audio callback the same way the load did.
     std::unique_ptr<DpdfnetModel> old_model;
     std::unique_ptr<StreamingStft> old_stft;
+    audio_resampler_t *old_in = nullptr;
+    audio_resampler_t *old_out = nullptr;
+    bool log_resamplers_active = false;
     bool log_model_loaded = false;
     bool log_keep_model = false;
     std::string log_loaded_model_path;
@@ -249,6 +452,20 @@ public:
         rate_warning_logged_ = false;
       }
 
+      if (swap_resamplers || drop_resamplers) {
+        old_in = resampler_in_;
+        old_out = resampler_out_;
+        resampler_in_ = new_in;
+        resampler_out_ = new_out;
+        resampler_native_rate_ = swap_resamplers ? obs_rate : 0;
+        resampler_model_rate_ = swap_resamplers ? target_model_rate : 0;
+        resample_delay_ns_ = new_delay_ns;
+        dry_prefill_frames_ = new_prefill;
+        rate_warning_logged_ = false;
+        reset_stream_locked();
+        log_resamplers_active = swap_resamplers;
+      }
+
       if (load_attempted) {
         if (new_model) {
           old_model = std::move(model_);
@@ -270,6 +487,18 @@ public:
               loaded_model_path_.empty() ? "(none)" : loaded_model_path_;
         }
       }
+    }
+
+    audio_resampler_destroy(old_in);
+    audio_resampler_destroy(old_out);
+
+    if (log_resamplers_active) {
+      blog(LOG_INFO,
+           "[obs-dpdfnet] resampling %u Hz <-> %d Hz (round-trip delay "
+           "%zu samples, %.2f ms)",
+           obs_rate, target_model_rate, new_prefill,
+           static_cast<double>(new_prefill) * 1000.0 /
+               static_cast<double>(obs_rate));
     }
 
     if (log_model_loaded) {
@@ -314,11 +543,13 @@ public:
     if (bypass_ || !model_ || !stft_)
       return audio;
 
-    if (sample_rate_ != static_cast<uint32_t>(model_->sample_rate())) {
+    if (sample_rate_ != static_cast<uint32_t>(model_->sample_rate()) &&
+        !resample_path_) {
       if (!rate_warning_logged_) {
         blog(LOG_WARNING,
              "[obs-dpdfnet] OBS sample rate is %u Hz but the loaded model is "
-             "%d Hz; bypassing",
+             "%d Hz; passing audio through (change any filter setting or "
+             "restart OBS to activate resampling)",
              sample_rate_, model_->sample_rate());
         rate_warning_logged_ = true;
       }
@@ -339,7 +570,14 @@ public:
     }
 
     info_queue_.push(PacketInfo{audio->frames, audio->timestamp});
-    push_input(audio);
+    if (!push_input(audio)) {
+      if (!process_error_logged_) {
+        blog(LOG_ERROR, "[obs-dpdfnet] input resampling failed");
+        process_error_logged_ = true;
+      }
+      reset_stream_locked();
+      return audio;
+    }
 
     try {
       const size_t processed_hops = process_available_hops();
@@ -393,11 +631,20 @@ private:
     wet_gain_ = static_cast<float>(wet_mix_ * output_gain_);
   }
 
+  void recompute_resample_path_locked() {
+    resample_path_ = model_ && resampler_in_ && resampler_out_ &&
+                     resampler_native_rate_ == sample_rate_ &&
+                     resampler_model_rate_ == model_->sample_rate();
+  }
+
   void recompute_latency_locked() {
+    hop_latency_ns_ = 0;
     if (model_)
       hop_latency_ns_ = static_cast<uint64_t>(
           static_cast<double>(model_->hop_size()) /
           static_cast<double>(model_->sample_rate()) * NS_PER_SECOND);
+    output_latency_ns_ =
+        hop_latency_ns_ + (resample_path_ ? resample_delay_ns_ : 0);
   }
 
   void resize_channel_buffers() {
@@ -429,11 +676,30 @@ private:
   }
 
   void reset_stream_locked() {
+    recompute_resample_path_locked();
+    recompute_latency_locked();
+
     input_mono_.clear();
     output_mono_.clear();
     for (auto &buffer : dry_buffers_)
       buffer.clear();
     info_queue_.clear();
+
+    // The wet lane lags the dry lane by the pair's standing holdback plus its
+    // content delay (measured by the probe); preloading that much silence
+    // keeps the two index-aligned at the mixer. The swr contexts themselves
+    // are intentionally NOT reset here: recreating them would allocate on the
+    // audio thread, the holdback is a stable property of the filter so the
+    // prefill stays correct across resets, and the cost is only the last
+    // ~holdback samples of pre-reset audio leaking into the first packet's
+    // wet lane against prefill silence. Same reasoning covers a stale pair
+    // reactivated when OBS flips back to a previously probed rate.
+    // zero_scratch_ never shrinks below RING_RESERVE_SAMPLES, which bounds
+    // dry_prefill_frames_, so this push stays within preallocated capacity.
+    if (resample_path_ && dry_prefill_frames_) {
+      for (auto &buffer : dry_buffers_)
+        buffer.push(zero_scratch_.data(), dry_prefill_frames_);
+    }
 
     if (model_)
       model_->reset();
@@ -453,16 +719,36 @@ private:
     return true;
   }
 
+  // Rate-scaled ring-growth bounds for the resampled path; ceiling division
+  // plus slack covers swresample draining its standing delay on top of the
+  // rate-scaled output.
+  size_t to_model_frames(size_t native_frames) const {
+    const auto num = native_frames * static_cast<size_t>(resampler_model_rate_);
+    const auto den = static_cast<size_t>(resampler_native_rate_);
+    return (num + den - 1) / den + RESAMPLE_BOUND_SLACK;
+  }
+
+  size_t to_native_frames(size_t model_frames) const {
+    const auto num = model_frames * static_cast<size_t>(resampler_native_rate_);
+    const auto den = static_cast<size_t>(resampler_model_rate_);
+    return (num + den - 1) / den + RESAMPLE_BOUND_SLACK;
+  }
+
   // True if buffering this packet stays within every ring's preallocated
   // capacity, so no push() reallocates on the audio thread.
   bool buffers_can_accept(uint32_t frames) const {
     if (info_queue_.size() + 1 > info_queue_.capacity())
       return false;
-    if (input_mono_.size() + frames > input_mono_.capacity())
+    if (resample_path_ && frames > MAX_RESAMPLE_INPUT_FRAMES)
+      return false;
+    const size_t input_gain = resample_path_ ? to_model_frames(frames) : frames;
+    if (input_mono_.size() + input_gain > input_mono_.capacity())
       return false;
     // Upper bound on what synthesis can append before this packet drains.
-    if (output_mono_.size() + input_mono_.size() + frames >
-        output_mono_.capacity())
+    const size_t synthesis_gain =
+        resample_path_ ? to_native_frames(input_mono_.size() + input_gain)
+                       : input_mono_.size() + frames;
+    if (output_mono_.size() + synthesis_gain > output_mono_.capacity())
       return false;
     for (size_t channel = 0; channel < channels_; ++channel)
       if (dry_buffers_[channel].size() + frames >
@@ -471,7 +757,7 @@ private:
     return true;
   }
 
-  void push_input(struct obs_audio_data *audio) {
+  bool push_input(struct obs_audio_data *audio) {
     const uint32_t frames = audio->frames;
     const float *ch0 = reinterpret_cast<const float *>(audio->data[0]);
 
@@ -489,41 +775,53 @@ private:
         dry_buffers_[channel].push(zero_scratch_.data(), frames);
     }
 
+    const float *mono = nullptr;
     if (input_channel_ >= 0 &&
         static_cast<size_t>(input_channel_) < channels_) {
       const auto selected_channel = static_cast<size_t>(input_channel_);
       const float *selected =
           reinterpret_cast<const float *>(audio->data[selected_channel]);
-      if (selected)
-        input_mono_.push(selected, frames);
-      else if (ch0)
-        input_mono_.push(ch0, frames);
-      else
-        input_mono_.push(zero_scratch_.data(), frames);
-      return;
-    }
+      mono = selected ? selected : (ch0 ? ch0 : zero_scratch_.data());
+    } else {
+      mono_scratch_.resize(frames);
+      for (uint32_t frame = 0; frame < frames; ++frame) {
+        const float fallback = ch0 ? ch0[frame] : 0.0f;
+        float mixed = 0.0f;
+        size_t mixed_channels = 0;
 
-    mono_scratch_.resize(frames);
-    for (uint32_t frame = 0; frame < frames; ++frame) {
-      const float fallback = ch0 ? ch0[frame] : 0.0f;
-      float mixed = 0.0f;
-      size_t mixed_channels = 0;
-
-      for (size_t channel = 0; channel < channels_; ++channel) {
-        const float *data =
-            reinterpret_cast<const float *>(audio->data[channel]);
-        const float sample = data ? data[frame] : fallback;
-        if (data) {
-          mixed += sample;
-          ++mixed_channels;
+        for (size_t channel = 0; channel < channels_; ++channel) {
+          const float *data =
+              reinterpret_cast<const float *>(audio->data[channel]);
+          const float sample = data ? data[frame] : fallback;
+          if (data) {
+            mixed += sample;
+            ++mixed_channels;
+          }
         }
-      }
 
-      mono_scratch_[frame] =
-          mixed_channels ? mixed / static_cast<float>(mixed_channels) : fallback;
+        mono_scratch_[frame] = mixed_channels
+                                   ? mixed / static_cast<float>(mixed_channels)
+                                   : fallback;
+      }
+      mono = mono_scratch_.data();
     }
 
-    input_mono_.push(mono_scratch_.data(), frames);
+    if (!resample_path_) {
+      input_mono_.push(mono, frames);
+      return true;
+    }
+
+    uint8_t *out[MAX_AV_PLANES] = {};
+    uint32_t out_frames = 0;
+    uint64_t ts_offset = 0;
+    const uint8_t *input[MAX_AV_PLANES] = {
+        reinterpret_cast<const uint8_t *>(mono)};
+    if (!audio_resampler_resample(resampler_in_, out, &out_frames, &ts_offset,
+                                  input, frames))
+      return false;
+    if (out_frames)
+      input_mono_.push(reinterpret_cast<const float *>(out[0]), out_frames);
+    return true;
   }
 
   size_t process_available_hops() {
@@ -545,7 +843,22 @@ private:
         enhanced_spec[i] = alpha * noisy_spec[i] + beta * enhanced_spec[i];
       stft_->synthesis(enhanced_spec, enhanced_hop_);
 
-      output_mono_.push(enhanced_hop_.data(), hop_size);
+      if (resample_path_) {
+        uint8_t *out[MAX_AV_PLANES] = {};
+        uint32_t out_frames = 0;
+        uint64_t ts_offset = 0;
+        const uint8_t *input[MAX_AV_PLANES] = {
+            reinterpret_cast<const uint8_t *>(enhanced_hop_.data())};
+        if (!audio_resampler_resample(resampler_out_, out, &out_frames,
+                                      &ts_offset, input,
+                                      static_cast<uint32_t>(hop_size)))
+          throw std::runtime_error("output resampling failed");
+        if (out_frames)
+          output_mono_.push(reinterpret_cast<const float *>(out[0]),
+                            out_frames);
+      } else {
+        output_mono_.push(enhanced_hop_.data(), hop_size);
+      }
       input_mono_.pop(hop_size);
       ++processed_hops;
     }
@@ -592,8 +905,8 @@ private:
 
     output_audio_.frames = info.frames;
     // Guard against unsigned underflow if a source stamps timestamps near zero.
-    output_audio_.timestamp = info.timestamp > hop_latency_ns_
-                                  ? info.timestamp - hop_latency_ns_
+    output_audio_.timestamp = info.timestamp > output_latency_ns_
+                                  ? info.timestamp - output_latency_ns_
                                   : 0;
 
     info_queue_.pop(1);
@@ -608,10 +921,22 @@ private:
   std::unique_ptr<DpdfnetModel> model_;
   std::unique_ptr<StreamingStft> stft_;
 
+  // Owned mono resampler pair bridging the OBS session rate and the model
+  // rate; null when the rates match. Only update() writes these (under
+  // mutex_); the audio thread reads them through resample_path_.
+  audio_resampler_t *resampler_in_ = nullptr;
+  audio_resampler_t *resampler_out_ = nullptr;
+  uint32_t resampler_native_rate_ = 0;
+  int resampler_model_rate_ = 0;
+  uint64_t resample_delay_ns_ = 0;
+  size_t dry_prefill_frames_ = 0;
+  bool resample_path_ = false;
+
   uint32_t sample_rate_ = 0;
   size_t channels_ = 0;
   uint64_t last_timestamp_ = 0;
   uint64_t hop_latency_ns_ = 0;
+  uint64_t output_latency_ns_ = 0;
 
   double attenuation_limit_db_ = 24.0;
   int input_channel_ = 0;

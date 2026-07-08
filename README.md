@@ -29,7 +29,6 @@ Requirements:
 
 - Windows 10/11 64-bit
 - OBS Studio x64
-- OBS audio sample rate set to 48 kHz
 
 Download the Windows x64 zip and `.sha256` file from the
 [GitHub releases](https://github.com/orienw/obs-dpdfnet/releases) page.
@@ -79,7 +78,7 @@ For preserving an RE20-style close dynamic mic sound, start with:
 - `Suppression limit`: `24-30 dB`
 - `Wet mix`: `100%`
 - `Output gain`: `0 dB`
-- OBS sample rate: `48 kHz`
+- OBS sample rate: `48 kHz` preferred (runs the model natively, no resampling)
 
 Raise the suppression limit only when the room noise is still obvious while
 speaking. `40 dB` is aggressive, and `60 dB` is mostly useful as a diagnostic or
@@ -89,8 +88,10 @@ This is a single-channel speech enhancer. On stereo sources, choose the mic
 input channel explicitly or use `Mix all channels` only when that is really what
 you want. Use it on a microphone source, not on desktop audio or music.
 
-If the loaded model sample rate does not match OBS's audio sample rate, the
-filter bypasses and logs a warning. The bundled models expect 48 kHz.
+If OBS's audio sample rate differs from the loaded model's rate (the bundled
+models run at 48 kHz), the filter resamples the enhanced voice lane internally
+at both boundaries, so a 44.1 kHz OBS setup works out of the box. At 48 kHz the
+model runs natively with no resampling in the path.
 
 ## CMake Build
 
