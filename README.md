@@ -30,6 +30,9 @@ Requirements:
 - Windows 10/11 64-bit
 - OBS Studio x64
 
+The release binary is unsigned. Windows SmartScreen or Defender may warn when
+it is downloaded or first loaded by OBS.
+
 Download the Windows x64 zip and `.sha256` file from the
 [GitHub releases](https://github.com/orienw/obs-dpdfnet/releases) page.
 
@@ -48,9 +51,12 @@ Optional checksum verification from PowerShell:
 
 ```powershell
 Get-FileHash .\obs-dpdfnet-<version>-windows-x64.zip -Algorithm SHA256
+Get-Content .\obs-dpdfnet-<version>-windows-x64.zip.sha256
 ```
 
-## Quick Start On Windows
+The two SHA-256 values must match exactly.
+
+## Build From Source On Windows
 
 From PowerShell in this directory:
 
@@ -160,6 +166,14 @@ cmake --build build-smoke --config Release --target dpdfnet-model-smoke
 The `models/` directory contains DPDFNet ONNX artifacts from
 `Ceva-IP/DPDFNet`. `models/manifest.json` records the source revision, file
 names, sizes, and SHA-256 hashes.
+
+The release includes two 48 kHz models:
+
+- `dpdfnet8_48khz_hr.onnx` is the default, higher-capacity model.
+- `dpdfnet2_48khz_hr.onnx` is the lighter alternative when lower CPU use is
+  more important.
+
+Choose a model with the `ONNX model` setting in the filter properties.
 
 To refresh the pinned ONNX Runtime and DPDFNet model artifacts with hash checks:
 
