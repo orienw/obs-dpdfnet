@@ -1005,6 +1005,12 @@ obs_properties_t *filter_properties(void *data) {
   obs_properties_add_text(props, "info", obs_module_text("DPDFNet.Info"),
                           OBS_TEXT_INFO);
 
+  std::string version_info = obs_module_text("DPDFNet.Version");
+  version_info += ": ";
+  version_info += PLUGIN_VERSION;
+  obs_properties_add_text(props, "version_info", version_info.c_str(),
+                          OBS_TEXT_INFO);
+
   obs_properties_add_path(props, SETTING_MODEL_PATH,
                           obs_module_text("DPDFNet.ModelPath"), OBS_PATH_FILE,
                           "ONNX model (*.onnx);;All files (*.*)", nullptr);

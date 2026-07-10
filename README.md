@@ -11,8 +11,8 @@ runtime.
 
 ## Status
 
-This is an early, working OBS plugin. The Windows path is the primary tested
-path right now, including the direct MSVC helper scripts in `scripts/`.
+This is the `1.0.0-rc1` release candidate. Windows x64 is the primary tested path,
+including the direct MSVC helper scripts in `scripts/`.
 
 Current filter:
 
@@ -184,10 +184,10 @@ GitHub auth configured for this checkout.
 From Windows PowerShell:
 
 ```powershell
-.\scripts\release-windows.ps1 -Version 0.3.2 `
+.\scripts\release-windows.ps1 -Version 1.0.0-rc1 `
   -Changelog @(
-    "Improved realtime audio processing."
-    "Fixed a model reload edge case."
+    "Added automatic resampling for 44.1 kHz OBS configurations."
+    "Kept the exact native processing path for 48 kHz OBS configurations."
   )
 ```
 
@@ -196,7 +196,7 @@ That writes the zip, checksum, and release notes under `build/`.
 From WSL:
 
 ```bash
-./scripts/publish-release-wsl.sh 0.3.2
+./scripts/publish-release-wsl.sh 1.0.0-rc1
 ```
 
 For a draft release, add `--draft` to the WSL publish command.

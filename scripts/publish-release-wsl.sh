@@ -68,7 +68,7 @@ done
 }
 
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] ||
-  die "version '$version' must look like 0.3.2 or 0.4.0-rc1"
+  die "version '$version' must look like 1.0.0 or 1.0.0-rc1"
 
 if [[ -n "$prerelease_override" ]]; then
   is_prerelease="$prerelease_override"

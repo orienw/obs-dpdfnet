@@ -6,9 +6,9 @@
 # from WSL with scripts/publish-release-wsl.sh so git/gh use the WSL GitHub auth
 # that is already configured for this checkout.
 #
-#   .\scripts\release-windows.ps1 -Version 0.3.2
-#   .\scripts\release-windows.ps1 -Version 0.3.2 -SkipBuild
-#   ./scripts/publish-release-wsl.sh 0.3.2
+#   .\scripts\release-windows.ps1 -Version 1.0.0-rc1
+#   .\scripts\release-windows.ps1 -Version 1.0.0-rc1 -SkipBuild
+#   ./scripts/publish-release-wsl.sh 1.0.0-rc1
 
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -32,7 +32,7 @@ if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetDefaultOb
 if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $DpdfnetDefaultOnnxRuntimeVersion }
 
 if ($Version -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
-    throw "Version '$Version' must look like 0.2.1 or 0.3.0-rc1."
+    throw "Version '$Version' must look like 1.0.0 or 1.0.0-rc1."
 }
 
 if ($Publish -or $Draft) {
@@ -114,7 +114,7 @@ DPDFNet local speech-enhancement audio filter for OBS Studio.
 
 REQUIREMENTS
 - OBS Studio $ObsVersion (x64), Windows 10/11 64-bit
-- OBS audio sample rate set to 48 kHz (Settings -> Audio -> Sample Rate)
+- OBS audio sample rate: 48 kHz preferred; 44.1 kHz is supported through internal resampling
 
 INSTALL
 1. Close OBS Studio.
@@ -150,7 +150,13 @@ $Sha = (Get-FileHash -Algorithm SHA256 -Path $ZipPath).Hash.ToLowerInvariant()
 "$Sha  $ZipName" | Set-Content -Encoding ASCII "$ZipPath.sha256"
 
 # 6. Release notes. Keep reusable install instructions in README.md.
-$Kind = if ($IsPreRelease) { "Early pre-release" } else { "Release" }
+$Kind = if ($Version -match '-rc\d+$') {
+    "Release candidate"
+} elseif ($IsPreRelease) {
+    "Early pre-release"
+} else {
+    "Release"
+}
 $CleanChangelog = @($Changelog | Where-Object { ![string]::IsNullOrWhiteSpace($_) })
 $ChangelogSection = ""
 if ($CleanChangelog.Count -gt 0) {

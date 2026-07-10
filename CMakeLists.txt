@@ -2,7 +2,7 @@
 
 cmake_minimum_required(VERSION 3.24)
 
-project(obs-dpdfnet VERSION 0.3.2 LANGUAGES C CXX)
+project(obs-dpdfnet VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +16,7 @@ option(DPDFNET_BUILD_STREAM_DUMP "Build the standalone DPDFNet stream parity dum
 option(DPDFNET_COPY_RUNTIME_DEPENDENCIES "Copy ONNX Runtime shared libraries next to CMake-built binaries" ON)
 option(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES "Install ONNX Runtime shared libraries with the OBS plugin" ON)
 
+set(DPDFNET_PLUGIN_VERSION "${PROJECT_VERSION}-rc1")
 set(DPDFNET_PLUGIN_DESTINATION "obs-plugins/64bit" CACHE STRING "Install destination for the OBS plugin binary")
 set(DPDFNET_DATA_DESTINATION "data/obs-plugins/obs-dpdfnet" CACHE STRING "Install destination for OBS plugin data")
 
@@ -71,7 +72,7 @@ add_library(obs-dpdfnet MODULE
 
 target_compile_definitions(obs-dpdfnet PRIVATE
   PLUGIN_NAME="obs-dpdfnet"
-  PLUGIN_VERSION="${PROJECT_VERSION}"
+  PLUGIN_VERSION="${DPDFNET_PLUGIN_VERSION}"
   ${DPDFNET_PLATFORM_COMPILE_DEFINITIONS}
 )
 
