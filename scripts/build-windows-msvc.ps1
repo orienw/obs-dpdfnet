@@ -158,9 +158,46 @@ function Invoke-DownloadZip {
 }
 
 function Import-VcVars64 {
-    $vcvars = Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio" -Recurse -Filter vcvars64.bat -ErrorAction SilentlyContinue |
-        Sort-Object FullName -Descending |
-        Select-Object -First 1
+    $vcvars = $null
+    $vswhereCommand = Get-Command vswhere.exe -ErrorAction SilentlyContinue
+    $vswherePath = if ($vswhereCommand) { $vswhereCommand.Source } else { "" }
+    if (!$vswherePath -and ${env:ProgramFiles(x86)}) {
+        $candidate = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $vswherePath = $candidate
+        }
+    }
+
+    if ($vswherePath) {
+        $vswhereOutput = & $vswherePath -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+        if ($LASTEXITCODE -eq 0) {
+            $installationPath = @($vswhereOutput | Where-Object {
+                ![string]::IsNullOrWhiteSpace($_)
+            })[0]
+            if ($installationPath) {
+                $candidate = Join-Path $installationPath "VC\Auxiliary\Build\vcvars64.bat"
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                    $vcvars = Get-Item -LiteralPath $candidate
+                }
+            }
+        }
+    }
+
+    if (!$vcvars) {
+        $visualStudioRoots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) |
+            Where-Object { ![string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { Join-Path $_ "Microsoft Visual Studio" } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
+            Sort-Object -Unique
+        $vcvars = $visualStudioRoots |
+            ForEach-Object {
+                Get-ChildItem -LiteralPath $_ -Recurse -Filter vcvars64.bat -ErrorAction SilentlyContinue
+            } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+    }
 
     if (!$vcvars) {
         throw "Could not find vcvars64.bat. Install Visual Studio Build Tools with the C++ toolchain."
