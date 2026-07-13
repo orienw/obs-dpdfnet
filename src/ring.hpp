@@ -8,9 +8,9 @@
 #include <type_traits>
 #include <vector>
 
-// Fixed-capacity FIFO over a contiguous buffer. Reserve the maximum expected
-// size before realtime use; push() only grows for an explicitly unsupported
-// oversized input.
+// FIFO over a contiguous buffer. Realtime callers reserve their maximum size
+// up front and use try_push() so an unexpected input can fail open without
+// touching the allocator.
 template <typename T> class Ring {
   static_assert(std::is_trivially_copyable_v<T>,
                 "Ring requires a trivially copyable element type");
@@ -46,14 +46,18 @@ public:
     if (!n)
       return;
     ensure(count_ + n);
-    const size_t cap = buf_.size();
-    const size_t tail = (head_ + count_) % cap;
-    const size_t first = std::min(n, cap - tail);
-    std::memcpy(&buf_[tail], src, first * sizeof(T));
-    if (n > first)
-      std::memcpy(buf_.data(), src + first, (n - first) * sizeof(T));
-    count_ += n;
+    push_unchecked(src, n);
   }
+
+  bool try_push(const T *src, size_t n) {
+    if (n > buf_.size() - count_)
+      return false;
+    if (n)
+      push_unchecked(src, n);
+    return true;
+  }
+
+  bool try_push(const T &value) { return try_push(&value, 1); }
 
   void push(const T &value) { push(&value, 1); }
 
@@ -71,6 +75,15 @@ public:
   }
 
 private:
+  void push_unchecked(const T *src, size_t n) {
+    const size_t cap = buf_.size();
+    const size_t tail = (head_ + count_) % cap;
+    const size_t first = std::min(n, cap - tail);
+    std::memcpy(&buf_[tail], src, first * sizeof(T));
+    if (n > first)
+      std::memcpy(buf_.data(), src + first, (n - first) * sizeof(T));
+    count_ += n;
+  }
   void ensure(size_t need) {
     if (need > buf_.size())
       reserve(std::max(need, buf_.size() * 2 + 64));

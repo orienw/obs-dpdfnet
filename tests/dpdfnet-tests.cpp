@@ -70,6 +70,16 @@ void test_ring() {
           "ring wraparound order diverged");
   ring.clear();
   require(ring.empty(), "ring clear failed");
+
+  Ring<int> realtime_ring;
+  realtime_ring.reserve(2);
+  const int values[] = {4, 5};
+  require(realtime_ring.try_push(values, 2),
+          "ring rejected an in-capacity realtime push");
+  require(!realtime_ring.try_push(6),
+          "ring grew during an over-capacity realtime push");
+  require(realtime_ring.capacity() == 2 && realtime_ring.size() == 2,
+          "failed realtime push changed the ring");
 }
 
 void test_timestamp_floor() {
@@ -367,6 +377,86 @@ void test_empty_resampler_replacement_is_noop(const std::string &model_path) {
   unchanged.replace_resamplers({});
   packet.timestamp += 20'000'000;
   compare_results(control.process(packet), unchanged.process(packet));
+}
+
+void test_extreme_contract_capacity_plan() {
+  const auto low_rate = plan_dpdfnet_realtime_capacity(8000, 8192);
+  const size_t native_window = 8192 * (384000 / 8000);
+  require(low_rate.output_samples >=
+              native_window + DPDFNET_MAX_REALTIME_PACKET_FRAMES,
+          "8 kHz / 8192 FFT plan cannot hold the native-rate output window");
+  require(low_rate.dry_samples > low_rate.output_samples,
+          "extreme contract plan cannot retain latency-aligned dry audio");
+  require(low_rate.packet_infos >= native_window,
+          "extreme contract plan cannot queue small native packets");
+
+  const auto high_rate = plan_dpdfnet_realtime_capacity(384000, 8192);
+  const size_t model_input =
+      DPDFNET_MAX_REALTIME_PACKET_FRAMES * (384000 / 8000);
+  require(high_rate.input_samples >= model_input + 8192,
+          "384 kHz model plan cannot hold an upsampled 8 kHz packet");
+}
+
+void test_extreme_contract_stream(const std::filesystem::path &fixtures) {
+  DpdfnetProcessor processor = make_processor(
+      (fixtures / "valid_extreme_capacity.onnx").string(), 48000);
+  DpdfnetControls controls;
+  controls.bypass = true;
+  processor.set_controls(controls);
+
+  std::vector<float> data(960, 0.025f);
+  uint64_t timestamp = NS_PER_SECOND;
+  size_t processed = 0;
+  for (size_t packet_index = 0; packet_index < 160; ++packet_index) {
+    DpdfnetAudioPacket packet;
+    packet.data[0] = data.data();
+    packet.frames = static_cast<uint32_t>(data.size());
+    packet.timestamp = timestamp;
+    const auto result = processor.process(packet);
+    require(result.disposition != DpdfnetDisposition::Passthrough,
+            "extreme contract stream reset at its former fixed capacity");
+    if (result.disposition == DpdfnetDisposition::Processed) {
+      ++processed;
+      for (uint32_t frame = 0; frame < result.frames; ++frame) {
+        require(std::isfinite(result.data[0][frame]),
+                "extreme contract stream produced non-finite audio");
+      }
+    }
+    timestamp += 20'000'000;
+  }
+  require(processed > 60,
+          "extreme contract stream never reached processed output");
+}
+
+void test_output_storage_survives_format_update(const std::string &model_path) {
+  DpdfnetProcessor processor = make_processor(model_path);
+  DpdfnetControls controls;
+  controls.bypass = true;
+  processor.set_controls(controls);
+
+  std::vector<float> data(960, 0.0375f);
+  float *returned = nullptr;
+  uint32_t returned_frames = 0;
+  uint64_t timestamp = NS_PER_SECOND;
+  for (size_t attempt = 0; attempt < 4 && !returned; ++attempt) {
+    DpdfnetAudioPacket packet;
+    packet.data[0] = data.data();
+    packet.frames = static_cast<uint32_t>(data.size());
+    packet.timestamp = timestamp;
+    const auto result = processor.process(packet);
+    if (result.disposition == DpdfnetDisposition::Processed) {
+      returned = result.data[0];
+      returned_frames = result.frames;
+    }
+    timestamp += 20'000'000;
+  }
+  require(returned && returned_frames,
+          "pointer-lifetime test did not receive processed audio");
+  std::vector<float> expected(returned, returned + returned_frames);
+
+  processor.set_format(96000, DPDFNET_MAX_AUDIO_PLANES);
+  require(std::equal(expected.begin(), expected.end(), returned),
+          "format update invalidated audio returned to OBS");
 }
 
 void test_model_activation_probe(const std::filesystem::path &fixtures) {
@@ -696,6 +786,17 @@ int main(int argc, char **argv) {
   passed = run_test("empty resampler replacement is a no-op",
                     [&] {
                       test_empty_resampler_replacement_is_noop(low_cpu_model);
+                    }) &&
+           passed;
+  passed = run_test("extreme model contract realtime capacity",
+                    test_extreme_contract_capacity_plan) &&
+           passed;
+  passed = run_test("extreme model contract stream",
+                    [&] { test_extreme_contract_stream(fixtures); }) &&
+           passed;
+  passed = run_test("returned audio survives format update",
+                    [&] {
+                      test_output_storage_survives_format_update(low_cpu_model);
                     }) &&
            passed;
   passed = run_test("variable packets and aligned bypass",

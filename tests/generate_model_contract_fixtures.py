@@ -30,6 +30,18 @@ BASE_METADATA = {
 CASES = (
     Case("valid_identity", {}),
     Case(
+        "valid_extreme_capacity",
+        {
+            "spec_shape": (1, 1, 4097, 2),
+            "metadata": {
+                "sample_rate": "8000",
+                "n_fft": "8192",
+                "hop_length": "4096",
+                "freq_bins": "4097",
+            },
+        },
+    ),
+    Case(
         "valid_dynamic_arbitrary_names",
         {
             "spec_shape": (1, 1, "freq", 2),

@@ -241,16 +241,17 @@ public:
     int old_input_channel = 0;
     bool need_load = false;
     bool skip_failed = false;
+    bool clear_failed_request = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       before = processor_.state();
       old_input_channel = controls_.input_channel;
-      need_load = requested_path != active_model_path_;
-      skip_failed = need_load && requested_path == failed_model_path_;
-      if (!failed_model_path_.empty() && requested_path != failed_model_path_) {
-        failed_model_path_.clear();
-        last_load_error_.clear();
-      }
+      need_load = requested_path != active_model_path_ ||
+                  (selection == DPDFNET_MODEL_CUSTOM && requested_path.empty());
+      skip_failed = need_load && have_failed_model_path_ &&
+                    requested_path == failed_model_path_;
+      clear_failed_request =
+          have_failed_model_path_ && requested_path != failed_model_path_;
     }
 
     const bool channel_boundary = input_channel != old_input_channel;
@@ -305,6 +306,16 @@ public:
         }
       }
     }
+    if (new_model.model) {
+      try {
+        prefill_dpdfnet_model_bundle(new_model, obs_channels,
+                                     new_resamplers.prefill_frames());
+      } catch (const std::exception &ex) {
+        load_error = ex.what();
+        new_model = {};
+        new_resamplers = {};
+      }
+    }
     const bool new_resamplers_ready = static_cast<bool>(new_resamplers);
     const bool model_activation_failed =
         replacing_model && resampler_attempted && !new_resamplers_ready;
@@ -330,11 +341,20 @@ public:
     }
     const bool fallback_ready = static_cast<bool>(fallback_resamplers);
 
+    std::string prepared_active_path = requested_path;
+    std::string prepared_failed_path = requested_path;
+    std::string prepared_load_error = load_error;
+    std::string prepared_resampler_error = resampler_error;
+    std::string prepared_fallback_error = fallback_error;
+    std::string discarded_failed_path;
+    std::string discarded_load_error;
+    std::string discarded_resampler_error;
+
     DpdfnetModelBundle old_model;
     DpdfnetResamplers old_resamplers;
     bool model_loaded = false;
     bool model_failed = false;
-    std::string active_path_after_failure;
+    const char *active_path_after_failure = nullptr;
     DpdfnetProcessorState after;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -343,51 +363,57 @@ public:
       if (replacing_model && new_model.model) {
         old_model = processor_.replace_model(std::move(new_model));
         model_loaded = true;
-        active_model_path_ = requested_path;
-        failed_model_path_.clear();
-        last_load_error_.clear();
+        active_model_path_.swap(prepared_active_path);
+        have_failed_model_path_ = false;
+        failed_model_path_.swap(discarded_failed_path);
+        last_load_error_.swap(discarded_load_error);
       } else if (load_attempted && !load_error.empty()) {
-        failed_model_path_ = requested_path;
-        last_load_error_ = load_error;
+        have_failed_model_path_ = true;
+        failed_model_path_.swap(prepared_failed_path);
+        last_load_error_.swap(prepared_load_error);
         model_failed = true;
-        active_path_after_failure = active_model_path_;
+        active_path_after_failure = active_model_path_.c_str();
+      } else if (clear_failed_request) {
+        have_failed_model_path_ = false;
+        failed_model_path_.swap(discarded_failed_path);
+        last_load_error_.swap(discarded_load_error);
       }
 
       if (model_loaded) {
         if (want_resamplers) {
           old_resamplers =
-              processor_.replace_resamplers(std::move(new_resamplers));
+              processor_.replace_resamplers(std::move(new_resamplers), false);
         } else {
-          old_resamplers = processor_.replace_resamplers({});
+          old_resamplers = processor_.replace_resamplers({}, false);
         }
-        last_resampler_error_.clear();
+        last_resampler_error_.swap(discarded_resampler_error);
       } else if (model_activation_failed) {
         if (!old_needs_resamplers) {
           if (format_boundary || before.resampling ||
               before.resampler_refresh_required)
             old_resamplers = processor_.replace_resamplers({});
-          last_resampler_error_.clear();
+          last_resampler_error_.swap(discarded_resampler_error);
         } else if (fallback_ready) {
           old_resamplers =
               processor_.replace_resamplers(std::move(fallback_resamplers));
-          last_resampler_error_.clear();
+          last_resampler_error_.swap(discarded_resampler_error);
         } else if (fallback_attempted) {
           old_resamplers = processor_.replace_resamplers({});
-          last_resampler_error_ = fallback_error;
+          last_resampler_error_.swap(prepared_fallback_error);
         }
       } else if (fresh_resamplers) {
         if (new_resamplers_ready) {
           old_resamplers =
               processor_.replace_resamplers(std::move(new_resamplers));
-          last_resampler_error_.clear();
+          last_resampler_error_.swap(discarded_resampler_error);
         } else {
           old_resamplers = processor_.replace_resamplers({});
-          last_resampler_error_ = resampler_error;
+          last_resampler_error_.swap(prepared_resampler_error);
         }
       } else if (!want_resamplers && (format_boundary || before.resampling ||
                                       before.resampler_refresh_required)) {
         old_resamplers = processor_.replace_resamplers({});
-        last_resampler_error_.clear();
+        last_resampler_error_.swap(discarded_resampler_error);
       }
 
       controls_ = controls;
@@ -410,9 +436,9 @@ public:
       blog(
           LOG_WARNING,
           "[obs-dpdfnet] keeping previously loaded model after failed load: %s",
-          active_path_after_failure.empty()
+          !active_path_after_failure || !*active_path_after_failure
               ? "(none)"
-              : active_path_after_failure.c_str());
+              : active_path_after_failure);
     }
 
     if (fresh_resamplers && new_resamplers_ready && !model_activation_failed &&
@@ -520,26 +546,8 @@ public:
     }
     lock.unlock();
 
-    if (format_resampler_refresh || result.resampler_refresh_needed)
-      request_resampler_refresh();
-
-    if (result.event == DpdfnetEvent::RateMismatch) {
-      blog(LOG_WARNING, "[obs-dpdfnet] %s; audio is passing through",
-           result.message.data());
-    } else if (result.event == DpdfnetEvent::ResamplerRefreshNeeded) {
-      blog(LOG_WARNING,
-           "[obs-dpdfnet] %s; audio is passing through while a fresh pair is "
-           "prepared",
-           result.message.data());
-    } else if (result.event == DpdfnetEvent::ProcessingFailure) {
-      blog(LOG_ERROR, "[obs-dpdfnet] processing failed: %s",
-           result.message.data());
-    } else if (result.event == DpdfnetEvent::CircuitOpened) {
-      blog(LOG_ERROR,
-           "[obs-dpdfnet] processing disabled after repeated failures: %s; "
-           "audio is passing through until Reset",
-           result.message.data());
-    }
+    request_worker(format_resampler_refresh || result.resampler_refresh_needed,
+                   result);
     return output;
   }
 
@@ -570,6 +578,10 @@ public:
       }
 
       DpdfnetResamplers old;
+      std::string prepared_resampler_error = resampler_error;
+      std::string discarded_resampler_error;
+      std::string discarded_failed_path;
+      std::string discarded_load_error;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         if (fresh)
@@ -579,13 +591,14 @@ public:
         else if (state.resampler_refresh_required)
           old = processor_.release_invalid_resamplers();
         if (resampler_error.empty())
-          last_resampler_error_.clear();
+          last_resampler_error_.swap(discarded_resampler_error);
         else
-          last_resampler_error_ = resampler_error;
+          last_resampler_error_.swap(prepared_resampler_error);
         processor_.reset_state();
         timings_.reset();
-        failed_model_path_.clear();
-        last_load_error_.clear();
+        have_failed_model_path_ = false;
+        failed_model_path_.swap(discarded_failed_path);
+        last_load_error_.swap(discarded_load_error);
       }
     }
 
@@ -620,6 +633,8 @@ public:
     }
 
     DpdfnetResamplers old;
+    std::string prepared_resampler_error = resampler_error;
+    std::string discarded_resampler_error;
     std::lock_guard<std::mutex> lock(mutex_);
     if (fresh)
       old = processor_.replace_resamplers(std::move(fresh));
@@ -628,26 +643,44 @@ public:
     else if (state.resampler_refresh_required)
       old = processor_.release_invalid_resamplers();
     if (resampler_error.empty())
-      last_resampler_error_.clear();
+      last_resampler_error_.swap(discarded_resampler_error);
     else
-      last_resampler_error_ = resampler_error;
+      last_resampler_error_.swap(prepared_resampler_error);
     processor_.reset_stream();
     timings_.reset();
     timestamp_floor_.reset();
   }
 
   FilterStatus status() const {
+    std::lock_guard<std::mutex> update_lock(update_mutex_);
+    DpdfnetProcessorState state;
     DpdfnetProcessorSnapshot snapshot;
     TimingSnapshot timing;
-    std::string load_error;
-    std::string resampler_error;
+    const DpdfnetModel *model = nullptr;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      snapshot = processor_.snapshot();
+      state = processor_.state();
       timing = timings_.snapshot();
-      load_error = last_load_error_;
-      resampler_error = last_resampler_error_;
+      model = processor_.model();
     }
+    snapshot.has_model = state.has_model;
+    snapshot.resampling = state.resampling;
+    snapshot.bypass = state.bypass;
+    snapshot.processing_disabled = state.processing_disabled;
+    snapshot.resampler_refresh_required = state.resampler_refresh_required;
+    snapshot.sample_rate = state.sample_rate;
+    snapshot.channels = state.channels;
+    snapshot.model_rate = state.model_rate;
+    snapshot.n_fft = state.n_fft;
+    snapshot.hop_size = state.hop_size;
+    snapshot.consecutive_failures = state.consecutive_failures;
+    snapshot.last_error = state.last_error.data();
+    if (model) {
+      snapshot.model_path = model->path().string();
+      snapshot.model_name = model->name();
+    }
+    const std::string load_error = last_load_error_;
+    const std::string resampler_error = last_resampler_error_;
 
     std::ostringstream text;
     FilterStatus result;
@@ -745,25 +778,81 @@ public:
   }
 
 private:
-  void request_resampler_refresh() {
+  struct CallbackDiagnostic {
+    bool pending = false;
+    DpdfnetEvent event = DpdfnetEvent::None;
+    std::array<char, 256> message = {};
+  };
+
+  void request_worker(bool resampler_refresh,
+                      const DpdfnetProcessResult &result) {
+    if (!resampler_refresh && result.event == DpdfnetEvent::None)
+      return;
+
     {
       std::lock_guard<std::mutex> lock(resampler_request_mutex_);
-      resampler_refresh_requested_ = true;
+      resampler_refresh_requested_ |= resampler_refresh;
+      if (result.event != DpdfnetEvent::None) {
+        const size_t index = static_cast<size_t>(result.event) - 1;
+        if (index < callback_diagnostics_.size()) {
+          callback_diagnostics_[index].pending = true;
+          callback_diagnostics_[index].event = result.event;
+          callback_diagnostics_[index].message = result.message;
+        }
+      }
     }
     resampler_request_cv_.notify_one();
+  }
+
+  bool callback_diagnostic_pending() const {
+    return std::any_of(callback_diagnostics_.begin(),
+                       callback_diagnostics_.end(),
+                       [](const CallbackDiagnostic &diagnostic) {
+                         return diagnostic.pending;
+                       });
+  }
+
+  static void log_callback_diagnostic(const CallbackDiagnostic &diagnostic) {
+    if (diagnostic.event == DpdfnetEvent::RateMismatch) {
+      blog(LOG_WARNING, "[obs-dpdfnet] %s; audio is passing through",
+           diagnostic.message.data());
+    } else if (diagnostic.event == DpdfnetEvent::ResamplerRefreshNeeded) {
+      blog(LOG_WARNING,
+           "[obs-dpdfnet] %s; audio is passing through while a fresh pair is "
+           "prepared",
+           diagnostic.message.data());
+    } else if (diagnostic.event == DpdfnetEvent::ProcessingFailure) {
+      blog(LOG_ERROR, "[obs-dpdfnet] processing failed: %s",
+           diagnostic.message.data());
+    } else if (diagnostic.event == DpdfnetEvent::CircuitOpened) {
+      blog(LOG_ERROR,
+           "[obs-dpdfnet] processing disabled after repeated failures: %s; "
+           "audio is passing through until Reset",
+           diagnostic.message.data());
+    }
   }
 
   void resampler_worker_loop() {
     std::unique_lock<std::mutex> request_lock(resampler_request_mutex_);
     for (;;) {
       resampler_request_cv_.wait(request_lock, [this] {
-        return stop_resampler_worker_ || resampler_refresh_requested_;
+        return stop_resampler_worker_ || resampler_refresh_requested_ ||
+               callback_diagnostic_pending();
       });
       if (stop_resampler_worker_)
         return;
+      const bool refresh_resamplers = resampler_refresh_requested_;
       resampler_refresh_requested_ = false;
+      auto diagnostics = callback_diagnostics_;
+      for (auto &diagnostic : callback_diagnostics_)
+        diagnostic.pending = false;
       request_lock.unlock();
-      rebuild_resamplers_after_discontinuity();
+      for (const auto &diagnostic : diagnostics) {
+        if (diagnostic.pending)
+          log_callback_diagnostic(diagnostic);
+      }
+      if (refresh_resamplers)
+        rebuild_resamplers_after_discontinuity();
       request_lock.lock();
     }
   }
@@ -793,6 +882,8 @@ private:
 
     DpdfnetResamplers old;
     bool applied = false;
+    std::string prepared_error = error;
+    std::string discarded_error;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       const DpdfnetProcessorState current = processor_.state();
@@ -805,12 +896,12 @@ private:
           old = processor_.replace_resamplers(std::move(fresh));
         else
           old = processor_.release_invalid_resamplers();
-        last_resampler_error_.clear();
+        last_resampler_error_.swap(discarded_error);
         if (needs_resampling)
           timings_.reset();
         applied = true;
       } else if (still_current && !error.empty()) {
-        last_resampler_error_ = error;
+        last_resampler_error_.swap(prepared_error);
       }
     }
 
@@ -850,13 +941,14 @@ private:
 
   obs_source_t *source_ = nullptr;
   mutable std::mutex mutex_;
-  std::mutex update_mutex_;
+  mutable std::mutex update_mutex_;
   DpdfnetProcessor processor_;
   DpdfnetTimestampFloor timestamp_floor_;
   DpdfnetControls controls_;
   CallbackTimings timings_;
   bool custom_model_selected_ = false;
   std::string active_model_path_;
+  bool have_failed_model_path_ = false;
   std::string failed_model_path_;
   std::string last_load_error_;
   std::string last_resampler_error_;
@@ -864,6 +956,7 @@ private:
   std::mutex resampler_request_mutex_;
   std::condition_variable resampler_request_cv_;
   bool resampler_refresh_requested_ = false;
+  std::array<CallbackDiagnostic, 4> callback_diagnostics_ = {};
   bool stop_resampler_worker_ = false;
   std::thread resampler_worker_;
 };

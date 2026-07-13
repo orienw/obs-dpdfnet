@@ -168,6 +168,9 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
   spec_out_val_ = Ort::Value::CreateTensor<float>(
       memory_info_, out_spec_.data(), out_spec_.size(), spec_shape_.data(),
       spec_shape_.size());
+  initial_state_val_ = Ort::Value::CreateTensor<float>(
+      memory_info_, initial_state_.data(), initial_state_.size(),
+      state_shape_.data(), state_shape_.size());
   state_a_val_ = Ort::Value::CreateTensor<float>(
       memory_info_, state_a_.data(), state_a_.size(), state_shape_.data(),
       state_shape_.size());
@@ -175,8 +178,15 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
       memory_info_, state_b_.data(), state_b_.size(), state_shape_.data(),
       state_shape_.size());
 
-  // Two static bindings: enhance() alternates between them so the recurrent
-  // state output of one hop is the state input of the next without a copy.
+  // The initial binding consumes the immutable model state once after reset.
+  // The two steady-state bindings then ping-pong recurrent state without a
+  // copy in either the processing or reset path.
+  binding_initial_.emplace(*session_);
+  binding_initial_->BindInput(in_spec_name_.c_str(), spec_in_val_);
+  binding_initial_->BindInput(in_state_name_.c_str(), initial_state_val_);
+  binding_initial_->BindOutput(out_spec_name_.c_str(), spec_out_val_);
+  binding_initial_->BindOutput(out_state_name_.c_str(), state_a_val_);
+
   binding_a_.emplace(*session_);
   binding_a_->BindInput(in_spec_name_.c_str(), spec_in_val_);
   binding_a_->BindInput(in_state_name_.c_str(), state_a_val_);
@@ -192,23 +202,29 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
   reset();
 }
 
-void DpdfnetModel::reset() {
-  std::copy(initial_state_.begin(), initial_state_.end(), state_a_.begin());
+void DpdfnetModel::reset() noexcept {
+  use_initial_state_ = true;
   parity_ = 0;
 }
 
 void DpdfnetModel::enhance() {
-  Ort::IoBinding &binding = parity_ == 0 ? *binding_a_ : *binding_b_;
+  Ort::IoBinding &binding = use_initial_state_
+                                ? *binding_initial_
+                                : (parity_ == 0 ? *binding_a_ : *binding_b_);
   session_->Run(Ort::RunOptions{nullptr}, binding);
 
-  const auto &next_state = parity_ == 0 ? state_b_ : state_a_;
+  const auto &next_state =
+      use_initial_state_ ? state_a_ : (parity_ == 0 ? state_b_ : state_a_);
   if (!all_finite(out_spec_))
     throw std::runtime_error(
         "DPDFNet model produced non-finite spectrum output");
   if (!all_finite(next_state))
     throw std::runtime_error("DPDFNet model produced non-finite state output");
 
-  parity_ ^= 1;
+  if (use_initial_state_)
+    use_initial_state_ = false;
+  else
+    parity_ ^= 1;
 }
 
 std::string DpdfnetModel::metadata_value(Ort::ModelMetadata &metadata,

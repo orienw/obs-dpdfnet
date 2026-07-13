@@ -28,11 +28,35 @@ $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "dependency-versions.ps1")
 
+function Assert-NoReparsePoints {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $Pending = [System.Collections.Generic.Stack[string]]::new()
+    $Pending.Push($Path)
+    while ($Pending.Count -gt 0) {
+        $Item = Get-Item -Force -LiteralPath $Pending.Pop()
+        if (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Release staging paths may not contain a symbolic link or junction: $($Item.FullName)"
+        }
+        if ($Item.PSIsContainer) {
+            foreach ($Child in Get-ChildItem -Force -LiteralPath $Item.FullName) {
+                $Pending.Push($Child.FullName)
+            }
+        }
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetDefaultObsVersion }
 if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $DpdfnetDefaultOnnxRuntimeVersion }
 
 if ($Version -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
     throw "Version '$Version' must look like 1.0.0 or 1.0.0-rc1."
+}
+
+$PinnedObsArchiveHash = $DpdfnetKnownObsArchiveHashes[$ObsVersion]
+$PinnedOrtArchiveHash = $DpdfnetKnownOnnxRuntimeHashes[$OnnxRuntimeVersion]
+if (!$PinnedObsArchiveHash -or !$PinnedOrtArchiveHash) {
+    throw "Release staging requires pinned OBS and ONNX Runtime versions."
 }
 
 if ($Publish -or $Draft) {
@@ -54,6 +78,16 @@ $NotesPath = Join-Path $OutDir "release-notes-v$Version.md"
 $CommitPath = Join-Path $OutDir "release-commit-v$Version.txt"
 $Tag = "v$Version"
 
+if (Test-Path -LiteralPath $OutDir) {
+    $OutDirItem = Get-Item -Force -LiteralPath $OutDir
+    if (!$OutDirItem.PSIsContainer) {
+        throw "Release output path is not a directory: $OutDir"
+    }
+    if (($OutDirItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Release output path may not be a symbolic link or junction: $OutDir"
+    }
+}
+
 # Purge this version's prior outputs up front so a failed rerun can never
 # leave a stale zip/checksum pair alongside a fresh commit stamp.
 foreach ($StaleOutput in @($ZipPath, "$ZipPath.sha256", $NotesPath, $CommitPath)) {
@@ -65,7 +99,8 @@ if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot "build-windows-msvc.ps1") `
         -PluginVersion $Version `
         -ObsVersion $ObsVersion `
-        -OnnxRuntimeVersion $OnnxRuntimeVersion
+        -OnnxRuntimeVersion $OnnxRuntimeVersion `
+        -Configuration $Configuration
 }
 
 # The behavioral gate always runs, including with -SkipBuild. It rejects stale
@@ -80,13 +115,81 @@ if (!(Test-Path $PluginDll)) {
     throw "Plugin DLL not found at $PluginDll. Run without -SkipBuild."
 }
 
+# A skipped build may only be reused for the exact release inputs that
+# produced it. The test gate has already verified every recorded artifact
+# hash; these checks prevent relabeling those binaries at packaging time.
+$BuildProvenancePath = Join-Path $BuildDir "$Configuration\build-provenance.json"
+if (!(Test-Path $BuildProvenancePath -PathType Leaf)) {
+    throw "No complete build provenance at $BuildProvenancePath. Re-run without -SkipBuild."
+}
+try {
+    $BuildProvenance = Get-Content -Raw -LiteralPath $BuildProvenancePath | ConvertFrom-Json
+} catch {
+    throw "Build provenance is not valid JSON: $BuildProvenancePath"
+}
+if ($BuildProvenance.schemaVersion -ne 2) {
+    throw "Unsupported build provenance schema '$($BuildProvenance.schemaVersion)'."
+}
+if ($BuildProvenance.obsSourceArchiveSha256 -cne $PinnedObsArchiveHash -or
+    $BuildProvenance.onnxRuntimeArchiveSha256 -cne $PinnedOrtArchiveHash) {
+    throw "Build provenance dependency archive hashes do not match the pinned release inputs."
+}
+$ExpectedBuildMetadata = [ordered]@{
+    pluginVersion = $Version
+    obsVersion = $ObsVersion
+    onnxRuntimeVersion = $OnnxRuntimeVersion
+    onnxRuntimeReportedVersion = $OnnxRuntimeVersion
+    configuration = $Configuration
+    architecture = "x64"
+}
+foreach ($Property in $ExpectedBuildMetadata.Keys) {
+    if ([string]$BuildProvenance.$Property -cne [string]$ExpectedBuildMetadata[$Property]) {
+        throw "Build provenance records $Property '$($BuildProvenance.$Property)', but this release requests '$($ExpectedBuildMetadata[$Property])'. Rebuild with matching inputs."
+    }
+}
+if ($BuildProvenance.sourceDirty -isnot [bool] -or $BuildProvenance.sourceDirty) {
+    throw "The staged build was not produced from a clean working tree. Commit and rebuild before releasing."
+}
+if ($BuildProvenance.sourceCommit -notmatch '^[0-9a-fA-F]{40,64}$') {
+    throw "Build provenance contains an invalid source commit."
+}
+$PluginArtifact = @($BuildProvenance.artifacts | Where-Object { $_.path -ceq "obs-dpdfnet.dll" })
+if ($PluginArtifact.Count -ne 1 -or $PluginArtifact[0].sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "Build provenance does not contain exactly one valid plugin DLL hash."
+}
+
 # 2. Stage the install layout with the existing installer, into a clean dir.
-if (Test-Path $Staging) { Remove-Item -Recurse -Force $Staging }
+if (Test-Path -LiteralPath $Staging) {
+    $StagingItem = Get-Item -Force -LiteralPath $Staging
+    if (!$StagingItem.PSIsContainer) {
+        throw "Release staging path is not a directory: $Staging"
+    }
+    Assert-NoReparsePoints -Path $Staging
+    Remove-Item -Recurse -Force -LiteralPath $Staging
+}
 New-Item -ItemType Directory -Force -Path $PluginStage | Out-Null
 & (Join-Path $PSScriptRoot "install-windows.ps1") `
     -BuildDir $BuildDir `
     -Configuration $Configuration `
     -PluginRoot $PluginStage
+
+$StagedArtifacts = @(
+    @{ Name = "obs-dpdfnet.dll"; Path = (Join-Path $PluginStage "bin\64bit\obs-dpdfnet.dll") },
+    @{ Name = "onnxruntime_dpdfnet.dll"; Path = (Join-Path $PluginStage "bin\64bit\onnxruntime_dpdfnet.dll") },
+    @{ Name = "onnxruntime_providers_shared.dll"; Path = (Join-Path $PluginStage "bin\64bit\onnxruntime_providers_shared.dll") }
+)
+foreach ($Artifact in $StagedArtifacts) {
+    $ManifestEntry = @($BuildProvenance.artifacts | Where-Object { $_.path -ceq $Artifact.Name })
+    if ($ManifestEntry.Count -ne 1 -or !(Test-Path $Artifact.Path -PathType Leaf)) {
+        throw "The staged release is missing the verified build artifact $($Artifact.Name)."
+    }
+    $StagedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Artifact.Path).Hash.ToLowerInvariant()
+    if ($StagedHash -cne $ManifestEntry[0].sha256.ToLowerInvariant()) {
+        throw "The staged $($Artifact.Name) does not match the verified build artifact."
+    }
+}
+Copy-Item -LiteralPath $BuildProvenancePath `
+    -Destination (Join-Path $PluginStage "data\build-provenance.json") -Force
 
 # ONNX Runtime's own MIT LICENSE alongside its ThirdPartyNotices.
 $OrtLicense = Join-Path $Root "third_party\onnxruntime\LICENSE"
@@ -94,26 +197,13 @@ if (Test-Path $OrtLicense) {
     Copy-Item $OrtLicense -Destination (Join-Path $PluginStage "data\ONNXRuntime-LICENSE.txt") -Force
 }
 
-# The commit stamp must come from the build that produced the DLL, not from
-# whatever HEAD is at staging time: with -SkipBuild those can differ, and the
-# publish-side check would bless a stale binary.
-$SourceCommitFile = Join-Path $BuildDir "$Configuration\source-commit.txt"
-if (!(Test-Path $SourceCommitFile)) {
-    throw "No build provenance at $SourceCommitFile. Re-run without -SkipBuild."
-}
-$ReleaseCommit = (Get-Content -Raw $SourceCommitFile).Trim()
+# The commit stamp comes from the hash-bound build manifest, never from HEAD at
+# staging time or from caller-supplied release metadata.
+$ReleaseCommit = $BuildProvenance.sourceCommit.ToLowerInvariant()
 if (![string]::IsNullOrWhiteSpace($SourceCommit) -and
     $SourceCommit.Trim().ToLowerInvariant() -ne $ReleaseCommit.ToLowerInvariant()) {
     throw "-SourceCommit does not match the commit recorded by the staged build. Rebuild the requested source instead of overriding provenance."
 }
-
-if ($ReleaseCommit -match '-dirty$') {
-    throw "The staged build was produced from a dirty working tree ($ReleaseCommit). Commit and rebuild before releasing."
-}
-if ($ReleaseCommit -notmatch '^[0-9a-fA-F]{40,64}$') {
-    throw "Release commit '$ReleaseCommit' must be a git commit sha."
-}
-$ReleaseCommit = $ReleaseCommit.ToLowerInvariant()
 
 # 3. INSTALL.txt at the zip root.
 $InstallTxt = @"

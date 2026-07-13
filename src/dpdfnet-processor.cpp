@@ -16,6 +16,12 @@
 #include <utility>
 
 namespace {
+constexpr uint32_t MIN_SUPPORTED_SAMPLE_RATE = 8000;
+constexpr uint32_t MAX_SUPPORTED_SAMPLE_RATE = 384000;
+constexpr size_t MAX_SUPPORTED_NFFT = 8192;
+constexpr size_t MAX_RESAMPLER_PREFILL_FRAMES = 8192;
+constexpr size_t RESAMPLE_BOUND_SLACK = 256;
+
 #if defined(_M_X64) || defined(__x86_64__)
 constexpr unsigned int MXCSR_FLUSH_ZERO = 0x8000;
 constexpr unsigned int MXCSR_DENORMALS_ZERO = 0x0040;
@@ -35,6 +41,38 @@ struct DenormalModeGuard {};
 
 float db_to_amp(double db) {
   return static_cast<float>(std::pow(10.0, db / 20.0));
+}
+
+size_t scale_frames_ceil(size_t frames, uint32_t numerator,
+                         uint32_t denominator) {
+  return (frames * static_cast<size_t>(numerator) + denominator - 1) /
+         denominator;
+}
+
+void include_capacity_for_rate(DpdfnetRealtimeCapacity &capacity,
+                               uint32_t native_rate, uint32_t model_rate,
+                               size_t n_fft) {
+  const bool resampling = native_rate != model_rate;
+  const size_t input_gain =
+      resampling ? scale_frames_ceil(DPDFNET_MAX_REALTIME_PACKET_FRAMES,
+                                     model_rate, native_rate) +
+                       RESAMPLE_BOUND_SLACK
+                 : DPDFNET_MAX_REALTIME_PACKET_FRAMES;
+  const size_t input_samples = n_fft + input_gain;
+  const size_t synthesized_samples =
+      resampling ? scale_frames_ceil(input_samples, native_rate, model_rate) +
+                       RESAMPLE_BOUND_SLACK
+                 : input_samples;
+  const size_t output_samples =
+      DPDFNET_MAX_REALTIME_PACKET_FRAMES + synthesized_samples;
+  const size_t dry_samples = MAX_RESAMPLER_PREFILL_FRAMES +
+                             DPDFNET_MAX_REALTIME_PACKET_FRAMES +
+                             output_samples;
+
+  capacity.input_samples = std::max(capacity.input_samples, input_samples);
+  capacity.output_samples = std::max(capacity.output_samples, output_samples);
+  capacity.dry_samples = std::max(capacity.dry_samples, dry_samples);
+  capacity.packet_infos = std::max(capacity.packet_infos, dry_samples);
 }
 
 audio_resampler_t *create_mono_resampler(uint32_t src_rate, uint32_t dst_rate) {
@@ -141,6 +179,24 @@ ResampleProbe probe_resampler_pair(audio_resampler_t *in,
 }
 } // namespace
 
+DpdfnetRealtimeCapacity plan_dpdfnet_realtime_capacity(int model_sample_rate,
+                                                       int n_fft) {
+  DpdfnetRealtimeCapacity capacity{16384, 16384, 16384, 256};
+  if (model_sample_rate < static_cast<int>(MIN_SUPPORTED_SAMPLE_RATE) ||
+      model_sample_rate > static_cast<int>(MAX_SUPPORTED_SAMPLE_RATE) ||
+      n_fft <= 0 || n_fft > static_cast<int>(MAX_SUPPORTED_NFFT))
+    return capacity;
+
+  const auto model_rate = static_cast<uint32_t>(model_sample_rate);
+  include_capacity_for_rate(capacity, MIN_SUPPORTED_SAMPLE_RATE, model_rate,
+                            static_cast<size_t>(n_fft));
+  include_capacity_for_rate(capacity, model_rate, model_rate,
+                            static_cast<size_t>(n_fft));
+  include_capacity_for_rate(capacity, MAX_SUPPORTED_SAMPLE_RATE, model_rate,
+                            static_cast<size_t>(n_fft));
+  return capacity;
+}
+
 DpdfnetModelBundle prepare_dpdfnet_model(const std::string &path) {
   DpdfnetModelBundle bundle;
   bundle.model = std::make_unique<DpdfnetModel>(path);
@@ -150,7 +206,42 @@ DpdfnetModelBundle prepare_dpdfnet_model(const std::string &path) {
   bundle.model->reset();
   bundle.stft = std::make_unique<StreamingStft>(bundle.model->n_fft(),
                                                 bundle.model->hop_size());
+
+  const DpdfnetRealtimeCapacity capacity = plan_dpdfnet_realtime_capacity(
+      bundle.model->sample_rate(), bundle.model->n_fft());
+  bundle.realtime.input_mono.reserve(capacity.input_samples);
+  bundle.realtime.output_mono.reserve(capacity.output_samples);
+  bundle.realtime.info_queue.reserve(capacity.packet_infos);
+  for (auto &buffer : bundle.realtime.dry_buffers)
+    buffer.reserve(capacity.dry_samples);
+  bundle.realtime.mono_scratch.reserve(DPDFNET_MAX_REALTIME_PACKET_FRAMES);
+  bundle.realtime.dry_scratch.reserve(DPDFNET_MAX_REALTIME_PACKET_FRAMES);
+  bundle.realtime.enhanced_scratch.reserve(DPDFNET_MAX_REALTIME_PACKET_FRAMES);
+  bundle.realtime.zero_scratch.assign(
+      std::max<size_t>(DPDFNET_MAX_REALTIME_PACKET_FRAMES,
+                       MAX_RESAMPLER_PREFILL_FRAMES),
+      0.0f);
+  bundle.realtime.frame.assign(static_cast<size_t>(bundle.model->n_fft()),
+                               0.0f);
+  bundle.realtime.enhanced_hop.assign(
+      static_cast<size_t>(bundle.model->hop_size()), 0.0f);
   return bundle;
+}
+
+void prefill_dpdfnet_model_bundle(DpdfnetModelBundle &bundle, size_t channels,
+                                  size_t frames) {
+  if (!frames)
+    return;
+  channels = std::clamp<size_t>(channels, 1, DPDFNET_MAX_AUDIO_PLANES);
+  if (frames > bundle.realtime.zero_scratch.size())
+    bundle.realtime.zero_scratch.resize(frames, 0.0f);
+  for (size_t channel = 0; channel < channels; ++channel) {
+    bundle.realtime.dry_buffers[channel].reserve(
+        bundle.realtime.dry_buffers[channel].capacity() + frames);
+    if (!bundle.realtime.dry_buffers[channel].try_push(
+            bundle.realtime.zero_scratch.data(), frames))
+      throw std::runtime_error("resampler prefill exceeds dry buffer capacity");
+  }
 }
 
 uint64_t DpdfnetTimestampFloor::apply(uint64_t timestamp, uint32_t frames,
@@ -238,21 +329,32 @@ DpdfnetResamplers prepare_dpdfnet_resamplers(uint32_t native_rate,
   return result;
 }
 
+DpdfnetProcessor::DpdfnetProcessor() {
+  for (auto &storage : output_storage_)
+    storage.reserve(MAX_AUDIO_PACKET_FRAMES);
+}
+
 DpdfnetModelBundle DpdfnetProcessor::replace_model(DpdfnetModelBundle bundle) {
-  DpdfnetModelBundle old{std::move(model_), std::move(stft_)};
+  DpdfnetModelBundle old{std::move(model_), std::move(stft_),
+                         std::move(realtime_)};
   model_ = std::move(bundle.model);
   stft_ = std::move(bundle.stft);
-  resize_model_buffers();
+  realtime_ = std::move(bundle.realtime);
   processing_disabled_ = false;
   consecutive_failures_ = 0;
   process_error_reported_ = false;
   last_error_.fill(0);
-  reset_audio_state();
+  recompute_path();
+  recompute_latency();
+  last_timestamp_ = 0;
+  expected_timestamp_ = 0;
+  have_timestamp_ = false;
   return old;
 }
 
 DpdfnetResamplers
-DpdfnetProcessor::replace_resamplers(DpdfnetResamplers resamplers) {
+DpdfnetProcessor::replace_resamplers(DpdfnetResamplers resamplers,
+                                     bool reset_model) {
   if (!resamplers_ && !resamplers) {
     resamplers_valid_ = true;
     return {};
@@ -261,7 +363,12 @@ DpdfnetProcessor::replace_resamplers(DpdfnetResamplers resamplers) {
   resamplers_ = std::move(resamplers);
   resamplers_valid_ = true;
   rate_warning_reported_ = false;
-  reset_audio_state();
+  if (reset_model)
+    reset_audio_state();
+  else {
+    recompute_path();
+    recompute_latency();
+  }
   return old;
 }
 
@@ -286,7 +393,6 @@ void DpdfnetProcessor::set_format(uint32_t sample_rate, size_t channels) {
     resamplers_valid_ = false;
   sample_rate_ = sample_rate;
   channels_ = channels;
-  resize_channel_buffers();
   rate_warning_reported_ = false;
   reset_audio_state();
 }
@@ -321,54 +427,26 @@ bool DpdfnetProcessor::resampler_matches(uint32_t native_rate,
          resamplers_.model_rate_ == model_rate;
 }
 
-void DpdfnetProcessor::resize_channel_buffers() {
-  input_mono_.reserve(RING_RESERVE_SAMPLES);
-  output_mono_.reserve(RING_RESERVE_SAMPLES);
-  info_queue_.reserve(INFO_RESERVE);
-
-  dry_buffers_.assign(channels_, {});
-  for (auto &buffer : dry_buffers_)
-    buffer.reserve(RING_RESERVE_SAMPLES);
-
-  output_storage_.assign(channels_, {});
-  for (auto &storage : output_storage_)
-    storage.reserve(RING_RESERVE_SAMPLES);
-
-  mono_scratch_.reserve(RING_RESERVE_SAMPLES);
-  dry_scratch_.reserve(RING_RESERVE_SAMPLES);
-  enhanced_scratch_.reserve(RING_RESERVE_SAMPLES);
-  zero_scratch_.assign(RING_RESERVE_SAMPLES, 0.0f);
-}
-
-void DpdfnetProcessor::resize_model_buffers() {
-  if (!model_) {
-    frame_.clear();
-    enhanced_hop_.clear();
-    return;
-  }
-  frame_.assign(static_cast<size_t>(model_->n_fft()), 0.0f);
-  enhanced_hop_.assign(static_cast<size_t>(model_->hop_size()), 0.0f);
-}
-
-void DpdfnetProcessor::reset_audio_state() {
+void DpdfnetProcessor::reset_audio_state(bool reset_model) {
   recompute_path();
   recompute_latency();
-  input_mono_.clear();
-  output_mono_.clear();
-  for (auto &buffer : dry_buffers_)
+  realtime_.input_mono.clear();
+  realtime_.output_mono.clear();
+  for (auto &buffer : realtime_.dry_buffers)
     buffer.clear();
-  info_queue_.clear();
+  realtime_.info_queue.clear();
   last_timestamp_ = 0;
   expected_timestamp_ = 0;
   have_timestamp_ = false;
 
   if (resample_path_ && resamplers_.prefill_frames_) {
-    for (auto &buffer : dry_buffers_)
-      buffer.push(zero_scratch_.data(), resamplers_.prefill_frames_);
+    for (size_t channel = 0; channel < channels_; ++channel)
+      realtime_.dry_buffers[channel].try_push(realtime_.zero_scratch.data(),
+                                              resamplers_.prefill_frames_);
   }
-  if (model_)
+  if (reset_model && model_)
     model_->reset();
-  if (stft_)
+  if (reset_model && stft_)
     stft_->reset();
 }
 
@@ -422,30 +500,32 @@ size_t DpdfnetProcessor::to_native_frames(size_t model_frames) const {
 }
 
 bool DpdfnetProcessor::buffers_can_accept(uint32_t frames) const {
-  if (info_queue_.size() + 1 > info_queue_.capacity())
+  if (frames > MAX_AUDIO_PACKET_FRAMES)
     return false;
-  if (resample_path_ && frames > MAX_RESAMPLE_INPUT_FRAMES)
+  if (realtime_.info_queue.size() + 1 > realtime_.info_queue.capacity())
     return false;
   const size_t input_gain = resample_path_ ? to_model_frames(frames) : frames;
-  if (input_mono_.size() + input_gain > input_mono_.capacity())
+  if (realtime_.input_mono.size() + input_gain >
+      realtime_.input_mono.capacity())
     return false;
   const size_t synthesis_gain =
-      resample_path_ ? to_native_frames(input_mono_.size() + input_gain)
-                     : input_mono_.size() + frames;
-  if (output_mono_.size() + synthesis_gain > output_mono_.capacity())
+      resample_path_
+          ? to_native_frames(realtime_.input_mono.size() + input_gain)
+          : realtime_.input_mono.size() + frames;
+  if (realtime_.output_mono.size() + synthesis_gain >
+      realtime_.output_mono.capacity())
     return false;
-  for (const auto &buffer : dry_buffers_) {
-    if (buffer.size() + frames > buffer.capacity())
+  for (size_t channel = 0; channel < channels_; ++channel) {
+    if (realtime_.dry_buffers[channel].size() + frames >
+        realtime_.dry_buffers[channel].capacity())
       return false;
   }
   return true;
 }
 
 bool DpdfnetProcessor::dry_buffers_have_frames(uint32_t frames) const {
-  if (dry_buffers_.size() < channels_)
-    return false;
-  for (const auto &buffer : dry_buffers_) {
-    if (buffer.size() < frames)
+  for (size_t channel = 0; channel < channels_; ++channel) {
+    if (realtime_.dry_buffers[channel].size() < frames)
       return false;
   }
   return true;
@@ -455,12 +535,10 @@ bool DpdfnetProcessor::push_input(const DpdfnetAudioPacket &audio) {
   const float *ch0 = audio.data[0];
   for (size_t channel = 0; channel < channels_; ++channel) {
     const float *data = audio.data[channel];
-    if (data)
-      dry_buffers_[channel].push(data, audio.frames);
-    else if (ch0)
-      dry_buffers_[channel].push(ch0, audio.frames);
-    else
-      dry_buffers_[channel].push(zero_scratch_.data(), audio.frames);
+    const float *source =
+        data ? data : (ch0 ? ch0 : realtime_.zero_scratch.data());
+    if (!realtime_.dry_buffers[channel].try_push(source, audio.frames))
+      return false;
   }
 
   const float *mono = nullptr;
@@ -468,9 +546,9 @@ bool DpdfnetProcessor::push_input(const DpdfnetAudioPacket &audio) {
       static_cast<size_t>(controls_.input_channel) < channels_) {
     const float *selected =
         audio.data[static_cast<size_t>(controls_.input_channel)];
-    mono = selected ? selected : (ch0 ? ch0 : zero_scratch_.data());
+    mono = selected ? selected : (ch0 ? ch0 : realtime_.zero_scratch.data());
   } else {
-    mono_scratch_.resize(audio.frames);
+    realtime_.mono_scratch.resize(audio.frames);
     for (uint32_t frame = 0; frame < audio.frames; ++frame) {
       const float fallback = ch0 ? ch0[frame] : 0.0f;
       float mixed = 0.0f;
@@ -482,16 +560,15 @@ bool DpdfnetProcessor::push_input(const DpdfnetAudioPacket &audio) {
           ++mixed_channels;
         }
       }
-      mono_scratch_[frame] = mixed_channels
-                                 ? mixed / static_cast<float>(mixed_channels)
-                                 : fallback;
+      realtime_.mono_scratch[frame] =
+          mixed_channels ? mixed / static_cast<float>(mixed_channels)
+                         : fallback;
     }
-    mono = mono_scratch_.data();
+    mono = realtime_.mono_scratch.data();
   }
 
   if (!resample_path_) {
-    input_mono_.push(mono, audio.frames);
-    return true;
+    return realtime_.input_mono.try_push(mono, audio.frames);
   }
 
   uint8_t *out[DPDFNET_MAX_AUDIO_PLANES] = {};
@@ -503,7 +580,8 @@ bool DpdfnetProcessor::push_input(const DpdfnetAudioPacket &audio) {
                                 &ts_offset, input, audio.frames))
     return false;
   if (out_frames)
-    input_mono_.push(reinterpret_cast<const float *>(out[0]), out_frames);
+    return realtime_.input_mono.try_push(
+        reinterpret_cast<const float *>(out[0]), out_frames);
   return true;
 }
 
@@ -517,41 +595,45 @@ size_t DpdfnetProcessor::process_available_hops() {
   const float beta = 1.0f - alpha;
   size_t processed_hops = 0;
 
-  while (input_mono_.size() >= window_size) {
-    input_mono_.peek(frame_.data(), window_size);
-    stft_->analysis(frame_, noisy_spec);
+  while (realtime_.input_mono.size() >= window_size) {
+    realtime_.input_mono.peek(realtime_.frame.data(), window_size);
+    stft_->analysis(realtime_.frame, noisy_spec);
     model_->enhance();
     for (size_t i = 0; i < spec_n; ++i)
       enhanced_spec[i] = alpha * noisy_spec[i] + beta * enhanced_spec[i];
-    stft_->synthesis(enhanced_spec, enhanced_hop_);
+    stft_->synthesis(enhanced_spec, realtime_.enhanced_hop);
 
     if (resample_path_) {
       uint8_t *out[DPDFNET_MAX_AUDIO_PLANES] = {};
       uint32_t out_frames = 0;
       uint64_t ts_offset = 0;
       const uint8_t *input[DPDFNET_MAX_AUDIO_PLANES] = {
-          reinterpret_cast<const uint8_t *>(enhanced_hop_.data())};
+          reinterpret_cast<const uint8_t *>(realtime_.enhanced_hop.data())};
       if (!audio_resampler_resample(resamplers_.output_, out, &out_frames,
                                     &ts_offset, input,
                                     static_cast<uint32_t>(hop_size)))
         throw std::runtime_error("output resampling failed");
-      if (out_frames)
-        output_mono_.push(reinterpret_cast<const float *>(out[0]), out_frames);
+      if (out_frames &&
+          !realtime_.output_mono.try_push(
+              reinterpret_cast<const float *>(out[0]), out_frames))
+        throw std::runtime_error("output buffer capacity exceeded");
     } else {
-      output_mono_.push(enhanced_hop_.data(), hop_size);
+      if (!realtime_.output_mono.try_push(realtime_.enhanced_hop.data(),
+                                          hop_size))
+        throw std::runtime_error("output buffer capacity exceeded");
     }
-    input_mono_.pop(hop_size);
+    realtime_.input_mono.pop(hop_size);
     ++processed_hops;
   }
   return processed_hops;
 }
 
 DpdfnetProcessResult
-DpdfnetProcessor::pop_output_packet(const PacketInfo &info,
+DpdfnetProcessor::pop_output_packet(const DpdfnetPacketInfo &info,
                                     size_t processed_hops) {
-  enhanced_scratch_.resize(info.frames);
-  output_mono_.peek(enhanced_scratch_.data(), info.frames);
-  output_mono_.pop(info.frames);
+  realtime_.enhanced_scratch.resize(info.frames);
+  realtime_.output_mono.peek(realtime_.enhanced_scratch.data(), info.frames);
+  realtime_.output_mono.pop(info.frames);
 
   DpdfnetProcessResult result;
   result.disposition = DpdfnetDisposition::Processed;
@@ -563,36 +645,40 @@ DpdfnetProcessor::pop_output_packet(const PacketInfo &info,
 
   const bool need_dry = controls_.bypass || dry_gain_ != 0.0f;
   if (need_dry)
-    dry_scratch_.resize(info.frames);
+    realtime_.dry_scratch.resize(info.frames);
 
   for (size_t channel = 0; channel < channels_; ++channel) {
     output_storage_[channel].resize(info.frames);
     if (need_dry) {
-      dry_buffers_[channel].peek(dry_scratch_.data(), info.frames);
-      dry_buffers_[channel].pop(info.frames);
+      realtime_.dry_buffers[channel].peek(realtime_.dry_scratch.data(),
+                                          info.frames);
+      realtime_.dry_buffers[channel].pop(info.frames);
     } else {
-      dry_buffers_[channel].pop(info.frames);
+      realtime_.dry_buffers[channel].pop(info.frames);
     }
 
     if (controls_.bypass) {
-      std::copy(dry_scratch_.begin(), dry_scratch_.end(),
+      std::copy(realtime_.dry_scratch.begin(), realtime_.dry_scratch.end(),
                 output_storage_[channel].begin());
     } else if (need_dry) {
       for (uint32_t frame = 0; frame < info.frames; ++frame) {
-        output_storage_[channel][frame] = enhanced_scratch_[frame] * wet_gain_ +
-                                          dry_scratch_[frame] * dry_gain_;
+        output_storage_[channel][frame] =
+            realtime_.enhanced_scratch[frame] * wet_gain_ +
+            realtime_.dry_scratch[frame] * dry_gain_;
       }
     } else if (wet_gain_ == 1.0f) {
-      std::copy(enhanced_scratch_.begin(), enhanced_scratch_.end(),
+      std::copy(realtime_.enhanced_scratch.begin(),
+                realtime_.enhanced_scratch.end(),
                 output_storage_[channel].begin());
     } else {
       for (uint32_t frame = 0; frame < info.frames; ++frame)
-        output_storage_[channel][frame] = enhanced_scratch_[frame] * wet_gain_;
+        output_storage_[channel][frame] =
+            realtime_.enhanced_scratch[frame] * wet_gain_;
     }
     result.data[channel] = output_storage_[channel].data();
   }
 
-  info_queue_.pop(1);
+  realtime_.info_queue.pop(1);
   return result;
 }
 
@@ -665,7 +751,11 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
     return result;
   }
 
-  info_queue_.push(PacketInfo{audio.frames, audio.timestamp});
+  if (!realtime_.info_queue.try_push(
+          DpdfnetPacketInfo{audio.frames, audio.timestamp})) {
+    reset_audio_state();
+    return result;
+  }
   if (!push_input(audio))
     return failure_result("input resampling failed");
 
@@ -680,13 +770,13 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
     return failure_result(ex.what());
   }
 
-  if (info_queue_.empty()) {
+  if (realtime_.info_queue.empty()) {
     result.disposition = DpdfnetDisposition::Pending;
     return result;
   }
 
-  const PacketInfo info = info_queue_.front();
-  if (output_mono_.size() < info.frames ||
+  const DpdfnetPacketInfo info = realtime_.info_queue.front();
+  if (realtime_.output_mono.size() < info.frames ||
       !dry_buffers_have_frames(info.frames)) {
     result.disposition = DpdfnetDisposition::Pending;
     result.processed_hops = processed_hops;

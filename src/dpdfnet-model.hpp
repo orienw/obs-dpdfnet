@@ -15,13 +15,14 @@ class DpdfnetModel {
 public:
   explicit DpdfnetModel(const std::filesystem::path &model_path);
 
-  void reset();
+  void reset() noexcept;
 
   // Run one hop. The caller fills input_spectrum() with the noisy spectrum
   // (interleaved [r,i]), calls enhance(), then reads the enhanced spectrum from
-  // output_spectrum(). Both buffers are bound as the ONNX tensors via IoBinding,
-  // so there is no per-hop tensor allocation or output copy; the recurrent state
-  // ping-pongs between two preallocated buffers instead of being copied back.
+  // output_spectrum(). Both buffers are bound as the ONNX tensors via
+  // IoBinding, so there is no per-hop tensor allocation or output copy; the
+  // recurrent state ping-pongs between two preallocated buffers instead of
+  // being copied back.
   void enhance();
 
   float *input_spectrum() { return in_spec_.data(); }
@@ -66,10 +67,13 @@ private:
 
   Ort::Value spec_in_val_{nullptr};
   Ort::Value spec_out_val_{nullptr};
+  Ort::Value initial_state_val_{nullptr};
   Ort::Value state_a_val_{nullptr};
   Ort::Value state_b_val_{nullptr};
+  std::optional<Ort::IoBinding> binding_initial_;
   std::optional<Ort::IoBinding> binding_a_;
   std::optional<Ort::IoBinding> binding_b_;
+  bool use_initial_state_ = true;
   int parity_ = 0;
 
   int sample_rate_ = 48000;

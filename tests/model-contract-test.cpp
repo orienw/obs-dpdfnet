@@ -18,6 +18,7 @@ struct ContractCase {
 
 constexpr ContractCase kCases[] = {
     {"valid_identity.onnx", nullptr},
+    {"valid_extreme_capacity.onnx", nullptr},
     {"valid_dynamic_arbitrary_names.onnx", nullptr},
     {"missing_input.onnx",
      "DPDFNet ONNX model must expose exactly two inputs and two outputs"},

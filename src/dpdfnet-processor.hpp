@@ -16,13 +16,44 @@
 #include <vector>
 
 constexpr size_t DPDFNET_MAX_AUDIO_PLANES = 8;
+constexpr uint32_t DPDFNET_MAX_REALTIME_PACKET_FRAMES = 8192;
+
+struct DpdfnetPacketInfo {
+  uint32_t frames = 0;
+  uint64_t timestamp = 0;
+};
+
+struct DpdfnetRealtimeCapacity {
+  size_t input_samples = 0;
+  size_t output_samples = 0;
+  size_t dry_samples = 0;
+  size_t packet_infos = 0;
+};
+
+struct DpdfnetRealtimeStorage {
+  Ring<float> input_mono;
+  Ring<float> output_mono;
+  Ring<DpdfnetPacketInfo> info_queue;
+  std::array<Ring<float>, DPDFNET_MAX_AUDIO_PLANES> dry_buffers;
+  std::vector<float> mono_scratch;
+  std::vector<float> dry_scratch;
+  std::vector<float> enhanced_scratch;
+  std::vector<float> zero_scratch;
+  std::vector<float> frame;
+  std::vector<float> enhanced_hop;
+};
 
 struct DpdfnetModelBundle {
   std::unique_ptr<DpdfnetModel> model;
   std::unique_ptr<StreamingStft> stft;
+  DpdfnetRealtimeStorage realtime;
 };
 
+DpdfnetRealtimeCapacity plan_dpdfnet_realtime_capacity(int model_sample_rate,
+                                                       int n_fft);
 DpdfnetModelBundle prepare_dpdfnet_model(const std::string &path);
+void prefill_dpdfnet_model_bundle(DpdfnetModelBundle &bundle, size_t channels,
+                                  size_t frames);
 
 class DpdfnetResamplers {
 public:
@@ -137,10 +168,11 @@ struct DpdfnetProcessorState {
 
 class DpdfnetProcessor {
 public:
-  DpdfnetProcessor() = default;
+  DpdfnetProcessor();
 
   DpdfnetModelBundle replace_model(DpdfnetModelBundle model);
-  DpdfnetResamplers replace_resamplers(DpdfnetResamplers resamplers);
+  DpdfnetResamplers replace_resamplers(DpdfnetResamplers resamplers,
+                                       bool reset_model = true);
   DpdfnetResamplers release_invalid_resamplers();
   void set_format(uint32_t sample_rate, size_t channels);
   bool set_controls(const DpdfnetControls &controls);
@@ -155,22 +187,14 @@ public:
   bool resampler_matches(uint32_t native_rate, int model_rate) const;
 
 private:
-  struct PacketInfo {
-    uint32_t frames = 0;
-    uint64_t timestamp = 0;
-  };
-
-  static constexpr size_t RING_RESERVE_SAMPLES = 16384;
-  static constexpr size_t INFO_RESERVE = 256;
-  static constexpr uint32_t MAX_RESAMPLE_INPUT_FRAMES = 8192;
+  static constexpr uint32_t MAX_AUDIO_PACKET_FRAMES =
+      DPDFNET_MAX_REALTIME_PACKET_FRAMES;
   static constexpr size_t RESAMPLE_BOUND_SLACK = 256;
   static constexpr unsigned MAX_CONSECUTIVE_FAILURES = 3;
   static constexpr uint64_t NS_PER_SECOND = 1000000000ULL;
   static constexpr uint64_t MAX_TIMESTAMP_DEVIATION_NS = 50000000ULL;
 
-  void resize_channel_buffers();
-  void resize_model_buffers();
-  void reset_audio_state();
+  void reset_audio_state(bool reset_model = true);
   void recompute_mix();
   void recompute_path();
   void recompute_latency();
@@ -181,7 +205,7 @@ private:
   size_t to_native_frames(size_t model_frames) const;
   bool push_input(const DpdfnetAudioPacket &audio);
   size_t process_available_hops();
-  DpdfnetProcessResult pop_output_packet(const PacketInfo &info,
+  DpdfnetProcessResult pop_output_packet(const DpdfnetPacketInfo &info,
                                          size_t processed_hops);
   DpdfnetProcessResult failure_result(const char *message);
 
@@ -189,17 +213,8 @@ private:
   std::unique_ptr<StreamingStft> stft_;
   DpdfnetResamplers resamplers_;
 
-  Ring<float> input_mono_;
-  Ring<float> output_mono_;
-  Ring<PacketInfo> info_queue_;
-  std::vector<Ring<float>> dry_buffers_;
-  std::vector<std::vector<float>> output_storage_;
-  std::vector<float> mono_scratch_;
-  std::vector<float> dry_scratch_;
-  std::vector<float> enhanced_scratch_;
-  std::vector<float> zero_scratch_;
-  std::vector<float> frame_;
-  std::vector<float> enhanced_hop_;
+  DpdfnetRealtimeStorage realtime_;
+  std::array<std::vector<float>, DPDFNET_MAX_AUDIO_PLANES> output_storage_;
 
   uint32_t sample_rate_ = 0;
   size_t channels_ = 0;

@@ -56,8 +56,8 @@ int main(int argc, char **argv) {
     std::vector<uint64_t> durations;
     durations.reserve(measured_packets);
     uint64_t timestamp = 1'000'000'000;
-    size_t processed_packets = 0;
-    size_t processed_hops = 0;
+    size_t measured_processed_packets = 0;
+    size_t measured_processed_hops = 0;
     size_t deadline_misses = 0;
 
     for (size_t packet_index = 0;
@@ -80,11 +80,11 @@ int main(int argc, char **argv) {
         throw std::runtime_error(result.message.data());
       if (result.disposition == DpdfnetDisposition::Passthrough)
         throw std::runtime_error("benchmark unexpectedly passed audio through");
-      if (result.disposition == DpdfnetDisposition::Processed)
-        ++processed_packets;
-      processed_hops += result.processed_hops;
 
       if (packet_index >= warmup_packets) {
+        if (result.disposition == DpdfnetDisposition::Processed)
+          ++measured_processed_packets;
+        measured_processed_hops += result.processed_hops;
         const uint64_t elapsed = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start)
                 .count());
@@ -99,9 +99,11 @@ int main(int argc, char **argv) {
     std::cout << "model=" << model_name << "\n"
               << "sample_rate=" << sample_rate << "\n"
               << "packet_frames=" << frames << "\n"
+              << "warmup_packets=" << warmup_packets << "\n"
               << "measured_packets=" << measured_packets << "\n"
-              << "processed_packets=" << processed_packets << "\n"
-              << "processed_hops=" << processed_hops << "\n"
+              << "measured_processed_packets=" << measured_processed_packets
+              << "\n"
+              << "measured_processed_hops=" << measured_processed_hops << "\n"
               << "p50_us=" << percentile(durations, 0.50) / 1000.0 << "\n"
               << "p95_us=" << percentile(durations, 0.95) / 1000.0 << "\n"
               << "p99_us=" << percentile(durations, 0.99) / 1000.0 << "\n"

@@ -177,10 +177,10 @@ cmake --build build-smoke --config Release --target dpdfnet-model-smoke
 .\build-smoke\Release\dpdfnet-model-smoke.exe .\models\dpdfnet8_48khz_hr.onnx
 ```
 
-Set `DPDFNET_BUILD_TESTS=ON` to register the deterministic processor and model
-contract tests with CTest. The other optional tool targets are controlled by
-`DPDFNET_BUILD_STREAM_DUMP`, `DPDFNET_BUILD_QUALITY_BENCHMARK`, and
-`DPDFNET_BUILD_PROCESSOR_BENCHMARK`.
+Set `DPDFNET_BUILD_TESTS=ON` to register the deterministic processor, model
+contract, and real-libobs filter lifecycle tests with CTest. The other optional
+tool targets are controlled by `DPDFNET_BUILD_STREAM_DUMP`,
+`DPDFNET_BUILD_QUALITY_BENCHMARK`, and `DPDFNET_BUILD_PROCESSOR_BENCHMARK`.
 
 ## Tests And Benchmarks
 
@@ -196,8 +196,11 @@ The suite covers both bundled models, malformed ONNX contracts, variable OBS
 packet sizes, channel and timestamp resets, aligned bypass transitions,
 44.1 and 96 kHz resampling, format transitions, resampled failure recovery,
 deterministic signal-integrity cases, and the runtime failure circuit breaker.
+Its real-libobs gate also checks filter lifecycle overlap, returned-buffer
+lifetime, plugin-owned callback allocations, and synchronous callback logging.
 The release script runs this gate before staging, including when `-SkipBuild`
-is used, and rejects binaries from a different source revision.
+is used, and requires hash-bound build metadata for the source revision,
+versions, runtime dependencies, and tested artifacts.
 
 Measure processor timing for both models at 44.1, 48, and 96 kHz with:
 

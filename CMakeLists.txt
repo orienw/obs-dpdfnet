@@ -15,7 +15,7 @@ option(DPDFNET_BUILD_MODEL_SMOKE "Build the standalone DPDFNet model smoke test"
 option(DPDFNET_BUILD_STREAM_DUMP "Build the standalone DPDFNet stream parity dumper" OFF)
 option(DPDFNET_BUILD_QUALITY_BENCHMARK "Build the opt-in local quality benchmark" OFF)
 option(DPDFNET_BUILD_PROCESSOR_BENCHMARK "Build the processor timing benchmark" OFF)
-option(DPDFNET_BUILD_TESTS "Build deterministic processor and model contract tests" OFF)
+option(DPDFNET_BUILD_TESTS "Build processor, model contract, and filter lifecycle tests" OFF)
 option(DPDFNET_COPY_RUNTIME_DEPENDENCIES "Copy ONNX Runtime shared libraries next to CMake-built binaries" ON)
 option(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES "Install ONNX Runtime shared libraries with the OBS plugin" ON)
 
@@ -190,6 +190,27 @@ if(DPDFNET_BUILD_TESTS)
   endif()
   dpdfnet_copy_runtime_dependencies(obs-dpdfnet-tests)
 
+  add_executable(obs-dpdfnet-filter-tests
+    tests/dpdfnet-filter-tests.cpp
+    src/dpdfnet-filter.cpp
+    src/dpdfnet-model.cpp
+    src/dpdfnet-processor.cpp
+    src/dpdfnet-settings.cpp
+    src/stft.cpp
+  )
+  target_compile_definitions(obs-dpdfnet-filter-tests PRIVATE
+    PLUGIN_NAME="obs-dpdfnet"
+    PLUGIN_VERSION="${DPDFNET_PLUGIN_VERSION}"
+    ${DPDFNET_PLATFORM_COMPILE_DEFINITIONS}
+  )
+  target_link_libraries(obs-dpdfnet-filter-tests PRIVATE
+    OBS::libobs
+    ONNXRuntime::ONNXRuntime
+    Threads::Threads
+    ${DPDFNET_KISSFFT_TARGET}
+  )
+  dpdfnet_copy_runtime_dependencies(obs-dpdfnet-filter-tests)
+
   add_executable(dpdfnet-model-contract-test
     tests/model-contract-test.cpp
     src/dpdfnet-model.cpp
@@ -214,13 +235,25 @@ if(DPDFNET_BUILD_TESTS)
     "${CMAKE_CURRENT_SOURCE_DIR}/models/dpdfnet2_48khz_hr.onnx"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/model-contract"
   )
+  add_test(NAME filter-integration COMMAND obs-dpdfnet-filter-tests
+    "${CMAKE_CURRENT_SOURCE_DIR}/models/dpdfnet8_48khz_hr.onnx"
+  )
+  if(WIN32)
+    # Use the runtime directory from the imported OBS target. This also makes
+    # obs.dll's own adjacent dependencies available without relying on the
+    # shell's ambient PATH or copying only part of the OBS runtime.
+    set_tests_properties(processor filter-integration PROPERTIES
+      ENVIRONMENT_MODIFICATION
+        "PATH=path_list_prepend:$<TARGET_FILE_DIR:OBS::libobs>"
+    )
+  endif()
 endif()
 
 if(MSVC)
   target_compile_options(obs-dpdfnet PRIVATE /W4 /permissive-)
   foreach(target dpdfnet-model-smoke dpdfnet-stream-dump
                  dpdfnet-quality-benchmark dpdfnet-processor-benchmark
-                 obs-dpdfnet-tests
+                 obs-dpdfnet-tests obs-dpdfnet-filter-tests
                  dpdfnet-model-contract-test)
     if(TARGET ${target})
       target_compile_options(${target} PRIVATE /W4 /permissive-)
@@ -230,7 +263,7 @@ else()
   target_compile_options(obs-dpdfnet PRIVATE -Wall -Wextra -Wpedantic)
   foreach(target dpdfnet-model-smoke dpdfnet-stream-dump
                  dpdfnet-quality-benchmark dpdfnet-processor-benchmark
-                 obs-dpdfnet-tests
+                 obs-dpdfnet-tests obs-dpdfnet-filter-tests
                  dpdfnet-model-contract-test)
     if(TARGET ${target})
       target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)

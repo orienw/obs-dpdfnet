@@ -18,6 +18,22 @@ if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $
 if ([string]::IsNullOrWhiteSpace($ModelName)) { $ModelName = $DpdfnetDefaultModelName }
 if ([string]::IsNullOrWhiteSpace($PluginVersion)) { $PluginVersion = $DpdfnetDefaultPluginVersion }
 
+foreach ($VersionValue in @($ObsVersion, $OnnxRuntimeVersion)) {
+    if ($VersionValue -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
+        throw "Dependency version '$VersionValue' contains unsupported characters."
+    }
+}
+if ($PluginVersion -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
+    throw "Plugin version '$PluginVersion' must look like 1.0.0 or 1.0.0-rc1."
+}
+if ($ModelName -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9_-])?$' -or
+    @($ModelName -split '\.', 2)[0] -match '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') {
+    throw "Model name '$ModelName' must be a simple file name without a trailing period."
+}
+if ($Configuration -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,30}[A-Za-z0-9_-])?$') {
+    throw "Configuration '$Configuration' must be a simple directory name."
+}
+
 $KnownOnnxRuntimeHashes = $DpdfnetKnownOnnxRuntimeHashes
 $KnownObsArchiveHashes = $DpdfnetKnownObsArchiveHashes
 
@@ -35,19 +51,45 @@ function Get-Sha256 {
     return (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
 }
 
+function Assert-NoReparsePoints {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$Recursive
+    )
+
+    if (!(Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $Pending = [System.Collections.Generic.Stack[string]]::new()
+    $Pending.Push($Path)
+    while ($Pending.Count -gt 0) {
+        $Item = Get-Item -Force -LiteralPath $Pending.Pop()
+        if (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Refusing to replace or remove a path containing a reparse point: $($Item.FullName)"
+        }
+        if ($Recursive -and $Item.PSIsContainer) {
+            foreach ($Child in Get-ChildItem -Force -LiteralPath $Item.FullName) {
+                $Pending.Push($Child.FullName)
+            }
+        }
+    }
+}
+
 function Invoke-DownloadZip {
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
         [Parameter(Mandatory = $true)][string]$ZipPath,
         [Parameter(Mandatory = $true)][string]$Destination,
         [Parameter(Mandatory = $true)][string]$ExpectedDirectory,
+        [Parameter(Mandatory = $true)][string]$ArchiveRootName,
         [string]$ExpectedSha256 = ""
     )
 
-    if (Test-Path $ExpectedDirectory) {
-        return
-    }
-
+    Assert-NoReparsePoints -Path $Destination
+    Assert-NoReparsePoints -Path (Split-Path $ZipPath)
+    Assert-NoReparsePoints -Path $ZipPath
+    Assert-NoReparsePoints -Path $ExpectedDirectory -Recursive
     New-Item -ItemType Directory -Force -Path (Split-Path $ZipPath), $Destination | Out-Null
 
     if ((Test-Path $ZipPath) -and $ExpectedSha256) {
@@ -57,21 +99,62 @@ function Invoke-DownloadZip {
             Remove-Item -Force $ZipPath
         }
     }
+    if ((Test-Path $ZipPath) -and !$ExpectedSha256) {
+        # An unpinned archive is never trusted from the mutable local cache.
+        # Development builds may use one, but each invocation downloads it
+        # again and release-grade gates reject it.
+        Remove-Item -Force $ZipPath
+    }
 
     if (!(Test-Path $ZipPath)) {
         Write-Host "Downloading $Uri"
-        Invoke-WebRequest -Uri $Uri -OutFile $ZipPath
+        $null = Invoke-WebRequest -Uri $Uri -OutFile $ZipPath
     }
 
+    $ArchiveSha256 = Get-Sha256 -Path $ZipPath
     if ($ExpectedSha256) {
-        $downloadHash = Get-Sha256 -Path $ZipPath
-        if ($downloadHash -ne $ExpectedSha256) {
+        if ($ArchiveSha256 -ne $ExpectedSha256) {
             Remove-Item -Force $ZipPath -ErrorAction SilentlyContinue
-            throw "Hash mismatch for $ZipPath. Expected $ExpectedSha256, got $downloadHash"
+            throw "Hash mismatch for $ZipPath. Expected $ExpectedSha256, got $ArchiveSha256"
         }
     }
 
-    Expand-Archive -Path $ZipPath -DestinationPath $Destination -Force
+    $ExtractionDirectory = Join-Path $Destination (".extract-" + [guid]::NewGuid().ToString("N"))
+    $ReplacementBackup = "$($ExpectedDirectory).replace-" + [guid]::NewGuid().ToString("N")
+    Assert-NoReparsePoints -Path $ExtractionDirectory -Recursive
+    Assert-NoReparsePoints -Path $ReplacementBackup -Recursive
+    New-Item -ItemType Directory -Path $ExtractionDirectory | Out-Null
+    try {
+        $null = Expand-Archive -Path $ZipPath -DestinationPath $ExtractionDirectory -Force
+        Assert-NoReparsePoints -Path $ExtractionDirectory -Recursive
+        $ExtractedRoot = Join-Path $ExtractionDirectory $ArchiveRootName
+        if (!(Test-Path $ExtractedRoot -PathType Container)) {
+            throw "Archive $ZipPath did not contain expected root '$ArchiveRootName'."
+        }
+
+        if (Test-Path $ExpectedDirectory) {
+            $null = Move-Item -Path $ExpectedDirectory -Destination $ReplacementBackup
+        }
+        try {
+            $null = Move-Item -Path $ExtractedRoot -Destination $ExpectedDirectory
+        } catch {
+            if ((Test-Path $ReplacementBackup) -and !(Test-Path $ExpectedDirectory)) {
+                $null = Move-Item -Path $ReplacementBackup -Destination $ExpectedDirectory
+            }
+            throw
+        }
+        if (Test-Path $ReplacementBackup) {
+            Assert-NoReparsePoints -Path $ReplacementBackup -Recursive
+            Remove-Item -Recurse -Force $ReplacementBackup
+        }
+    } finally {
+        if (Test-Path $ExtractionDirectory) {
+            Assert-NoReparsePoints -Path $ExtractionDirectory -Recursive
+            Remove-Item -Recurse -Force $ExtractionDirectory
+        }
+    }
+
+    return $ArchiveSha256
 }
 
 function Import-VcVars64 {
@@ -132,6 +215,15 @@ $Models = Join-Path $Root "models"
 
 New-Item -ItemType Directory -Force -Path $BuildDir, $OutputDir, $ThirdParty, $GeneratedObs, $Models | Out-Null
 
+# Remove provenance and test status before touching build outputs. A failed or
+# interrupted build must never leave a valid stamp beside partially replaced
+# artifacts.
+$BuildProvenanceFile = Join-Path $OutputDir "build-provenance.json"
+$SourceCommitFile = Join-Path $OutputDir "source-commit.txt"
+$TestsPassedFile = Join-Path $OutputDir "tests-passed.txt"
+Remove-Item -LiteralPath $BuildProvenanceFile, $SourceCommitFile, $TestsPassedFile `
+    -Force -ErrorAction SilentlyContinue
+
 $onnxBase = "onnxruntime-win-x64-$OnnxRuntimeVersion"
 $onnxRoot = Join-Path $ThirdParty "onnxruntime"
 $onnxZip = Join-Path $ThirdParty "$onnxBase.zip"
@@ -139,21 +231,17 @@ $onnxExpectedHash = $KnownOnnxRuntimeHashes[$OnnxRuntimeVersion]
 if (!$onnxExpectedHash) {
     Write-Warning "No pinned ONNX Runtime hash is known for version $OnnxRuntimeVersion."
 }
-$onnxVersionFile = Join-Path $onnxRoot "VERSION_NUMBER"
-if ((Test-Path $onnxRoot) -and
-    (!(Test-Path $onnxVersionFile) -or
-     ((Get-Content -Raw $onnxVersionFile).Trim() -ne $OnnxRuntimeVersion))) {
-    Write-Host "Replacing ONNX Runtime with $OnnxRuntimeVersion"
-    Remove-Item -Recurse -Force $onnxRoot
-}
-Invoke-DownloadZip `
+$OnnxRuntimeArchiveSha256 = Invoke-DownloadZip `
     -Uri "https://github.com/microsoft/onnxruntime/releases/download/v$OnnxRuntimeVersion/$onnxBase.zip" `
     -ZipPath $onnxZip `
     -Destination $ThirdParty `
     -ExpectedDirectory $onnxRoot `
+    -ArchiveRootName $onnxBase `
     -ExpectedSha256 $onnxExpectedHash
-if (!(Test-Path $onnxRoot)) {
-    Rename-Item -Path (Join-Path $ThirdParty $onnxBase) -NewName "onnxruntime"
+$onnxVersionFile = Join-Path $onnxRoot "VERSION_NUMBER"
+if (!(Test-Path $onnxVersionFile -PathType Leaf) -or
+    (Get-Content -Raw $onnxVersionFile).Trim() -cne $OnnxRuntimeVersion) {
+    throw "Extracted ONNX Runtime does not identify itself as $OnnxRuntimeVersion."
 }
 
 $obsSourceRoot = Join-Path $ThirdParty "obs-studio-$ObsVersion"
@@ -162,29 +250,32 @@ $obsExpectedHash = $KnownObsArchiveHashes[$ObsVersion]
 if (!$obsExpectedHash) {
     Write-Warning "No pinned OBS Studio source hash is known for version $ObsVersion."
 }
-Invoke-DownloadZip `
+$ObsSourceArchiveSha256 = Invoke-DownloadZip `
     -Uri "https://github.com/obsproject/obs-studio/archive/refs/tags/$ObsVersion.zip" `
     -ZipPath $obsZip `
     -Destination $ThirdParty `
     -ExpectedDirectory $obsSourceRoot `
+    -ArchiveRootName "obs-studio-$ObsVersion" `
     -ExpectedSha256 $obsExpectedHash
 
 $simdeRoot = Join-Path $ThirdParty "simde-$SimdeCommit"
 $simdeZip = Join-Path $ThirdParty "simde-$SimdeCommit.zip"
-Invoke-DownloadZip `
+$null = Invoke-DownloadZip `
     -Uri "https://github.com/simd-everywhere/simde/archive/$SimdeCommit.zip" `
     -ZipPath $simdeZip `
     -Destination $ThirdParty `
     -ExpectedDirectory $simdeRoot `
+    -ArchiveRootName "simde-$SimdeCommit" `
     -ExpectedSha256 $SimdeArchiveSha256
 
 $kissRoot = Join-Path $ThirdParty "kissfft-131.1.0"
 $kissZip = Join-Path $ThirdParty "kissfft-131.1.0.zip"
-Invoke-DownloadZip `
+$null = Invoke-DownloadZip `
     -Uri "https://github.com/mborgerding/kissfft/archive/refs/tags/131.1.0.zip" `
     -ZipPath $kissZip `
     -Destination $ThirdParty `
     -ExpectedDirectory $kissRoot `
+    -ArchiveRootName "kissfft-131.1.0" `
     -ExpectedSha256 $KissArchiveSha256
 
 $modelPath = Join-Path $Models "$ModelName.onnx"
@@ -213,6 +304,11 @@ $obsDll = Join-Path $ObsInstallDir "bin\64bit\obs.dll"
 if (!(Test-Path $obsDll)) {
     throw "Could not find installed OBS DLL at $obsDll"
 }
+$ObsRuntimeProductVersion = (Get-Item -LiteralPath $obsDll).VersionInfo.ProductVersion.Trim()
+if ($ObsRuntimeProductVersion -cne $ObsVersion) {
+    throw "Installed OBS runtime is version '$ObsRuntimeProductVersion', but this build requests OBS $ObsVersion."
+}
+$ObsRuntimeSha256 = Get-Sha256 -Path $obsDll
 
 $obsLib = Join-Path $BuildDir "obs.lib"
 New-ImportLibrary `
@@ -291,7 +387,8 @@ function Invoke-NativeExecutableBuild {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][string[]]$Sources,
-        [Parameter(Mandatory = $true)][string[]]$Libraries
+        [Parameter(Mandatory = $true)][string[]]$Libraries,
+        [string[]]$AdditionalCompileArguments = @()
     )
 
     $Executable = Join-Path $OutputDir "$Name.exe"
@@ -311,7 +408,7 @@ function Invoke-NativeExecutableBuild {
         "/Fd:$ObjectDir\$Name.pdb",
         "/Fe:$Executable",
         "/Fo:$ObjectDir\"
-    ) + $defines + $includeArgs + $Sources + @(
+    ) + $defines + $includeArgs + $AdditionalCompileArguments + $Sources + @(
         "/link",
         "/NOLOGO",
         "/DEBUG:FULL",
@@ -350,12 +447,29 @@ Invoke-NativeExecutableBuild `
     -Libraries @($onnxRenamedLib)
 
 Invoke-NativeExecutableBuild `
+    -Name "dpdfnet-onnxruntime-version" `
+    -Sources @((Join-Path $Root "tools\onnxruntime-version.cpp")) `
+    -Libraries @($onnxRenamedLib)
+
+Invoke-NativeExecutableBuild `
     -Name "obs-dpdfnet-tests" `
     -Sources (@(
         (Join-Path $Root "tests\dpdfnet-tests.cpp"),
         (Join-Path $Root "src\dpdfnet-settings.cpp")
     ) + $DspSources) `
     -Libraries @($obsLib, $onnxRenamedLib)
+
+Invoke-NativeExecutableBuild `
+    -Name "obs-dpdfnet-filter-tests" `
+    -Sources (@(
+        (Join-Path $Root "tests\dpdfnet-filter-tests.cpp"),
+        (Join-Path $Root "src\dpdfnet-filter.cpp"),
+        (Join-Path $Root "src\dpdfnet-settings.cpp")
+    ) + $DspSources) `
+    -Libraries @($obsLib, $onnxRenamedLib) `
+    -AdditionalCompileArguments @(
+        "/FI$(Join-Path $GeneratedObs 'plugin-version.h')"
+    )
 
 Invoke-NativeExecutableBuild `
     -Name "dpdfnet-stream-dump" `
@@ -376,11 +490,19 @@ Remove-Item (Join-Path $OutputDir "onnxruntime.dll") -Force -ErrorAction Silentl
 Copy-Item $onnxDll -Destination (Join-Path $OutputDir $onnxRenamedDll) -Force
 Copy-Item (Join-Path $onnxRoot "lib\onnxruntime_providers_shared.dll") -Destination $OutputDir -Force
 
-# Record which commit produced this DLL so release staging can stamp the
-# artifact truthfully even with -SkipBuild. A dirty tree is recorded as such
-# and release-windows.ps1 refuses to stage it.
-$SourceCommitFile = Join-Path $OutputDir "source-commit.txt"
-Remove-Item $SourceCommitFile -Force -ErrorAction SilentlyContinue
+$OnnxRuntimeVersionExecutable = Join-Path $OutputDir "dpdfnet-onnxruntime-version.exe"
+$OnnxRuntimeVersionOutput = & $OnnxRuntimeVersionExecutable
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not query the version reported by onnxruntime_dpdfnet.dll."
+}
+$OnnxRuntimeReportedVersion = ($OnnxRuntimeVersionOutput -join "").Trim()
+if ($OnnxRuntimeReportedVersion -cne $OnnxRuntimeVersion) {
+    throw "onnxruntime_dpdfnet.dll reports version '$OnnxRuntimeReportedVersion', but this build requests $OnnxRuntimeVersion."
+}
+
+# Bind release metadata to the exact outputs produced by this invocation.
+# source-commit.txt remains for older local reporting scripts, but release and
+# test gates require the complete, hash-bound JSON manifest below.
 $Git = Get-Command git.exe -ErrorAction SilentlyContinue
 if ($Git) {
     # Capture before selecting: an inline `| Select-Object -First 1` stops the
@@ -388,15 +510,60 @@ if ($Git) {
     $GitOutput = & $Git.Source -C $Root rev-parse HEAD
     if ($LASTEXITCODE -eq 0 -and $GitOutput) {
         $GitSha = @($GitOutput)[0].Trim().ToLowerInvariant()
-        $GitDirty = & $Git.Source -C $Root status --porcelain
+        $GitStatus = & $Git.Source -C $Root status --porcelain
         if ($LASTEXITCODE -eq 0) {
-            if ($GitDirty) { $GitSha = "$GitSha-dirty" }
-            Set-Content -Encoding ASCII -Path $SourceCommitFile -Value $GitSha
+            $GitDirty = [bool]$GitStatus
+            $ArtifactNames = @(
+                "obs-dpdfnet.dll",
+                "dpdfnet-model-smoke.exe",
+                "dpdfnet-model-contract-test.exe",
+                "dpdfnet-onnxruntime-version.exe",
+                "obs-dpdfnet-tests.exe",
+                "obs-dpdfnet-filter-tests.exe",
+                "dpdfnet-stream-dump.exe",
+                "dpdfnet-quality-benchmark.exe",
+                "dpdfnet-processor-benchmark.exe",
+                $onnxRenamedDll,
+                "onnxruntime_providers_shared.dll"
+            )
+            $Artifacts = foreach ($ArtifactName in $ArtifactNames) {
+                $ArtifactPath = Join-Path $OutputDir $ArtifactName
+                if (!(Test-Path $ArtifactPath -PathType Leaf)) {
+                    throw "Expected build artifact is missing: $ArtifactPath"
+                }
+                [ordered]@{
+                    path = $ArtifactName
+                    sha256 = Get-Sha256 -Path $ArtifactPath
+                }
+            }
+
+            $BuildProvenance = [ordered]@{
+                schemaVersion = 2
+                sourceCommit = $GitSha
+                sourceDirty = $GitDirty
+                pluginVersion = $PluginVersion
+                obsVersion = $ObsVersion
+                obsSourceArchiveSha256 = $ObsSourceArchiveSha256
+                obsRuntimeProductVersion = $ObsRuntimeProductVersion
+                obsRuntimeSha256 = $ObsRuntimeSha256
+                onnxRuntimeVersion = $OnnxRuntimeVersion
+                onnxRuntimeReportedVersion = $OnnxRuntimeReportedVersion
+                onnxRuntimeArchiveSha256 = $OnnxRuntimeArchiveSha256
+                configuration = $Configuration
+                architecture = "x64"
+                artifacts = @($Artifacts)
+            }
+            $BuildProvenance |
+                ConvertTo-Json -Depth 4 |
+                Set-Content -Encoding ASCII -Path $BuildProvenanceFile
+
+            $LegacyCommit = if ($GitDirty) { "$GitSha-dirty" } else { $GitSha }
+            Set-Content -Encoding ASCII -Path $SourceCommitFile -Value $LegacyCommit
         }
     }
 }
-if (!(Test-Path $SourceCommitFile)) {
-    Write-Warning "Could not record the build's source commit; release staging will require -SourceCommit."
+if (!(Test-Path $BuildProvenanceFile)) {
+    Write-Warning "Could not record complete build provenance; testing and release staging will reject this build."
 }
 
 Write-Host "Built $pluginDll"
