@@ -235,6 +235,8 @@ $pluginLib = Join-Path $OutputDir "obs-dpdfnet.lib"
 $sources = @(
     (Join-Path $Root "src\dpdfnet-filter.cpp"),
     (Join-Path $Root "src\dpdfnet-model.cpp"),
+    (Join-Path $Root "src\dpdfnet-processor.cpp"),
+    (Join-Path $Root "src\dpdfnet-settings.cpp"),
     (Join-Path $Root "src\plugin-main.cpp"),
     (Join-Path $Root "src\stft.cpp"),
     (Join-Path $kissRoot "kiss_fft.c"),
@@ -261,6 +263,7 @@ $compileArgs = @(
     "/std:c++17",
     "/EHsc",
     "/W4",
+    "/permissive-",
     "/FI$(Join-Path $GeneratedObs 'plugin-version.h')",
     "/MD",
     "/O2",
@@ -283,6 +286,91 @@ $compileArgs = @(
 if ($LASTEXITCODE -ne 0) {
     throw "cl.exe failed"
 }
+
+function Invoke-NativeExecutableBuild {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string[]]$Sources,
+        [Parameter(Mandatory = $true)][string[]]$Libraries
+    )
+
+    $Executable = Join-Path $OutputDir "$Name.exe"
+    $ObjectDir = Join-Path $BuildDir "obj-$Name"
+    New-Item -ItemType Directory -Force -Path $ObjectDir | Out-Null
+    Get-ChildItem $ObjectDir -File -ErrorAction SilentlyContinue | Remove-Item -Force
+
+    $Arguments = @(
+        "/nologo",
+        "/std:c++17",
+        "/EHsc",
+        "/W4",
+        "/permissive-",
+        "/MD",
+        "/O2",
+        "/Zi",
+        "/Fd:$ObjectDir\$Name.pdb",
+        "/Fe:$Executable",
+        "/Fo:$ObjectDir\"
+    ) + $defines + $includeArgs + $Sources + @(
+        "/link",
+        "/NOLOGO",
+        "/DEBUG:FULL",
+        "/PDB:$OutputDir\$Name.pdb"
+    ) + $Libraries
+
+    & cl.exe @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "cl.exe failed while building $Name"
+    }
+}
+
+$ModelSources = @(
+    (Join-Path $Root "src\dpdfnet-model.cpp")
+)
+$DspSources = @(
+    (Join-Path $Root "src\dpdfnet-model.cpp"),
+    (Join-Path $Root "src\dpdfnet-processor.cpp"),
+    (Join-Path $Root "src\stft.cpp"),
+    (Join-Path $kissRoot "kiss_fft.c"),
+    (Join-Path $kissRoot "kiss_fftr.c")
+)
+
+Invoke-NativeExecutableBuild `
+    -Name "dpdfnet-model-smoke" `
+    -Sources (@((Join-Path $Root "tools\model-smoke.cpp")) + $ModelSources + @(
+        (Join-Path $Root "src\stft.cpp"),
+        (Join-Path $kissRoot "kiss_fft.c"),
+        (Join-Path $kissRoot "kiss_fftr.c")
+    )) `
+    -Libraries @($onnxRenamedLib)
+
+Invoke-NativeExecutableBuild `
+    -Name "dpdfnet-model-contract-test" `
+    -Sources (@((Join-Path $Root "tests\model-contract-test.cpp")) + $ModelSources) `
+    -Libraries @($onnxRenamedLib)
+
+Invoke-NativeExecutableBuild `
+    -Name "obs-dpdfnet-tests" `
+    -Sources (@(
+        (Join-Path $Root "tests\dpdfnet-tests.cpp"),
+        (Join-Path $Root "src\dpdfnet-settings.cpp")
+    ) + $DspSources) `
+    -Libraries @($obsLib, $onnxRenamedLib)
+
+Invoke-NativeExecutableBuild `
+    -Name "dpdfnet-stream-dump" `
+    -Sources (@((Join-Path $Root "tools\stream-dump.cpp")) + $DspSources) `
+    -Libraries @($obsLib, $onnxRenamedLib)
+
+Invoke-NativeExecutableBuild `
+    -Name "dpdfnet-quality-benchmark" `
+    -Sources (@((Join-Path $Root "tools\quality-benchmark.cpp")) + $DspSources) `
+    -Libraries @($obsLib, $onnxRenamedLib)
+
+Invoke-NativeExecutableBuild `
+    -Name "dpdfnet-processor-benchmark" `
+    -Sources (@((Join-Path $Root "tools\processor-benchmark.cpp")) + $DspSources) `
+    -Libraries @($obsLib, $onnxRenamedLib)
 
 Remove-Item (Join-Path $OutputDir "onnxruntime.dll") -Force -ErrorAction SilentlyContinue
 Copy-Item $onnxDll -Destination (Join-Path $OutputDir $onnxRenamedDll) -Force
@@ -312,3 +400,4 @@ if (!(Test-Path $SourceCommitFile)) {
 }
 
 Write-Host "Built $pluginDll"
+Write-Host "Built Windows test and quality executables in $OutputDir"

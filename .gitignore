@@ -38,3 +38,5 @@ third_party/
 
 # Local agent/tool state
 .context/
+__pycache__/
+*.py[cod]

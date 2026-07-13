@@ -20,8 +20,8 @@ Current filter:
 - Default model: `models/dpdfnet8_48khz_hr.onnx`
 - Model input: streaming DPDFNet ONNX with metadata-backed state initialization
 - Audio path: one selected mono input, blended back to the source channels
-- Controls: model path, input channel, suppression limit, wet mix, output gain,
-  bypass, reset state
+- Controls: model preset or custom model, input channel, suppression limit, wet
+  mix, output gain, latency-aligned bypass, reset state, diagnostics
 
 ## Install A Release Build
 
@@ -63,6 +63,7 @@ From PowerShell in this directory:
 ```powershell
 .\scripts\bootstrap-windows.ps1
 .\scripts\build-windows-msvc.ps1
+.\scripts\test-windows.ps1
 .\scripts\install-windows.ps1 -BuildDir .\build\msvc
 ```
 
@@ -81,6 +82,7 @@ folder:
 For preserving an RE20-style close dynamic mic sound, start with:
 
 - `Input channel`: `Input 1 / left`
+- `Model`: `Best quality (DPDFNet8)`
 - `Suppression limit`: `24-30 dB`
 - `Wet mix`: `100%`
 - `Output gain`: `0 dB`
@@ -98,6 +100,20 @@ If OBS's audio sample rate differs from the loaded model's rate (the bundled
 models run at 48 kHz), the filter resamples the enhanced voice lane internally
 at both boundaries, so a 44.1 kHz OBS setup works out of the box. At 48 kHz the
 model runs natively with no resampling in the path.
+
+`Bypass (latency-aligned)` keeps the processing pipeline warm and returns its
+aligned dry lane. This prevents stale or reordered packets while comparing the
+processed and original signals. Disable the filter with OBS's filter toggle
+when the goal is to stop its CPU use completely.
+
+The diagnostics row distinguishes the selected model from the model that is
+actually active, reports native or resampled operation, and shows the model's
+frame and hop sizes. It also reports callback timing for the current active
+processing epoch after audio has flowed. Model, format, resampler, and reset
+transitions start a new epoch, and fail-open passthrough callbacks are excluded.
+These figures are processing measurements, not an end-to-end microphone
+latency claim. Press `Refresh diagnostics` to update the row while the filter
+properties are open.
 
 ## CMake Build
 
@@ -161,6 +177,63 @@ cmake --build build-smoke --config Release --target dpdfnet-model-smoke
 .\build-smoke\Release\dpdfnet-model-smoke.exe .\models\dpdfnet8_48khz_hr.onnx
 ```
 
+Set `DPDFNET_BUILD_TESTS=ON` to register the deterministic processor and model
+contract tests with CTest. The other optional tool targets are controlled by
+`DPDFNET_BUILD_STREAM_DUMP`, `DPDFNET_BUILD_QUALITY_BENCHMARK`, and
+`DPDFNET_BUILD_PROCESSOR_BENCHMARK`.
+
+## Tests And Benchmarks
+
+The direct Windows build produces the plugin, both model checks, the processor
+suite, and the benchmark tools. Run the authoritative local gate with:
+
+```powershell
+.\scripts\build-windows-msvc.ps1
+.\scripts\test-windows.ps1
+```
+
+The suite covers both bundled models, malformed ONNX contracts, variable OBS
+packet sizes, channel and timestamp resets, aligned bypass transitions,
+44.1 and 96 kHz resampling, format transitions, resampled failure recovery,
+deterministic signal-integrity cases, and the runtime failure circuit breaker.
+The release script runs this gate before staging, including when `-SkipBuild`
+is used, and rejects binaries from a different source revision.
+
+Measure processor timing for both models at 44.1, 48, and 96 kHz with:
+
+```powershell
+.\scripts\benchmark-windows.ps1
+```
+
+The report is written to `build\processor-benchmark.txt`. Live OBS callback
+timing, including lock wait, is accumulated by the filter and displayed in its
+diagnostics row. Use a Windows heap or ETW trace when validating allocations in
+ONNX Runtime and OBS themselves; plugin-owned buffer-capacity checks cannot see
+allocations inside those libraries.
+
+The automated signal tests detect numerical and stream-integrity regressions,
+but they do not claim to measure perceived speech quality. For a real-corpus
+comparison, commit and rebuild a clean source tree, put local mono 48 kHz PCM16
+or float32 clean-speech and noise WAVs under `build\quality-corpus\`, then run:
+
+```powershell
+.\scripts\quality-benchmark-windows.ps1 `
+  -CaseName re20-fan-01 `
+  -CleanWav .\build\quality-corpus\clean.wav `
+  -NoiseWav .\build\quality-corpus\fan.wav
+```
+
+The case name creates a separate result directory and existing evidence is not
+overwritten unless `-Overwrite` is explicit. The ignored
+`build\quality-results\` directory receives the exact scaled clean and noise
+references, mixture and enhanced listening WAVs, and a report containing build,
+runtime, executable, input, and model provenance plus the mixing scales,
+settings, packet pattern, SI-SDR signals, clean-speech level change, noise
+attenuation, peak, clipping, non-finite, and DC measurements. Compare each model
+only with a baseline made from the same corpus and listen to every changed case
+for pumping, musical noise, coloration, and speech transitions before accepting
+it.
+
 ## Models
 
 The `models/` directory contains DPDFNet ONNX artifacts from
@@ -173,7 +246,13 @@ The release includes two 48 kHz models:
 - `dpdfnet2_48khz_hr.onnx` is the lighter alternative when lower CPU use is
   more important.
 
-Choose a model with the `ONNX model` setting in the filter properties.
+Choose `Best quality (DPDFNet8)`, `Lower CPU (DPDFNet2)`, or `Custom ONNX
+model` in the filter properties. Existing scenes that stored a model path are
+migrated without discarding custom or missing paths. Custom models must expose
+the exact two-input, two-output float32 DPDFNet tensor contract described by
+their metadata. Contract violations and non-finite warm-up output are rejected
+before activation. Non-finite runtime output fails open and trips the circuit
+breaker after repeated errors.
 
 To refresh the pinned ONNX Runtime and DPDFNet model artifacts with hash checks:
 
@@ -205,7 +284,9 @@ From Windows PowerShell:
   )
 ```
 
-That writes the zip, checksum, and release notes under `build/`.
+The script rebuilds unless `-SkipBuild` is supplied, runs the mandatory Windows
+test gate either way, verifies clean source and test provenance, then writes the
+zip, checksum, and release notes under `build/`.
 
 From WSL:
 

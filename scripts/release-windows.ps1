@@ -68,6 +68,13 @@ if (-not $SkipBuild) {
         -OnnxRuntimeVersion $OnnxRuntimeVersion
 }
 
+# The behavioral gate always runs, including with -SkipBuild. It rejects stale
+# test binaries and a dirty source tree before any files enter release staging.
+& (Join-Path $PSScriptRoot "test-windows.ps1") `
+    -ObsInstallDir "C:\Program Files\obs-studio" `
+    -Configuration $Configuration `
+    -RequireCleanProvenance
+
 $PluginDll = Join-Path $BuildDir "$Configuration\obs-dpdfnet.dll"
 if (!(Test-Path $PluginDll)) {
     throw "Plugin DLL not found at $PluginDll. Run without -SkipBuild."
@@ -91,12 +98,13 @@ if (Test-Path $OrtLicense) {
 # whatever HEAD is at staging time: with -SkipBuild those can differ, and the
 # publish-side check would bless a stale binary.
 $SourceCommitFile = Join-Path $BuildDir "$Configuration\source-commit.txt"
-$ReleaseCommit = $SourceCommit.Trim()
-if ([string]::IsNullOrWhiteSpace($ReleaseCommit)) {
-    if (!(Test-Path $SourceCommitFile)) {
-        throw "No build provenance at $SourceCommitFile. Re-run without -SkipBuild, or pass -SourceCommit <commit-sha> if you know which commit produced the staged build."
-    }
-    $ReleaseCommit = (Get-Content -Raw $SourceCommitFile).Trim()
+if (!(Test-Path $SourceCommitFile)) {
+    throw "No build provenance at $SourceCommitFile. Re-run without -SkipBuild."
+}
+$ReleaseCommit = (Get-Content -Raw $SourceCommitFile).Trim()
+if (![string]::IsNullOrWhiteSpace($SourceCommit) -and
+    $SourceCommit.Trim().ToLowerInvariant() -ne $ReleaseCommit.ToLowerInvariant()) {
+    throw "-SourceCommit does not match the commit recorded by the staged build. Rebuild the requested source instead of overriding provenance."
 }
 
 if ($ReleaseCommit -match '-dirty$') {

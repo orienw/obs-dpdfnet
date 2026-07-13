@@ -13,6 +13,9 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 option(DPDFNET_FETCH_KISSFFT "Fetch KissFFT at configure time" ON)
 option(DPDFNET_BUILD_MODEL_SMOKE "Build the standalone DPDFNet model smoke test" OFF)
 option(DPDFNET_BUILD_STREAM_DUMP "Build the standalone DPDFNet stream parity dumper" OFF)
+option(DPDFNET_BUILD_QUALITY_BENCHMARK "Build the opt-in local quality benchmark" OFF)
+option(DPDFNET_BUILD_PROCESSOR_BENCHMARK "Build the processor timing benchmark" OFF)
+option(DPDFNET_BUILD_TESTS "Build deterministic processor and model contract tests" OFF)
 option(DPDFNET_COPY_RUNTIME_DEPENDENCIES "Copy ONNX Runtime shared libraries next to CMake-built binaries" ON)
 option(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES "Install ONNX Runtime shared libraries with the OBS plugin" ON)
 
@@ -27,6 +30,7 @@ endif()
 
 find_package(libobs CONFIG REQUIRED)
 find_package(ONNXRuntime REQUIRED)
+find_package(Threads REQUIRED)
 
 if(DPDFNET_FETCH_KISSFFT)
   include(FetchContent)
@@ -66,6 +70,8 @@ endfunction()
 add_library(obs-dpdfnet MODULE
   src/dpdfnet-filter.cpp
   src/dpdfnet-model.cpp
+  src/dpdfnet-processor.cpp
+  src/dpdfnet-settings.cpp
   src/plugin-main.cpp
   src/stft.cpp
 )
@@ -79,6 +85,7 @@ target_compile_definitions(obs-dpdfnet PRIVATE
 target_link_libraries(obs-dpdfnet PRIVATE
   OBS::libobs
   ONNXRuntime::ONNXRuntime
+  Threads::Threads
   ${DPDFNET_KISSFFT_TARGET}
 )
 
@@ -106,9 +113,11 @@ if(DPDFNET_BUILD_STREAM_DUMP)
   add_executable(dpdfnet-stream-dump
     tools/stream-dump.cpp
     src/dpdfnet-model.cpp
+    src/dpdfnet-processor.cpp
     src/stft.cpp
   )
   target_link_libraries(dpdfnet-stream-dump PRIVATE
+    OBS::libobs
     ONNXRuntime::ONNXRuntime
     ${DPDFNET_KISSFFT_TARGET}
   )
@@ -120,10 +129,113 @@ if(DPDFNET_BUILD_STREAM_DUMP)
   dpdfnet_copy_runtime_dependencies(dpdfnet-stream-dump)
 endif()
 
+if(DPDFNET_BUILD_QUALITY_BENCHMARK)
+  add_executable(dpdfnet-quality-benchmark
+    tools/quality-benchmark.cpp
+    src/dpdfnet-model.cpp
+    src/dpdfnet-processor.cpp
+    src/stft.cpp
+  )
+  target_link_libraries(dpdfnet-quality-benchmark PRIVATE
+    OBS::libobs
+    ONNXRuntime::ONNXRuntime
+    ${DPDFNET_KISSFFT_TARGET}
+  )
+  if(DPDFNET_PLATFORM_COMPILE_DEFINITIONS)
+    target_compile_definitions(dpdfnet-quality-benchmark PRIVATE
+      ${DPDFNET_PLATFORM_COMPILE_DEFINITIONS}
+    )
+  endif()
+  dpdfnet_copy_runtime_dependencies(dpdfnet-quality-benchmark)
+endif()
+
+if(DPDFNET_BUILD_PROCESSOR_BENCHMARK)
+  add_executable(dpdfnet-processor-benchmark
+    tools/processor-benchmark.cpp
+    src/dpdfnet-model.cpp
+    src/dpdfnet-processor.cpp
+    src/stft.cpp
+  )
+  target_link_libraries(dpdfnet-processor-benchmark PRIVATE
+    OBS::libobs
+    ONNXRuntime::ONNXRuntime
+    ${DPDFNET_KISSFFT_TARGET}
+  )
+  if(DPDFNET_PLATFORM_COMPILE_DEFINITIONS)
+    target_compile_definitions(dpdfnet-processor-benchmark PRIVATE
+      ${DPDFNET_PLATFORM_COMPILE_DEFINITIONS}
+    )
+  endif()
+  dpdfnet_copy_runtime_dependencies(dpdfnet-processor-benchmark)
+endif()
+
+if(DPDFNET_BUILD_TESTS)
+  enable_testing()
+  add_executable(obs-dpdfnet-tests
+    tests/dpdfnet-tests.cpp
+    src/dpdfnet-model.cpp
+    src/dpdfnet-processor.cpp
+    src/dpdfnet-settings.cpp
+    src/stft.cpp
+  )
+  target_link_libraries(obs-dpdfnet-tests PRIVATE
+    OBS::libobs
+    ONNXRuntime::ONNXRuntime
+    ${DPDFNET_KISSFFT_TARGET}
+  )
+  if(DPDFNET_PLATFORM_COMPILE_DEFINITIONS)
+    target_compile_definitions(obs-dpdfnet-tests PRIVATE
+      ${DPDFNET_PLATFORM_COMPILE_DEFINITIONS}
+    )
+  endif()
+  dpdfnet_copy_runtime_dependencies(obs-dpdfnet-tests)
+
+  add_executable(dpdfnet-model-contract-test
+    tests/model-contract-test.cpp
+    src/dpdfnet-model.cpp
+  )
+  target_link_libraries(dpdfnet-model-contract-test PRIVATE
+    ONNXRuntime::ONNXRuntime
+  )
+  if(DPDFNET_PLATFORM_COMPILE_DEFINITIONS)
+    target_compile_definitions(dpdfnet-model-contract-test PRIVATE
+      ${DPDFNET_PLATFORM_COMPILE_DEFINITIONS}
+    )
+  endif()
+  dpdfnet_copy_runtime_dependencies(dpdfnet-model-contract-test)
+
+  add_test(NAME model-contract COMMAND dpdfnet-model-contract-test
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/model-contract"
+    "${CMAKE_CURRENT_SOURCE_DIR}/models/dpdfnet8_48khz_hr.onnx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/models/dpdfnet2_48khz_hr.onnx"
+  )
+  add_test(NAME processor COMMAND obs-dpdfnet-tests
+    "${CMAKE_CURRENT_SOURCE_DIR}/models/dpdfnet8_48khz_hr.onnx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/models/dpdfnet2_48khz_hr.onnx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/model-contract"
+  )
+endif()
+
 if(MSVC)
   target_compile_options(obs-dpdfnet PRIVATE /W4 /permissive-)
+  foreach(target dpdfnet-model-smoke dpdfnet-stream-dump
+                 dpdfnet-quality-benchmark dpdfnet-processor-benchmark
+                 obs-dpdfnet-tests
+                 dpdfnet-model-contract-test)
+    if(TARGET ${target})
+      target_compile_options(${target} PRIVATE /W4 /permissive-)
+    endif()
+  endforeach()
 else()
   target_compile_options(obs-dpdfnet PRIVATE -Wall -Wextra -Wpedantic)
+  foreach(target dpdfnet-model-smoke dpdfnet-stream-dump
+                 dpdfnet-quality-benchmark dpdfnet-processor-benchmark
+                 obs-dpdfnet-tests
+                 dpdfnet-model-contract-test)
+    if(TARGET ${target})
+      target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+  endforeach()
 endif()
 
 set_target_properties(obs-dpdfnet PROPERTIES

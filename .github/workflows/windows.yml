@@ -1,0 +1,80 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-2025
+    env:
+      OBS_VERSION: 32.1.2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download OBS runtime
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force build/obs-runtime | Out-Null
+          gh release download $env:OBS_VERSION `
+            --repo obsproject/obs-studio `
+            --pattern "OBS-Studio-$env:OBS_VERSION-Windows-x64.zip" `
+            --dir build/obs-runtime
+          Expand-Archive `
+            "build/obs-runtime/OBS-Studio-$env:OBS_VERSION-Windows-x64.zip" `
+            build/obs-runtime/extracted
+          $obsDll = Get-ChildItem build/obs-runtime/extracted -Recurse `
+            -Filter obs.dll | Where-Object { $_.FullName -match 'bin\\64bit\\obs\.dll$' } |
+            Select-Object -First 1
+          if (!$obsDll) { throw "Downloaded OBS archive contains no x64 obs.dll" }
+          $obsRoot = Split-Path (Split-Path (Split-Path $obsDll.FullName))
+          "OBS_INSTALL_DIR=$obsRoot" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Verify generated model fixtures
+        shell: pwsh
+        run: |
+          python -m pip install onnx==1.21.0
+          python tests/generate_model_contract_fixtures.py build/generated-fixtures
+          $expected = Get-ChildItem tests/fixtures/model-contract -Filter *.onnx
+          $generatedFiles = Get-ChildItem build/generated-fixtures -Filter *.onnx
+          $nameDrift = Compare-Object `
+            ($expected.Name | Sort-Object) `
+            ($generatedFiles.Name | Sort-Object)
+          if ($nameDrift) { throw "Tracked and generated fixture sets differ" }
+          foreach ($file in $expected) {
+            $generated = Join-Path build/generated-fixtures $file.Name
+            if (!(Test-Path $generated)) { throw "Missing generated fixture $($file.Name)" }
+            $left = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+            $right = (Get-FileHash $generated -Algorithm SHA256).Hash
+            if ($left -ne $right) { throw "Fixture drift: $($file.Name)" }
+          }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          ./scripts/build-windows-msvc.ps1 -ObsInstallDir $env:OBS_INSTALL_DIR
+
+      - name: Test
+        shell: pwsh
+        run: |
+          ./scripts/test-windows.ps1 `
+            -ObsInstallDir $env:OBS_INSTALL_DIR `
+            -RequireCleanProvenance
+
+      - name: Benchmark
+        shell: pwsh
+        run: |
+          ./scripts/benchmark-windows.ps1 -ObsInstallDir $env:OBS_INSTALL_DIR
+
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@v4
+        with:
+          name: processor-benchmark
+          path: build/processor-benchmark.txt

@@ -9,6 +9,51 @@
 #include <string_view>
 #include <system_error>
 
+namespace {
+
+constexpr float kMaxMetadataFloatMagnitude = 1'000'000.0f;
+
+void validate_tensor_contract(const Ort::TypeInfo &type_info,
+                              const char *tensor_description,
+                              const std::vector<int64_t> &expected_shape) {
+  if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
+    throw std::runtime_error(std::string("DPDFNet ") + tensor_description +
+                             " must be a tensor");
+  }
+
+  const auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+  if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    throw std::runtime_error(std::string("DPDFNet ") + tensor_description +
+                             " must use float32 values");
+  }
+
+  if (!tensor_info.HasShape()) {
+    throw std::runtime_error(std::string("DPDFNet ") + tensor_description +
+                             " must declare a shape");
+  }
+
+  const auto actual_shape = tensor_info.GetShape();
+  if (actual_shape.size() != expected_shape.size()) {
+    throw std::runtime_error(std::string("DPDFNet ") + tensor_description +
+                             " has an incompatible rank");
+  }
+
+  for (size_t i = 0; i < actual_shape.size(); ++i) {
+    const int64_t actual = actual_shape[i];
+    if (actual == 0 || (actual > 0 && actual != expected_shape[i])) {
+      throw std::runtime_error(std::string("DPDFNet ") + tensor_description +
+                               " has an incompatible shape");
+    }
+  }
+}
+
+bool all_finite(const std::vector<float> &values) {
+  return std::all_of(values.begin(), values.end(),
+                     [](float value) { return std::isfinite(value); });
+}
+
+} // namespace
+
 Ort::Env &DpdfnetModel::env() {
   static Ort::Env instance(ORT_LOGGING_LEVEL_WARNING, "obs-dpdfnet");
   return instance;
@@ -32,9 +77,9 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
   session_ = std::make_unique<Ort::Session>(env(), model_path_.c_str(),
                                             session_options_);
 
-  if (session_->GetInputCount() < 2 || session_->GetOutputCount() < 2)
+  if (session_->GetInputCount() != 2 || session_->GetOutputCount() != 2)
     throw std::runtime_error(
-        "DPDFNet ONNX model must expose two inputs and two outputs");
+        "DPDFNet ONNX model must expose exactly two inputs and two outputs");
 
   auto input_spec = session_->GetInputNameAllocated(0, allocator_);
   auto input_state = session_->GetInputNameAllocated(1, allocator_);
@@ -65,7 +110,8 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
     throw std::runtime_error(
         "DPDFNet model metadata has inconsistent FFT dimensions");
   if (state_size <= 0 || erb_norm_state_size < 0 || spec_norm_state_size < 0 ||
-      erb_norm_state_size + spec_norm_state_size > state_size) {
+      erb_norm_state_size > state_size ||
+      spec_norm_state_size > state_size - erb_norm_state_size) {
     throw std::runtime_error(
         "DPDFNet model metadata has inconsistent state dimensions");
   }
@@ -82,6 +128,18 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
     throw std::runtime_error(
         "DPDFNet model metadata state_size is out of supported range");
 
+  spec_shape_ = {1, 1, freq_bins_, 2};
+  state_shape_ = {state_size};
+
+  validate_tensor_contract(session_->GetInputTypeInfo(0), "spectrum input",
+                           spec_shape_);
+  validate_tensor_contract(session_->GetInputTypeInfo(1), "state input",
+                           state_shape_);
+  validate_tensor_contract(session_->GetOutputTypeInfo(0), "spectrum output",
+                           spec_shape_);
+  validate_tensor_contract(session_->GetOutputTypeInfo(1), "state output",
+                           state_shape_);
+
   initial_state_.assign(static_cast<size_t>(state_size), 0.0f);
 
   auto erb_norm = parse_float_list(metadata_value(metadata, "erb_norm_init"),
@@ -95,10 +153,8 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
   std::copy(spec_norm.begin(), spec_norm.end(),
             initial_state_.begin() + erb_norm_state_size);
 
-  spec_shape_ = {1, 1, freq_bins_, 2};
-  state_shape_ = {state_size};
-
-  memory_info_ = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  memory_info_ =
+      Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
   const size_t spec_n = static_cast<size_t>(freq_bins_) * 2;
   in_spec_.assign(spec_n, 0.0f);
@@ -144,6 +200,14 @@ void DpdfnetModel::reset() {
 void DpdfnetModel::enhance() {
   Ort::IoBinding &binding = parity_ == 0 ? *binding_a_ : *binding_b_;
   session_->Run(Ort::RunOptions{nullptr}, binding);
+
+  const auto &next_state = parity_ == 0 ? state_b_ : state_a_;
+  if (!all_finite(out_spec_))
+    throw std::runtime_error(
+        "DPDFNet model produced non-finite spectrum output");
+  if (!all_finite(next_state))
+    throw std::runtime_error("DPDFNet model produced non-finite state output");
+
   parity_ ^= 1;
 }
 
@@ -173,23 +237,37 @@ std::vector<float> DpdfnetModel::parse_float_list(const std::string &value,
   std::vector<float> out;
   out.reserve(expected);
 
+  if (value.empty()) {
+    if (expected != 0) {
+      throw std::runtime_error(
+          std::string("DPDFNet metadata key has unexpected value count: ") +
+          key);
+    }
+    return out;
+  }
+
   size_t start = 0;
-  while (start < value.size()) {
+  while (true) {
     const size_t comma = value.find(',', start);
     const size_t stop = comma == std::string::npos ? value.size() : comma;
     const std::string_view token(value.data() + start, stop - start);
 
-    if (!token.empty()) {
-      float number = 0.0f;
-      const auto *begin = token.data();
-      const auto *end = token.data() + token.size();
-      const auto result = std::from_chars(begin, end, number);
-      if (result.ec != std::errc() || result.ptr != end)
-        throw std::runtime_error(
-            std::string("DPDFNet metadata key contains an invalid float: ") +
-            key);
-      out.push_back(number);
+    if (token.empty())
+      throw std::runtime_error(
+          std::string("DPDFNet metadata key contains an empty float: ") + key);
+
+    float number = 0.0f;
+    const auto *begin = token.data();
+    const auto *end = token.data() + token.size();
+    const auto result = std::from_chars(begin, end, number);
+    if (result.ec != std::errc() || result.ptr != end ||
+        !std::isfinite(number) ||
+        std::abs(number) > kMaxMetadataFloatMagnitude) {
+      throw std::runtime_error(
+          std::string("DPDFNet metadata key contains an invalid float: ") +
+          key);
     }
+    out.push_back(number);
 
     if (comma == std::string::npos)
       break;
