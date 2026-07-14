@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "../src/dpdfnet-processor.hpp"
+#include "../src/dpdfnet-realtime-guard.hpp"
 #include "../src/dpdfnet-settings.hpp"
 #include "../src/ring.hpp"
 
@@ -10,6 +11,7 @@
 #include <deque>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -80,6 +82,84 @@ void test_ring() {
           "ring grew during an over-capacity realtime push");
   require(realtime_ring.capacity() == 2 && realtime_ring.size() == 2,
           "failed realtime push changed the ring");
+}
+
+void test_realtime_budget_guard() {
+  constexpr uint64_t hop_budget = 10'000'000;
+  DpdfnetRealtimeBudgetGuard guard;
+
+  const auto exact = guard.observe(hop_budget, 1, 480, 48000);
+  require(exact.budget_ns == hop_budget && !exact.tripped,
+          "exact realtime budget tripped the overload guard");
+  require(guard.debt_ns() == 0,
+          "exact realtime budget accumulated overload debt");
+
+  for (size_t hop = 1; hop <= 10; ++hop) {
+    const auto observation = guard.observe(2 * hop_budget, 1, 480, 48000);
+    require(observation.tripped == (hop == 10),
+            "2x realtime load tripped at the wrong point");
+    require(observation.debt_ns == hop * hop_budget,
+            "overload observation reported the wrong accumulated debt");
+  }
+
+  guard.reset();
+  for (size_t hop = 1; hop <= 100; ++hop) {
+    const auto observation =
+        guard.observe(hop_budget + 1'000'000, 1, 480, 48000);
+    require(observation.tripped == (hop == 100),
+            "sustained 10 percent overload tripped at the wrong point");
+  }
+
+  guard.reset();
+  require(!guard.observe(200'000'000, 1, 480, 48000).tripped,
+          "one scheduling spike opened the overload circuit");
+  for (size_t hop = 0; hop < 22; ++hop)
+    require(!guard.observe(1'000'000, 1, 480, 48000).tripped,
+            "healthy processing tripped while repaying overload debt");
+  require(guard.debt_ns() == 0 && guard.observed_audio_ns() == 0,
+          "healthy processing did not repay overload debt");
+
+  guard.reset();
+  require(!guard.observe(19'000'000, 2, 480, 48000).tripped,
+          "multi-hop processing did not receive a multi-hop budget");
+  require(guard.debt_ns() == 0,
+          "in-budget multi-hop processing accumulated overload debt");
+
+  require(!guard.observe(20'000'000, 1, 480, 48000).tripped,
+          "initial overload unexpectedly tripped the guard");
+  const uint64_t debt_before_zero_hop = guard.debt_ns();
+  require(!guard.observe(UINT64_MAX, 0, 480, 48000).tripped &&
+              guard.debt_ns() == debt_before_zero_hop,
+          "zero-hop callback changed overload debt");
+
+  guard.reset();
+  const auto saturated =
+      guard.observe(UINT64_MAX, std::numeric_limits<size_t>::max(),
+                    std::numeric_limits<int>::max(), 1);
+  require(saturated.budget_ns == UINT64_MAX && !saturated.tripped,
+          "realtime budget arithmetic did not saturate safely");
+}
+
+void test_process_result_fail_open() {
+  DpdfnetProcessResult result;
+  result.disposition = DpdfnetDisposition::Pending;
+  result.data[0] = reinterpret_cast<float *>(uintptr_t{1});
+  result.frames = 8192;
+  result.timestamp = NS_PER_SECOND;
+  result.processed_hops = 16;
+  result.resampler_refresh_needed = true;
+  result.event = DpdfnetEvent::RealtimeOverloadCircuitOpened;
+  result.message[0] = 'x';
+
+  result.fail_open();
+  require(result.disposition == DpdfnetDisposition::Passthrough &&
+              result.data[0] == nullptr && result.frames == 0 &&
+              result.timestamp == 0,
+          "fail-open transition retained pending output state");
+  require(result.processed_hops == 16 && result.resampler_refresh_needed &&
+              result.event == DpdfnetEvent::RealtimeOverloadCircuitOpened &&
+              result.message[0] == 'x',
+          "fail-open transition discarded diagnostic state");
 }
 
 void test_timestamp_floor() {
@@ -428,6 +508,160 @@ void test_extreme_contract_stream(const std::filesystem::path &fixtures) {
           "extreme contract stream never reached processed output");
 }
 
+void test_capacity_failure_diagnostics(const std::string &model_path) {
+  std::vector<float> oversized(DPDFNET_MAX_REALTIME_PACKET_FRAMES + 1, 0.02f);
+  DpdfnetAudioPacket packet;
+  packet.data[0] = oversized.data();
+  packet.frames = static_cast<uint32_t>(oversized.size());
+  packet.timestamp = NS_PER_SECOND;
+
+  DpdfnetProcessor native = make_processor(model_path);
+  auto result = native.process(packet);
+  require(result.disposition == DpdfnetDisposition::Passthrough &&
+              result.event == DpdfnetEvent::OversizedPacket,
+          "first oversized packet was not reported while failing open");
+  auto state = native.state();
+  require(state.oversized_packets == 1 && state.capacity_failures == 0 &&
+              state.capacity_recovery_pending && !state.processing_disabled &&
+              !state.consecutive_failures,
+          "oversized packet changed the wrong processor state");
+
+  packet.timestamp += 200'000'000;
+  result = native.process(packet);
+  require(result.event == DpdfnetEvent::None &&
+              native.state().oversized_packets == 2,
+          "repeated oversized packet was not counted or was reported twice");
+
+  std::vector<float> supported(960, 0.02f);
+  packet.data[0] = supported.data();
+  packet.frames = static_cast<uint32_t>(supported.size());
+  packet.timestamp += 200'000'000;
+  result = native.process(packet);
+  require(result.disposition != DpdfnetDisposition::Passthrough &&
+              !native.state().capacity_recovery_pending,
+          "supported packet did not recover the native pipeline");
+
+  native.reset_state();
+  state = native.state();
+  require(state.oversized_packets == 0 && state.capacity_failures == 0,
+          "Reset did not clear capacity diagnostics");
+  packet.data[0] = oversized.data();
+  packet.frames = static_cast<uint32_t>(oversized.size());
+  packet.timestamp += 200'000'000;
+  require(native.process(packet).event == DpdfnetEvent::OversizedPacket,
+          "Reset did not rearm oversized-packet reporting");
+
+  constexpr uint32_t resampled_rate = 44100;
+  DpdfnetProcessor resampled = make_processor(model_path, resampled_rate);
+  std::vector<float> resampled_audio(882, 0.02f);
+  packet.data[0] = resampled_audio.data();
+  packet.frames = static_cast<uint32_t>(resampled_audio.size());
+  packet.timestamp = 2 * NS_PER_SECOND;
+  (void)resampled.process(packet);
+
+  packet.data[0] = oversized.data();
+  packet.frames = static_cast<uint32_t>(oversized.size());
+  packet.timestamp += 200'000'000;
+  result = resampled.process(packet);
+  require(result.event == DpdfnetEvent::OversizedPacket &&
+              result.resampler_refresh_needed &&
+              resampled.state().resampler_refresh_required,
+          "resampled oversized packet did not invalidate stale resamplers");
+
+  packet.timestamp += 200'000'000;
+  result = resampled.process(packet);
+  require(!result.resampler_refresh_needed &&
+              resampled.state().oversized_packets == 2,
+          "continuous oversized packets repeatedly requested resamplers");
+
+  state = resampled.state();
+  resampled.replace_resamplers(prepare_dpdfnet_resamplers(
+      resampled_rate, state.model_rate, state.hop_size));
+  packet.timestamp += 200'000'000;
+  result = resampled.process(packet);
+  require(!result.resampler_refresh_needed && resampled.state().resampling,
+          "unused fresh resamplers were invalidated by another oversized "
+          "packet");
+
+  packet.data[0] = resampled_audio.data();
+  packet.frames = static_cast<uint32_t>(resampled_audio.size());
+  packet.timestamp += 200'000'000;
+  result = resampled.process(packet);
+  require(result.disposition != DpdfnetDisposition::Passthrough &&
+              !resampled.state().capacity_recovery_pending,
+          "supported packet did not recover the resampled pipeline");
+
+  packet.data[0] = oversized.data();
+  packet.frames = static_cast<uint32_t>(oversized.size());
+  packet.timestamp += 200'000'000;
+  result = resampled.process(packet);
+  require(result.resampler_refresh_needed &&
+              resampled.state().resampler_refresh_required,
+          "later oversized packet did not invalidate used resamplers");
+}
+
+void test_capacity_invariant_diagnostic(const std::string &model_path) {
+  DpdfnetProcessor processor;
+  processor.set_format(48000, 1);
+  auto model = prepare_dpdfnet_model(model_path);
+  model.realtime = DpdfnetRealtimeStorage{};
+  processor.replace_model(std::move(model));
+
+  std::vector<float> data(480, 0.02f);
+  DpdfnetAudioPacket packet;
+  packet.data[0] = data.data();
+  packet.frames = static_cast<uint32_t>(data.size());
+  packet.timestamp = NS_PER_SECOND;
+  auto result = processor.process(packet);
+  require(result.disposition == DpdfnetDisposition::Passthrough &&
+              result.event == DpdfnetEvent::CapacityInvariantFailure,
+          "unexpected buffer exhaustion was not reported while failing open");
+  auto state = processor.state();
+  require(state.capacity_failures == 1 && state.oversized_packets == 0 &&
+              state.capacity_recovery_pending && !state.processing_disabled &&
+              !state.consecutive_failures,
+          "capacity invariant failure changed the wrong processor state");
+
+  packet.timestamp += 10'000'000;
+  result = processor.process(packet);
+  require(result.event == DpdfnetEvent::None &&
+              processor.state().capacity_failures == 2,
+          "repeated capacity invariant failure was not counted or was reported "
+          "twice");
+}
+
+void test_realtime_overload_disable(const std::string &model_path) {
+  DpdfnetProcessor processor = make_processor(model_path);
+  require(processor.disable_for_realtime_overload(
+              "processing used 20000 us for 10000 us of model audio"),
+          "realtime overload did not open the circuit");
+  auto snapshot = processor.snapshot();
+  require(snapshot.processing_disabled &&
+              snapshot.disable_reason == DpdfnetDisableReason::RealtimeOverload,
+          "realtime overload circuit did not retain its distinct reason");
+  require(snapshot.consecutive_failures == 0 &&
+              snapshot.last_error.find("20000 us") != std::string::npos,
+          "realtime overload was misreported as a processing failure");
+
+  std::vector<float> data(960, 0.02f);
+  DpdfnetAudioPacket packet;
+  packet.data[0] = data.data();
+  packet.frames = static_cast<uint32_t>(data.size());
+  packet.timestamp = NS_PER_SECOND;
+  require(processor.process(packet).disposition ==
+              DpdfnetDisposition::Passthrough,
+          "open realtime circuit retried processing");
+
+  processor.reset_state();
+  snapshot = processor.snapshot();
+  require(!snapshot.processing_disabled &&
+              snapshot.disable_reason == DpdfnetDisableReason::None,
+          "Reset did not close the realtime overload circuit");
+  require(processor.process(packet).disposition !=
+              DpdfnetDisposition::Passthrough,
+          "Reset did not resume processing after realtime overload");
+}
+
 void test_output_storage_survives_format_update(const std::string &model_path) {
   DpdfnetProcessor processor = make_processor(model_path);
   DpdfnetControls controls;
@@ -773,6 +1007,11 @@ int main(int argc, char **argv) {
   const std::filesystem::path fixtures = argv[3];
   bool passed = true;
   passed = run_test("ring", test_ring) && passed;
+  passed =
+      run_test("realtime budget guard", test_realtime_budget_guard) && passed;
+  passed =
+      run_test("process result fail open", test_process_result_fail_open) &&
+      passed;
   passed = run_test("timestamp floor", test_timestamp_floor) && passed;
   passed = run_test("model selection migration",
                     [&] {
@@ -793,6 +1032,17 @@ int main(int argc, char **argv) {
            passed;
   passed = run_test("extreme model contract stream",
                     [&] { test_extreme_contract_stream(fixtures); }) &&
+           passed;
+  passed =
+      run_test("capacity failure diagnostics",
+               [&] { test_capacity_failure_diagnostics(low_cpu_model); }) &&
+      passed;
+  passed =
+      run_test("capacity invariant diagnostic",
+               [&] { test_capacity_invariant_diagnostic(low_cpu_model); }) &&
+      passed;
+  passed = run_test("realtime overload disable",
+                    [&] { test_realtime_overload_disable(low_cpu_model); }) &&
            passed;
   passed = run_test("returned audio survives format update",
                     [&] {

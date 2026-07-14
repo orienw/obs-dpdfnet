@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "dpdfnet-processor.hpp"
+#include "dpdfnet-realtime-guard.hpp"
 #include "dpdfnet-settings.hpp"
 
 #include <obs-module.h>
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -421,7 +423,7 @@ public:
       custom_model_selected_ = selection == DPDFNET_MODEL_CUSTOM;
       if (model_loaded || format_boundary ||
           (fresh_resamplers && !model_activation_failed) || fallback_attempted)
-        timings_.reset();
+        reset_timing_epoch();
       after = processor_.state();
     }
 
@@ -495,7 +497,7 @@ public:
     const bool format_changed =
         before.sample_rate != obs_rate || before.channels != obs_channels;
     if (format_changed)
-      timings_.reset();
+      reset_timing_epoch();
     processor_.set_format(obs_rate, obs_channels);
     const DpdfnetProcessorState active = processor_.state();
     const bool format_resampler_refresh =
@@ -505,7 +507,31 @@ public:
         active.has_model && !active.processing_disabled &&
         (active.sample_rate == static_cast<uint32_t>(active.model_rate) ||
          active.resampling);
-    const DpdfnetProcessResult result = processor_.process(packet);
+    const uint64_t processor_started = os_gettime_ns();
+    DpdfnetProcessResult result = processor_.process(packet);
+    const uint64_t processor_finished = os_gettime_ns();
+    const bool active_processing_result =
+        result.disposition != DpdfnetDisposition::Passthrough;
+
+    if (timing_eligible && active_processing_result) {
+      const DpdfnetRealtimeObservation observation = realtime_guard_.observe(
+          processor_finished - processor_started, result.processed_hops,
+          active.hop_size, active.model_rate);
+      if (observation.tripped) {
+        std::snprintf(
+            result.message.data(), result.message.size(),
+            "processing used %llu us for %llu us of model audio; accumulated "
+            "overload debt is %llu us",
+            static_cast<unsigned long long>(
+                (processor_finished - processor_started) / 1000),
+            static_cast<unsigned long long>(observation.budget_ns / 1000),
+            static_cast<unsigned long long>(observation.debt_ns / 1000));
+        if (processor_.disable_for_realtime_overload(result.message.data())) {
+          result.fail_open();
+          result.event = DpdfnetEvent::RealtimeOverloadCircuitOpened;
+        }
+      }
+    }
 
     struct obs_audio_data *output = audio;
     if (result.disposition == DpdfnetDisposition::Pending) {
@@ -537,8 +563,7 @@ public:
     const uint64_t deadline_ns =
         static_cast<uint64_t>(static_cast<double>(audio->frames) /
                               static_cast<double>(obs_rate) * 1e9);
-    if (timing_eligible &&
-        result.disposition != DpdfnetDisposition::Passthrough) {
+    if (timing_eligible && active_processing_result) {
       timings_.record(lock_acquired - lock_start,
                       processing_finished - lock_acquired,
                       processing_finished - callback_start, deadline_ns,
@@ -595,7 +620,7 @@ public:
         else
           last_resampler_error_.swap(prepared_resampler_error);
         processor_.reset_state();
-        timings_.reset();
+        reset_timing_epoch();
         have_failed_model_path_ = false;
         failed_model_path_.swap(discarded_failed_path);
         last_load_error_.swap(discarded_load_error);
@@ -647,7 +672,7 @@ public:
     else
       last_resampler_error_.swap(prepared_resampler_error);
     processor_.reset_stream();
-    timings_.reset();
+    reset_timing_epoch();
     timestamp_floor_.reset();
   }
 
@@ -667,13 +692,17 @@ public:
     snapshot.resampling = state.resampling;
     snapshot.bypass = state.bypass;
     snapshot.processing_disabled = state.processing_disabled;
+    snapshot.disable_reason = state.disable_reason;
     snapshot.resampler_refresh_required = state.resampler_refresh_required;
+    snapshot.capacity_recovery_pending = state.capacity_recovery_pending;
     snapshot.sample_rate = state.sample_rate;
     snapshot.channels = state.channels;
     snapshot.model_rate = state.model_rate;
     snapshot.n_fft = state.n_fft;
     snapshot.hop_size = state.hop_size;
     snapshot.consecutive_failures = state.consecutive_failures;
+    snapshot.oversized_packets = state.oversized_packets;
+    snapshot.capacity_failures = state.capacity_failures;
     snapshot.last_error = state.last_error.data();
     if (model) {
       snapshot.model_path = model->path().string();
@@ -688,7 +717,18 @@ public:
         snapshot.has_model && snapshot.sample_rate && snapshot.model_rate > 0 &&
         snapshot.sample_rate != static_cast<uint32_t>(snapshot.model_rate) &&
         !snapshot.resampling;
-    if (snapshot.processing_disabled) {
+    if (snapshot.processing_disabled &&
+        snapshot.disable_reason == DpdfnetDisableReason::RealtimeOverload) {
+      result.severity = StatusSeverity::Error;
+      text << "Processing is disabled after sustained realtime overload. Audio "
+              "is passing through. Choose the lower-CPU model, or reduce "
+              "system load and press Reset to retry.";
+      if (!snapshot.last_error.empty())
+        text << " Last overload: " << snapshot.last_error << ".";
+      if (!load_error.empty())
+        text << " The selected model also could not be loaded: " << load_error
+             << ".";
+    } else if (snapshot.processing_disabled) {
       result.severity = StatusSeverity::Error;
       text << "Processing is disabled after repeated errors. Audio is passing "
               "through. Press Reset to retry.";
@@ -757,6 +797,26 @@ public:
       text << frame_ms << " ms frame / " << hop_ms << " ms hop.";
     }
 
+    if (snapshot.oversized_packets) {
+      if (result.severity == StatusSeverity::Normal)
+        result.severity = StatusSeverity::Warning;
+      text << " Since the last Reset, " << snapshot.oversized_packets
+           << " incoming audio "
+           << (snapshot.oversized_packets == 1 ? "packet exceeded"
+                                               : "packets exceeded")
+           << " the " << DPDFNET_MAX_REALTIME_PACKET_FRAMES
+           << "-frame realtime limit and passed through.";
+    }
+    if (snapshot.capacity_failures) {
+      result.severity = StatusSeverity::Error;
+      text << " The realtime buffer capacity invariant failed "
+           << snapshot.capacity_failures << " "
+           << (snapshot.capacity_failures == 1 ? "time" : "times")
+           << "; affected audio passed through.";
+    }
+    if (snapshot.capacity_recovery_pending)
+      text << " Pipeline recovery is pending.";
+
     if (timing.callbacks) {
       text << " Active-processing epoch callback p99 <= "
            << timing.total_p99_ns / 1000 << " us, max "
@@ -783,6 +843,11 @@ private:
     DpdfnetEvent event = DpdfnetEvent::None;
     std::array<char, 256> message = {};
   };
+
+  void reset_timing_epoch() {
+    timings_.reset();
+    realtime_guard_.reset();
+  }
 
   void request_worker(bool resampler_refresh,
                       const DpdfnetProcessResult &result) {
@@ -828,6 +893,22 @@ private:
       blog(LOG_ERROR,
            "[obs-dpdfnet] processing disabled after repeated failures: %s; "
            "audio is passing through until Reset",
+           diagnostic.message.data());
+    } else if (diagnostic.event == DpdfnetEvent::OversizedPacket) {
+      blog(LOG_WARNING,
+           "[obs-dpdfnet] %s; packet passed through and pipeline state was "
+           "reset",
+           diagnostic.message.data());
+    } else if (diagnostic.event == DpdfnetEvent::CapacityInvariantFailure) {
+      blog(LOG_ERROR,
+           "[obs-dpdfnet] %s; packet passed through and pipeline state was "
+           "reset",
+           diagnostic.message.data());
+    } else if (diagnostic.event ==
+               DpdfnetEvent::RealtimeOverloadCircuitOpened) {
+      blog(LOG_ERROR,
+           "[obs-dpdfnet] sustained realtime overload: %s; processing is "
+           "disabled and audio is passing through until Reset",
            diagnostic.message.data());
     }
   }
@@ -898,7 +979,7 @@ private:
           old = processor_.release_invalid_resamplers();
         last_resampler_error_.swap(discarded_error);
         if (needs_resampling)
-          timings_.reset();
+          reset_timing_epoch();
         applied = true;
       } else if (still_current && !error.empty()) {
         last_resampler_error_.swap(prepared_error);
@@ -946,6 +1027,7 @@ private:
   DpdfnetTimestampFloor timestamp_floor_;
   DpdfnetControls controls_;
   CallbackTimings timings_;
+  DpdfnetRealtimeBudgetGuard realtime_guard_;
   bool custom_model_selected_ = false;
   std::string active_model_path_;
   bool have_failed_model_path_ = false;
@@ -956,7 +1038,8 @@ private:
   std::mutex resampler_request_mutex_;
   std::condition_variable resampler_request_cv_;
   bool resampler_refresh_requested_ = false;
-  std::array<CallbackDiagnostic, 4> callback_diagnostics_ = {};
+  std::array<CallbackDiagnostic, static_cast<size_t>(DpdfnetEvent::Count) - 1>
+      callback_diagnostics_ = {};
   bool stop_resampler_worker_ = false;
   std::thread resampler_worker_;
 };

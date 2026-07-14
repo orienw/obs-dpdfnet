@@ -120,7 +120,17 @@ enum class DpdfnetEvent {
   RateMismatch,
   ResamplerRefreshNeeded,
   ProcessingFailure,
-  CircuitOpened
+  CircuitOpened,
+  OversizedPacket,
+  CapacityInvariantFailure,
+  RealtimeOverloadCircuitOpened,
+  Count
+};
+
+enum class DpdfnetDisableReason {
+  None,
+  RepeatedProcessingFailures,
+  RealtimeOverload
 };
 
 struct DpdfnetProcessResult {
@@ -132,6 +142,13 @@ struct DpdfnetProcessResult {
   size_t processed_hops = 0;
   bool resampler_refresh_needed = false;
   std::array<char, 256> message = {};
+
+  void fail_open() noexcept {
+    disposition = DpdfnetDisposition::Passthrough;
+    data.fill(nullptr);
+    frames = 0;
+    timestamp = 0;
+  }
 };
 
 struct DpdfnetProcessorSnapshot {
@@ -139,13 +156,17 @@ struct DpdfnetProcessorSnapshot {
   bool resampling = false;
   bool bypass = false;
   bool processing_disabled = false;
+  DpdfnetDisableReason disable_reason = DpdfnetDisableReason::None;
   bool resampler_refresh_required = false;
+  bool capacity_recovery_pending = false;
   uint32_t sample_rate = 0;
   size_t channels = 0;
   int model_rate = 0;
   int n_fft = 0;
   int hop_size = 0;
   unsigned consecutive_failures = 0;
+  uint64_t oversized_packets = 0;
+  uint64_t capacity_failures = 0;
   std::string model_path;
   std::string model_name;
   std::string last_error;
@@ -156,13 +177,17 @@ struct DpdfnetProcessorState {
   bool resampling = false;
   bool bypass = false;
   bool processing_disabled = false;
+  DpdfnetDisableReason disable_reason = DpdfnetDisableReason::None;
   bool resampler_refresh_required = false;
+  bool capacity_recovery_pending = false;
   uint32_t sample_rate = 0;
   size_t channels = 0;
   int model_rate = 0;
   int n_fft = 0;
   int hop_size = 0;
   unsigned consecutive_failures = 0;
+  uint64_t oversized_packets = 0;
+  uint64_t capacity_failures = 0;
   std::array<char, 256> last_error = {};
 };
 
@@ -178,6 +203,7 @@ public:
   bool set_controls(const DpdfnetControls &controls);
   void reset_state();
   void reset_stream();
+  bool disable_for_realtime_overload(const char *message);
 
   DpdfnetProcessResult process(const DpdfnetAudioPacket &audio);
   DpdfnetProcessorState state() const;
@@ -208,6 +234,7 @@ private:
   DpdfnetProcessResult pop_output_packet(const DpdfnetPacketInfo &info,
                                          size_t processed_hops);
   DpdfnetProcessResult failure_result(const char *message);
+  DpdfnetProcessResult capacity_failure_result(uint32_t frames, bool oversized);
 
   std::unique_ptr<DpdfnetModel> model_;
   std::unique_ptr<StreamingStft> stft_;
@@ -226,8 +253,11 @@ private:
   bool resamplers_valid_ = true;
   bool rate_warning_reported_ = false;
   bool process_error_reported_ = false;
-  bool processing_disabled_ = false;
+  DpdfnetDisableReason disable_reason_ = DpdfnetDisableReason::None;
+  bool capacity_recovery_pending_ = false;
   unsigned consecutive_failures_ = 0;
+  uint64_t oversized_packets_ = 0;
+  uint64_t capacity_failures_ = 0;
   std::array<char, 256> last_error_ = {};
 
   DpdfnetControls controls_;

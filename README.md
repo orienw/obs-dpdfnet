@@ -113,7 +113,10 @@ processing epoch after audio has flowed. Model, format, resampler, and reset
 transitions start a new epoch, and fail-open passthrough callbacks are excluded.
 These figures are processing measurements, not an end-to-end microphone
 latency claim. Press `Refresh diagnostics` to update the row while the filter
-properties are open.
+properties are open. The row also retains oversized-packet and unexpected
+buffer-capacity counts until Reset or model replacement, so a fail-open
+discontinuity is not silent. Packets above the bounded 8,192-frame realtime
+limit pass through unchanged.
 
 ## CMake Build
 
@@ -255,7 +258,10 @@ migrated without discarding custom or missing paths. Custom models must expose
 the exact two-input, two-output float32 DPDFNet tensor contract described by
 their metadata. Contract violations and non-finite warm-up output are rejected
 before activation. Non-finite runtime output fails open and trips the circuit
-breaker after repeated errors.
+breaker after repeated errors. Processing time is also compared with the amount
+of model audio completed. Sustained overload opens a separate realtime circuit
+and passes audio through until Reset or model replacement; choose the lower-CPU
+model or a faster custom model if it repeats.
 
 To refresh the pinned ONNX Runtime and DPDFNet model artifacts with hash checks:
 

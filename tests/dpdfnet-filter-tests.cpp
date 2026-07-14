@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "../src/dpdfnet-processor.hpp"
 #include "../src/dpdfnet-settings.hpp"
 
 #include <obs-module.h>
@@ -582,6 +583,44 @@ void test_direct_callbacks(const std::string &model_path) {
   require(filter_test_instrumentation::callback_allocations.load(
               std::memory_order_relaxed) == steady_allocations_before,
           "steady-state processing allocated on the audio callback");
+
+  std::array<std::vector<float>, 2> oversized_storage = {
+      std::vector<float>(DPDFNET_MAX_REALTIME_PACKET_FRAMES + 1, 0.025f),
+      std::vector<float>(DPDFNET_MAX_REALTIME_PACKET_FRAMES + 1, -0.025f)};
+  struct obs_audio_data oversized = {};
+  oversized.data[0] = reinterpret_cast<uint8_t *>(oversized_storage[0].data());
+  oversized.data[1] = reinterpret_cast<uint8_t *>(oversized_storage[1].data());
+  oversized.frames = DPDFNET_MAX_REALTIME_PACKET_FRAMES + 1;
+  oversized.timestamp = steady_start + 9 * PACKET_DURATION_NS;
+  const uint64_t oversized_allocations_before =
+      filter_test_instrumentation::callback_allocations.load(
+          std::memory_order_relaxed);
+  const uint64_t oversized_logs_before = log_probe.synchronous_logs();
+  struct obs_audio_data *oversized_output = nullptr;
+  {
+    CallbackScope callback_scope;
+    oversized_output =
+        dpdfnet_filter_info.filter_audio(filter.get(), &oversized);
+  }
+  require(oversized_output && oversized_output->frames == oversized.frames &&
+              oversized_output->data[0] == oversized.data[0] &&
+              oversized_output->data[1] == oversized.data[1],
+          "oversized callback did not fail open with the original audio");
+  require(filter_test_instrumentation::callback_allocations.load(
+              std::memory_order_relaxed) == oversized_allocations_before,
+          "oversized callback allocated on the audio callback");
+  require(log_probe.synchronous_logs() == oversized_logs_before,
+          "oversized callback logged synchronously on the audio callback");
+  {
+    ObsProperties properties(dpdfnet_filter_info.get_properties(filter.get()));
+    obs_property_t *status = obs_properties_get(properties, "status_info");
+    const char *description =
+        status ? obs_property_description(status) : nullptr;
+    require(description &&
+                std::string(description).find("8192-frame realtime limit") !=
+                    std::string::npos,
+            "oversized callback was not retained in filter diagnostics");
+  }
 
   reset_audio(SPEAKERS_STEREO, 44100);
   struct obs_audio_data mismatch = storage.direct_packet(5000000000ULL);

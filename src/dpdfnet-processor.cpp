@@ -340,8 +340,11 @@ DpdfnetModelBundle DpdfnetProcessor::replace_model(DpdfnetModelBundle bundle) {
   model_ = std::move(bundle.model);
   stft_ = std::move(bundle.stft);
   realtime_ = std::move(bundle.realtime);
-  processing_disabled_ = false;
+  disable_reason_ = DpdfnetDisableReason::None;
+  capacity_recovery_pending_ = false;
   consecutive_failures_ = 0;
+  oversized_packets_ = 0;
+  capacity_failures_ = 0;
   process_error_reported_ = false;
   last_error_.fill(0);
   recompute_path();
@@ -411,8 +414,11 @@ bool DpdfnetProcessor::set_controls(const DpdfnetControls &controls) {
 }
 
 void DpdfnetProcessor::reset_state() {
-  processing_disabled_ = false;
+  disable_reason_ = DpdfnetDisableReason::None;
+  capacity_recovery_pending_ = false;
   consecutive_failures_ = 0;
+  oversized_packets_ = 0;
+  capacity_failures_ = 0;
   process_error_reported_ = false;
   last_error_.fill(0);
   reset_audio_state();
@@ -500,8 +506,6 @@ size_t DpdfnetProcessor::to_native_frames(size_t model_frames) const {
 }
 
 bool DpdfnetProcessor::buffers_can_accept(uint32_t frames) const {
-  if (frames > MAX_AUDIO_PACKET_FRAMES)
-    return false;
   if (realtime_.info_queue.size() + 1 > realtime_.info_queue.capacity())
     return false;
   const size_t input_gain = resample_path_ ? to_model_frames(frames) : frames;
@@ -688,7 +692,8 @@ DpdfnetProcessResult DpdfnetProcessor::failure_result(const char *message) {
   const bool report = !process_error_reported_;
   process_error_reported_ = true;
   const bool opened = consecutive_failures_ >= MAX_CONSECUTIVE_FAILURES;
-  processing_disabled_ = opened;
+  if (opened)
+    disable_reason_ = DpdfnetDisableReason::RepeatedProcessingFailures;
   const bool needs_fresh_resamplers = resample_path_;
   if (needs_fresh_resamplers)
     resamplers_valid_ = false;
@@ -705,12 +710,67 @@ DpdfnetProcessResult DpdfnetProcessor::failure_result(const char *message) {
   return result;
 }
 
+DpdfnetProcessResult DpdfnetProcessor::capacity_failure_result(uint32_t frames,
+                                                               bool oversized) {
+  uint64_t &counter = oversized ? oversized_packets_ : capacity_failures_;
+  const bool report = counter == 0;
+  if (counter != std::numeric_limits<uint64_t>::max())
+    ++counter;
+
+  const bool needs_fresh_resamplers =
+      !capacity_recovery_pending_ && resample_path_;
+  if (needs_fresh_resamplers) {
+    resamplers_valid_ = false;
+    rate_warning_reported_ = true;
+  }
+  if (!capacity_recovery_pending_)
+    reset_audio_state();
+  capacity_recovery_pending_ = true;
+
+  DpdfnetProcessResult result;
+  result.resampler_refresh_needed = needs_fresh_resamplers;
+  if (!report)
+    return result;
+
+  result.event = oversized ? DpdfnetEvent::OversizedPacket
+                           : DpdfnetEvent::CapacityInvariantFailure;
+  if (oversized) {
+    std::snprintf(result.message.data(), result.message.size(),
+                  "incoming audio packet has %u frames; the realtime limit is "
+                  "%u",
+                  frames, MAX_AUDIO_PACKET_FRAMES);
+  } else {
+    std::snprintf(result.message.data(), result.message.size(),
+                  "realtime buffers could not accept a %u-frame audio packet",
+                  frames);
+  }
+  return result;
+}
+
+bool DpdfnetProcessor::disable_for_realtime_overload(const char *message) {
+  if (disable_reason_ != DpdfnetDisableReason::None)
+    return false;
+
+  disable_reason_ = DpdfnetDisableReason::RealtimeOverload;
+  consecutive_failures_ = 0;
+  process_error_reported_ = false;
+  std::snprintf(last_error_.data(), last_error_.size(), "%s", message);
+  if (resample_path_)
+    resamplers_valid_ = false;
+  reset_audio_state();
+  return true;
+}
+
 DpdfnetProcessResult
 DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
   DenormalModeGuard denormal_guard;
   DpdfnetProcessResult result;
-  if (!audio.frames || !model_ || !stft_ || processing_disabled_)
+  if (!audio.frames || !model_ || !stft_ ||
+      disable_reason_ != DpdfnetDisableReason::None)
     return result;
+
+  if (audio.frames > MAX_AUDIO_PACKET_FRAMES)
+    return capacity_failure_result(audio.frames, true);
 
   if (sample_rate_ != static_cast<uint32_t>(model_->sample_rate()) &&
       !resample_path_) {
@@ -747,17 +807,16 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
                             static_cast<double>(sample_rate_) * NS_PER_SECOND);
 
   if (!buffers_can_accept(audio.frames)) {
-    reset_audio_state();
-    return result;
+    return capacity_failure_result(audio.frames, false);
   }
 
   if (!realtime_.info_queue.try_push(
           DpdfnetPacketInfo{audio.frames, audio.timestamp})) {
-    reset_audio_state();
-    return result;
+    return capacity_failure_result(audio.frames, false);
   }
   if (!push_input(audio))
     return failure_result("input resampling failed");
+  capacity_recovery_pending_ = false;
 
   size_t processed_hops = 0;
   try {
@@ -790,11 +849,15 @@ DpdfnetProcessorState DpdfnetProcessor::state() const {
   result.has_model = static_cast<bool>(model_);
   result.resampling = resample_path_;
   result.bypass = controls_.bypass;
-  result.processing_disabled = processing_disabled_;
+  result.disable_reason = disable_reason_;
+  result.processing_disabled = disable_reason_ != DpdfnetDisableReason::None;
   result.resampler_refresh_required = model_ && !resamplers_valid_;
+  result.capacity_recovery_pending = capacity_recovery_pending_;
   result.sample_rate = sample_rate_;
   result.channels = channels_;
   result.consecutive_failures = consecutive_failures_;
+  result.oversized_packets = oversized_packets_;
+  result.capacity_failures = capacity_failures_;
   result.last_error = last_error_;
   if (model_) {
     result.model_rate = model_->sample_rate();
@@ -811,13 +874,17 @@ DpdfnetProcessorSnapshot DpdfnetProcessor::snapshot() const {
   result.resampling = current.resampling;
   result.bypass = current.bypass;
   result.processing_disabled = current.processing_disabled;
+  result.disable_reason = current.disable_reason;
   result.resampler_refresh_required = current.resampler_refresh_required;
+  result.capacity_recovery_pending = current.capacity_recovery_pending;
   result.sample_rate = current.sample_rate;
   result.channels = current.channels;
   result.model_rate = current.model_rate;
   result.n_fft = current.n_fft;
   result.hop_size = current.hop_size;
   result.consecutive_failures = current.consecutive_failures;
+  result.oversized_packets = current.oversized_packets;
+  result.capacity_failures = current.capacity_failures;
   result.last_error = current.last_error.data();
   if (model_) {
     result.model_path = model_->path().string();
