@@ -6,9 +6,9 @@
 # from WSL with scripts/publish-release-wsl.sh so git/gh use the WSL GitHub auth
 # that is already configured for this checkout.
 #
-#   .\scripts\release-windows.ps1 -Version 1.0.0-rc2
-#   .\scripts\release-windows.ps1 -Version 1.0.0-rc2 -SkipBuild
-#   ./scripts/publish-release-wsl.sh 1.0.0-rc2
+#   .\scripts\release-windows.ps1 -Version 1.0.0-rc3
+#   .\scripts\release-windows.ps1 -Version 1.0.0-rc3 -SkipBuild
+#   ./scripts/publish-release-wsl.sh 1.0.0-rc3
 
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -50,7 +50,7 @@ if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetDefaultOb
 if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $DpdfnetDefaultOnnxRuntimeVersion }
 
 if ($Version -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
-    throw "Version '$Version' must look like 1.0.0 or 1.0.0-rc2."
+    throw "Version '$Version' must look like 1.0.0 or 1.0.0-rc3."
 }
 
 $PinnedObsArchiveHash = $DpdfnetKnownObsArchiveHashes[$ObsVersion]

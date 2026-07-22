@@ -11,7 +11,7 @@ runtime.
 
 ## Status
 
-This is the `1.0.0-rc2` release candidate. Windows x64 is the primary tested path,
+This is the `1.0.0-rc3` release candidate. Windows x64 is the primary tested path,
 including the direct MSVC helper scripts in `scripts/`.
 
 Current filter:
@@ -286,12 +286,11 @@ GitHub auth configured for this checkout.
 From Windows PowerShell:
 
 ```powershell
-.\scripts\release-windows.ps1 -Version 1.0.0-rc2 `
+.\scripts\release-windows.ps1 -Version 1.0.0-rc3 `
   -Changelog @(
-    "Hardened realtime processing across model, format, reset, and filter lifecycle transitions."
-    "Added real-libobs lifecycle, concurrency, buffer-lifetime, and extreme-model regression coverage."
-    "Bound Windows artifacts to verified source and dependency provenance and hardened release paths against tampering and junction traversal."
-    "Corrected timing benchmark accounting and expanded clean Windows validation."
+    "Added sustained realtime-overload protection with safe passthrough until Reset."
+    "Added visible diagnostics and recovery for oversized packets and unexpected buffer-capacity failures."
+    "Expanded regression coverage for realtime overload and capacity recovery."
   )
 ```
 
@@ -302,7 +301,7 @@ zip, checksum, and release notes under `build/`.
 From WSL:
 
 ```bash
-./scripts/publish-release-wsl.sh 1.0.0-rc2
+./scripts/publish-release-wsl.sh 1.0.0-rc3
 ```
 
 For a draft release, add `--draft` to the WSL publish command.

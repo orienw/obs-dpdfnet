@@ -24,7 +24,7 @@ foreach ($VersionValue in @($ObsVersion, $OnnxRuntimeVersion)) {
     }
 }
 if ($PluginVersion -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
-    throw "Plugin version '$PluginVersion' must look like 1.0.0 or 1.0.0-rc2."
+    throw "Plugin version '$PluginVersion' must look like 1.0.0 or 1.0.0-rc3."
 }
 if ($ModelName -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9_-])?$' -or
     @($ModelName -split '\.', 2)[0] -match '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') {
