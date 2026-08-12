@@ -450,12 +450,75 @@ struct obs_audio_data *wait_for_processed_audio(void *filter,
 }
 
 void verify_status_property(obs_properties_t *properties) {
+  obs_property_t *summary = obs_properties_get(properties, "status_summary");
+  require(summary != nullptr, "status summary is missing");
+  const char *summary_description = obs_property_description(summary);
+  require(summary_description &&
+              std::string(summary_description) == "Processing normally.",
+          "status summary is not concise or does not report normal operation");
+
   obs_property_t *status = obs_properties_get(properties, "status_info");
   require(status != nullptr, "status property is missing");
   const char *description = obs_property_description(status);
   require(description &&
               std::string(description).find("Active:") != std::string::npos,
           "status property does not report an active model");
+}
+
+void verify_properties_layout(obs_properties_t *properties,
+                              obs_data_t *settings) {
+  constexpr std::array<const char *, 4> root_order = {
+      "status_summary", "processing_group", "diagnostics_group",
+      "version_info"};
+  obs_property_t *root_property = obs_properties_first(properties);
+  for (const char *expected : root_order) {
+    require(root_property != nullptr, "settings layout is missing a root row");
+    require(std::string(obs_property_name(root_property)) == expected,
+            "settings layout root rows are in the wrong order");
+    obs_property_next(&root_property);
+  }
+  require(root_property == nullptr,
+          "settings layout contains an unexpected root row");
+
+  obs_property_t *processing_group =
+      obs_properties_get(properties, "processing_group");
+  obs_property_t *diagnostics_group =
+      obs_properties_get(properties, "diagnostics_group");
+  require(processing_group &&
+              obs_property_get_type(processing_group) == OBS_PROPERTY_GROUP &&
+              obs_property_group_type(processing_group) == OBS_GROUP_NORMAL,
+          "processing controls are not in a normal group");
+  require(diagnostics_group &&
+              obs_property_get_type(diagnostics_group) == OBS_PROPERTY_GROUP &&
+              obs_property_group_type(diagnostics_group) == OBS_GROUP_NORMAL,
+          "diagnostics controls are not in a normal group");
+
+  obs_properties_t *processing = obs_property_group_content(processing_group);
+  obs_properties_t *diagnostics = obs_property_group_content(diagnostics_group);
+  for (const char *name :
+       {"model_selection", "model_path", "input_channel",
+        "attenuation_limit_db", "wet_mix", "output_gain_db", "bypass"}) {
+    require(obs_properties_get(processing, name) != nullptr,
+            "processing group is missing a control");
+  }
+  for (const char *name : {"status_info", "refresh_status", "reset_state"}) {
+    require(obs_properties_get(diagnostics, name) != nullptr,
+            "diagnostics group is missing a control");
+  }
+
+  for (const char *name : {"model_selection", "model_path", "input_channel",
+                           "attenuation_limit_db", "wet_mix", "output_gain_db",
+                           "bypass", "refresh_status", "reset_state"}) {
+    obs_property_t *property = obs_properties_get(properties, name);
+    const char *tooltip =
+        property ? obs_property_long_description(property) : nullptr;
+    require(tooltip && *tooltip, "settings control is missing its help text");
+  }
+
+  require(!obs_data_has_user_value(settings, "processing_group") &&
+              !obs_data_has_user_value(settings, "diagnostics_group") &&
+              !obs_data_has_user_value(settings, "status_summary"),
+          "UI-only layout properties leaked into saved settings");
 }
 
 void test_empty_custom_model_error() {
@@ -503,6 +566,7 @@ void test_direct_callbacks(const std::string &model_path) {
     require(obs_property_visible(model_path_property),
             "custom model path was hidden after the modified callback");
 
+    verify_properties_layout(properties, settings);
     verify_status_property(properties);
     obs_property_t *refresh = obs_properties_get(properties, "refresh_status");
     require(refresh && obs_property_button_clicked(refresh, nullptr),

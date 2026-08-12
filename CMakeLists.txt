@@ -19,7 +19,7 @@ option(DPDFNET_BUILD_TESTS "Build processor, model contract, and filter lifecycl
 option(DPDFNET_COPY_RUNTIME_DEPENDENCIES "Copy ONNX Runtime shared libraries next to CMake-built binaries" ON)
 option(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES "Install ONNX Runtime shared libraries with the OBS plugin" ON)
 
-set(DPDFNET_PLUGIN_VERSION "${PROJECT_VERSION}-rc2")
+set(DPDFNET_PLUGIN_VERSION "${PROJECT_VERSION}")
 set(DPDFNET_PLUGIN_DESTINATION "obs-plugins/64bit" CACHE STRING "Install destination for the OBS plugin binary")
 set(DPDFNET_DATA_DESTINATION "data/obs-plugins/obs-dpdfnet" CACHE STRING "Install destination for OBS plugin data")
 

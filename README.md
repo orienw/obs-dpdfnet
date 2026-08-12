@@ -11,8 +11,8 @@ runtime.
 
 ## Status
 
-This is the `1.0.0-rc3` release candidate. Windows x64 is the primary tested path,
-including the direct MSVC helper scripts in `scripts/`.
+This is the `1.0.0` release. Windows x64 is the primary tested path, including
+the direct MSVC helper scripts in `scripts/`.
 
 Current filter:
 
@@ -21,7 +21,7 @@ Current filter:
 - Model input: streaming DPDFNet ONNX with metadata-backed state initialization
 - Audio path: one selected mono input, blended back to the source channels
 - Controls: model preset or custom model, input channel, suppression limit, wet
-  mix, output gain, latency-aligned bypass, reset state, diagnostics
+  mix, output gain, latency-aligned bypass, retry/reset processing, diagnostics
 
 ## Install A Release Build
 
@@ -112,11 +112,11 @@ frame and hop sizes. It also reports callback timing for the current active
 processing epoch after audio has flowed. Model, format, resampler, and reset
 transitions start a new epoch, and fail-open passthrough callbacks are excluded.
 These figures are processing measurements, not an end-to-end microphone
-latency claim. Press `Refresh diagnostics` to update the row while the filter
-properties are open. The row also retains oversized-packet and unexpected
-buffer-capacity counts until Reset or model replacement, so a fail-open
-discontinuity is not silent. Packets above the bounded 8,192-frame realtime
-limit pass through unchanged.
+latency claim. Press `Update status and diagnostics` while the filter properties
+are open to refresh it. The row also retains oversized-packet and unexpected
+buffer-capacity counts until a processing reset or model replacement, so a
+fail-open discontinuity is not silent. Packets above the bounded 8,192-frame
+realtime limit pass through unchanged.
 
 ## CMake Build
 
@@ -260,8 +260,8 @@ their metadata. Contract violations and non-finite warm-up output are rejected
 before activation. Non-finite runtime output fails open and trips the circuit
 breaker after repeated errors. Processing time is also compared with the amount
 of model audio completed. Sustained overload opens a separate realtime circuit
-and passes audio through until Reset or model replacement; choose the lower-CPU
-model or a faster custom model if it repeats.
+and passes audio through until processing is reset or the model is replaced;
+choose the lower-CPU model or a faster custom model if it repeats.
 
 To refresh the pinned ONNX Runtime and DPDFNet model artifacts with hash checks:
 
@@ -286,11 +286,11 @@ GitHub auth configured for this checkout.
 From Windows PowerShell:
 
 ```powershell
-.\scripts\release-windows.ps1 -Version 1.0.0-rc3 `
+.\scripts\release-windows.ps1 -Version 1.0.0 `
   -Changelog @(
-    "Added sustained realtime-overload protection with safe passthrough until Reset."
-    "Added visible diagnostics and recovery for oversized packets and unexpected buffer-capacity failures."
-    "Expanded regression coverage for realtime overload and capacity recovery."
+    "Reorganized settings into clear processing and diagnostics groups."
+    "Added concise status reporting, control help, and recovery guidance."
+    "Updated the build and test baseline to OBS Studio 32.2.1."
   )
 ```
 
@@ -301,7 +301,7 @@ zip, checksum, and release notes under `build/`.
 From WSL:
 
 ```bash
-./scripts/publish-release-wsl.sh 1.0.0-rc3
+./scripts/publish-release-wsl.sh 1.0.0
 ```
 
 For a draft release, add `--draft` to the WSL publish command.

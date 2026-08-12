@@ -167,6 +167,7 @@ private:
 enum class StatusSeverity { Normal, Warning, Error };
 struct FilterStatus {
   StatusSeverity severity = StatusSeverity::Normal;
+  std::string summary;
   std::string text;
 };
 
@@ -722,7 +723,7 @@ public:
       result.severity = StatusSeverity::Error;
       text << "Processing is disabled after sustained realtime overload. Audio "
               "is passing through. Choose the lower-CPU model, or reduce "
-              "system load and press Reset to retry.";
+              "system load and use Retry / reset processing.";
       if (!snapshot.last_error.empty())
         text << " Last overload: " << snapshot.last_error << ".";
       if (!load_error.empty())
@@ -731,7 +732,7 @@ public:
     } else if (snapshot.processing_disabled) {
       result.severity = StatusSeverity::Error;
       text << "Processing is disabled after repeated errors. Audio is passing "
-              "through. Press Reset to retry.";
+              "through. Use Retry / reset processing to try again.";
       if (!snapshot.last_error.empty())
         text << " Last processing error: " << snapshot.last_error << ".";
       if (!load_error.empty())
@@ -800,7 +801,7 @@ public:
     if (snapshot.oversized_packets) {
       if (result.severity == StatusSeverity::Normal)
         result.severity = StatusSeverity::Warning;
-      text << " Since the last Reset, " << snapshot.oversized_packets
+      text << " Since the last processing reset, " << snapshot.oversized_packets
            << " incoming audio "
            << (snapshot.oversized_packets == 1 ? "packet exceeded"
                                                : "packets exceeded")
@@ -822,6 +823,28 @@ public:
            << timing.total_p99_ns / 1000 << " us, max "
            << timing.total_max_ns / 1000 << " us, deadline misses "
            << timing.missed_deadlines << "/" << timing.callbacks << ".";
+    }
+
+    if (snapshot.processing_disabled || rate_mismatch || !snapshot.has_model) {
+      result.summary = "Processing is unavailable. Audio is passing through.";
+    } else if (!load_error.empty()) {
+      result.summary =
+          "The selected model could not be loaded. The previous model remains "
+          "active.";
+    } else if (snapshot.capacity_failures) {
+      result.summary =
+          "A realtime buffer error occurred. Affected audio passed through.";
+    } else if (snapshot.oversized_packets) {
+      result.summary =
+          "Some oversized audio packets passed through without enhancement.";
+    } else if (snapshot.capacity_recovery_pending) {
+      result.summary = "Processing recovery is pending.";
+    } else if (snapshot.consecutive_failures) {
+      result.summary = "Processing is active after a recent error.";
+    } else if (snapshot.bypass) {
+      result.summary = "Bypass is active. Audio is not being enhanced.";
+    } else {
+      result.summary = "Processing normally.";
     }
     result.text = text.str();
     return result;
@@ -892,7 +915,7 @@ private:
     } else if (diagnostic.event == DpdfnetEvent::CircuitOpened) {
       blog(LOG_ERROR,
            "[obs-dpdfnet] processing disabled after repeated failures: %s; "
-           "audio is passing through until Reset",
+           "audio is passing through until processing is reset",
            diagnostic.message.data());
     } else if (diagnostic.event == DpdfnetEvent::OversizedPacket) {
       blog(LOG_WARNING,
@@ -908,7 +931,7 @@ private:
                DpdfnetEvent::RealtimeOverloadCircuitOpened) {
       blog(LOG_ERROR,
            "[obs-dpdfnet] sustained realtime overload: %s; processing is "
-           "disabled and audio is passing through until Reset",
+           "disabled and audio is passing through until processing is reset",
            diagnostic.message.data());
     }
   }
@@ -1081,27 +1104,32 @@ obs_text_info_type status_info_type(StatusSeverity severity) {
   return OBS_TEXT_INFO_NORMAL;
 }
 
-void update_status_property(obs_properties_t *props, void *data) {
+void update_status_properties(obs_properties_t *props, void *data) {
   if (!data)
     return;
-  obs_property_t *property = obs_properties_get(props, "status_info");
-  if (!property)
-    return;
   const FilterStatus status = static_cast<DpdfnetFilter *>(data)->status();
-  obs_property_set_description(property, status.text.c_str());
-  obs_property_text_set_info_type(property, status_info_type(status.severity));
+  obs_property_t *summary = obs_properties_get(props, "status_summary");
+  if (summary) {
+    obs_property_set_description(summary, status.summary.c_str());
+    obs_property_text_set_info_type(summary, status_info_type(status.severity));
+  }
+  obs_property_t *details = obs_properties_get(props, "status_info");
+  if (details) {
+    obs_property_set_description(details, status.text.c_str());
+    obs_property_text_set_info_type(details, OBS_TEXT_INFO_NORMAL);
+  }
 }
 
 bool reset_clicked(obs_properties_t *props, obs_property_t *, void *data) {
   if (data) {
     static_cast<DpdfnetFilter *>(data)->reset_state();
-    update_status_property(props, data);
+    update_status_properties(props, data);
   }
   return true;
 }
 
 bool refresh_clicked(obs_properties_t *props, obs_property_t *, void *data) {
-  update_status_property(props, data);
+  update_status_properties(props, data);
   return true;
 }
 
@@ -1116,30 +1144,19 @@ bool model_selection_modified(void *, obs_properties_t *props, obs_property_t *,
 
 obs_properties_t *filter_properties(void *data) {
   obs_properties_t *props = obs_properties_create();
-  obs_properties_add_text(props, "info", obs_module_text("DPDFNet.Info"),
-                          OBS_TEXT_INFO);
-
-  std::string version_info = obs_module_text("DPDFNet.Version");
-  version_info += ": ";
-  version_info += PLUGIN_VERSION;
-  obs_properties_add_text(props, "version_info", version_info.c_str(),
-                          OBS_TEXT_INFO);
-
   if (data) {
     const FilterStatus status = static_cast<DpdfnetFilter *>(data)->status();
-    obs_property_t *status_property = obs_properties_add_text(
-        props, "status_info", status.text.c_str(), OBS_TEXT_INFO);
-    obs_property_text_set_info_type(status_property,
-                                    status_info_type(status.severity));
+    obs_property_t *summary = obs_properties_add_text(
+        props, "status_summary", status.summary.c_str(), OBS_TEXT_INFO);
+    obs_property_text_set_info_type(summary, status_info_type(status.severity));
   }
 
-  obs_properties_add_button2(props, "refresh_status",
-                             obs_module_text("DPDFNet.RefreshStatus"),
-                             refresh_clicked, data);
+  obs_properties_t *processing = obs_properties_create();
 
-  obs_property_t *selection = obs_properties_add_list(
-      props, SETTING_MODEL_SELECTION, obs_module_text("DPDFNet.ModelSelection"),
-      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+  obs_property_t *selection =
+      obs_properties_add_list(processing, SETTING_MODEL_SELECTION,
+                              obs_module_text("DPDFNet.ModelSelection"),
+                              OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
   obs_property_list_add_string(selection,
                                obs_module_text("DPDFNet.Model.Quality"),
                                DPDFNET_MODEL_QUALITY);
@@ -1148,46 +1165,91 @@ obs_properties_t *filter_properties(void *data) {
                                DPDFNET_MODEL_LOW_CPU);
   obs_property_list_add_string(
       selection, obs_module_text("DPDFNet.Model.Custom"), DPDFNET_MODEL_CUSTOM);
+  obs_property_set_long_description(
+      selection, obs_module_text("DPDFNet.ModelSelection.Tooltip"));
   obs_property_set_modified_callback2(selection, model_selection_modified,
                                       data);
 
   obs_property_t *model_path = obs_properties_add_path(
-      props, SETTING_MODEL_PATH, obs_module_text("DPDFNet.ModelPath"),
+      processing, SETTING_MODEL_PATH, obs_module_text("DPDFNet.ModelPath"),
       OBS_PATH_FILE, "ONNX model (*.onnx);;All files (*.*)", nullptr);
+  obs_property_set_long_description(
+      model_path, obs_module_text("DPDFNet.ModelPath.Tooltip"));
   const bool custom_selected =
       data && static_cast<DpdfnetFilter *>(data)->custom_model_selected();
   obs_property_set_visible(model_path, custom_selected);
 
-  obs_property_t *input_channel = obs_properties_add_list(
-      props, SETTING_INPUT_CHANNEL, obs_module_text("DPDFNet.InputChannel"),
-      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+  obs_property_t *input_channel =
+      obs_properties_add_list(processing, SETTING_INPUT_CHANNEL,
+                              obs_module_text("DPDFNet.InputChannel"),
+                              OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
   obs_property_list_add_int(input_channel,
                             obs_module_text("DPDFNet.InputChannel.Input1"), 0);
   obs_property_list_add_int(input_channel,
                             obs_module_text("DPDFNet.InputChannel.Input2"), 1);
   obs_property_list_add_int(input_channel,
                             obs_module_text("DPDFNet.InputChannel.Mix"), -1);
+  obs_property_set_long_description(
+      input_channel, obs_module_text("DPDFNet.InputChannel.Tooltip"));
 
   obs_property_t *attenuation = obs_properties_add_float_slider(
-      props, SETTING_ATTENUATION_LIMIT_DB,
+      processing, SETTING_ATTENUATION_LIMIT_DB,
       obs_module_text("DPDFNet.AttenuationLimit"), 0.0, 60.0, 0.5);
   obs_property_float_set_suffix(attenuation, " dB");
+  obs_property_set_long_description(
+      attenuation, obs_module_text("DPDFNet.AttenuationLimit.Tooltip"));
 
   obs_property_t *wet = obs_properties_add_float_slider(
-      props, SETTING_WET_MIX, obs_module_text("DPDFNet.WetMix"), 0.0, 100.0,
-      1.0);
+      processing, SETTING_WET_MIX, obs_module_text("DPDFNet.WetMix"), 0.0,
+      100.0, 1.0);
   obs_property_float_set_suffix(wet, "%");
+  obs_property_set_long_description(wet,
+                                    obs_module_text("DPDFNet.WetMix.Tooltip"));
 
   obs_property_t *gain = obs_properties_add_float_slider(
-      props, SETTING_OUTPUT_GAIN_DB, obs_module_text("DPDFNet.OutputGain"),
+      processing, SETTING_OUTPUT_GAIN_DB, obs_module_text("DPDFNet.OutputGain"),
       -12.0, 12.0, 0.1);
   obs_property_float_set_suffix(gain, " dB");
+  obs_property_set_long_description(
+      gain, obs_module_text("DPDFNet.OutputGain.Tooltip"));
 
-  obs_properties_add_bool(props, SETTING_BYPASS,
-                          obs_module_text("DPDFNet.Bypass"));
-  obs_properties_add_button2(props, "reset_state",
-                             obs_module_text("DPDFNet.ResetState"),
-                             reset_clicked, data);
+  obs_property_t *bypass = obs_properties_add_bool(
+      processing, SETTING_BYPASS, obs_module_text("DPDFNet.Bypass"));
+  obs_property_set_long_description(bypass,
+                                    obs_module_text("DPDFNet.Bypass.Tooltip"));
+
+  obs_properties_add_group(props, "processing_group",
+                           obs_module_text("DPDFNet.Processing"),
+                           OBS_GROUP_NORMAL, processing);
+
+  obs_properties_t *diagnostics = obs_properties_create();
+  if (data) {
+    const FilterStatus status = static_cast<DpdfnetFilter *>(data)->status();
+    obs_properties_add_text(diagnostics, "status_info", status.text.c_str(),
+                            OBS_TEXT_INFO);
+  }
+
+  obs_property_t *refresh = obs_properties_add_button2(
+      diagnostics, "refresh_status", obs_module_text("DPDFNet.RefreshStatus"),
+      refresh_clicked, data);
+  obs_property_set_long_description(
+      refresh, obs_module_text("DPDFNet.RefreshStatus.Tooltip"));
+
+  obs_property_t *reset = obs_properties_add_button2(
+      diagnostics, "reset_state", obs_module_text("DPDFNet.ResetState"),
+      reset_clicked, data);
+  obs_property_set_long_description(
+      reset, obs_module_text("DPDFNet.ResetState.Tooltip"));
+
+  obs_properties_add_group(props, "diagnostics_group",
+                           obs_module_text("DPDFNet.Diagnostics"),
+                           OBS_GROUP_NORMAL, diagnostics);
+
+  std::string version_info = obs_module_text("DPDFNet.Version");
+  version_info += ": ";
+  version_info += PLUGIN_VERSION;
+  obs_properties_add_text(props, "version_info", version_info.c_str(),
+                          OBS_TEXT_INFO);
   return props;
 }
 } // namespace
