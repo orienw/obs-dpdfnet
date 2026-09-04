@@ -216,75 +216,104 @@ void test_model_selection_migration(const std::string &quality_path,
           "filesystem-equivalent model path was not recognized");
 }
 
-struct ExpectedPacket {
-  std::vector<std::vector<float>> channels;
-  uint64_t timestamp = 0;
-};
-
-void test_variable_packets_and_bypass(const std::string &model_path) {
-  DpdfnetProcessor processor = make_processor(model_path, 48000, 2);
+void check_packet_drain(const std::string &model_path, uint32_t rate,
+                        const std::vector<uint32_t> &sizes, bool gaps = false) {
+  auto processor = make_processor(model_path, rate, 2);
   DpdfnetControls controls;
-  controls.input_channel = 0;
   controls.bypass = true;
   processor.set_controls(controls);
-
-  const uint32_t sizes[] = {137, 441, 480, 512, 960, 1024};
-  std::deque<ExpectedPacket> expected;
-  uint64_t timestamp = NS_PER_SECOND;
-  uint64_t last_output_timestamp = 0;
+  size_t prefill = 0;
+  uint64_t latency = 0;
+  if (rate != static_cast<uint32_t>(processor.model()->sample_rate())) {
+    auto resamplers = prepare_dpdfnet_resamplers(
+        rate, processor.model()->sample_rate(), processor.model()->hop_size());
+    prefill = resamplers.prefill_frames();
+    latency = resamplers.delay_ns();
+    processor.replace_resamplers(std::move(resamplers));
+  }
+  std::array<std::deque<float>, 2> expected;
+  for (auto &channel : expected)
+    channel.resize(prefill, 0.0f);
+  std::deque<uint64_t> timestamps;
+  uint64_t sent = 0, received = 0, gap = 0;
   size_t outputs = 0;
-
-  for (size_t packet_index = 0; packet_index < 80; ++packet_index) {
-    const uint32_t frames = sizes[packet_index % std::size(sizes)];
-    ExpectedPacket item;
-    item.timestamp = timestamp;
-    item.channels.resize(2);
-    for (size_t channel = 0; channel < 2; ++channel) {
-      item.channels[channel].resize(frames);
-      const float value = 0.001f * static_cast<float>(packet_index + 1) +
-                          0.01f * static_cast<float>(channel);
-      std::fill(item.channels[channel].begin(), item.channels[channel].end(),
-                value);
-    }
-
+  for (size_t index = 0; index < sizes.size(); ++index) {
+    const uint32_t frames = sizes[index];
+    if (gaps && index && index % 9 == 0)
+      gap += 10'000'000;
     DpdfnetAudioPacket packet;
     packet.frames = frames;
-    packet.timestamp = timestamp;
-    for (size_t channel = 0; channel < 2; ++channel)
-      packet.data[channel] = item.channels[channel].data();
-    expected.push_back(item);
-
+    packet.timestamp = NS_PER_SECOND + sent * NS_PER_SECOND / rate + gap;
+    std::array<std::vector<float>, 2> input;
+    for (size_t channel = 0; channel < 2; ++channel) {
+      input[channel].resize(frames);
+      for (size_t i = 0; i < frames; ++i)
+        input[channel][i] = static_cast<float>(
+            0.05 * std::sin((sent + i) * 0.071 + channel));
+      expected[channel].insert(expected[channel].end(), input[channel].begin(),
+                               input[channel].end());
+      packet.data[channel] = input[channel].data();
+    }
+    for (uint64_t i = 0; i < frames; ++i)
+      timestamps.push_back(packet.timestamp + i * NS_PER_SECOND / rate - latency);
+    sent += frames;
     const auto result = processor.process(packet);
-    require(result.disposition != DpdfnetDisposition::Passthrough,
-            "healthy bypass returned immediate raw audio");
+    require(result.disposition != DpdfnetDisposition::Passthrough &&
+                result.event == DpdfnetEvent::None,
+            "valid packet stream failed open at callback " + std::to_string(index));
     if (result.disposition == DpdfnetDisposition::Processed) {
-      require(!expected.empty(), "processor emitted an unqueued packet");
-      const auto &front = expected.front();
-      require(result.frames == front.channels[0].size(),
-              "processor changed packet frame count");
-      require(result.timestamp == front.timestamp,
-              "bypass changed the input samples' timestamp");
-      require(result.timestamp >= last_output_timestamp,
-              "processor output timestamps went backwards");
-      for (size_t channel = 0; channel < 2; ++channel) {
-        for (size_t frame = 0; frame < result.frames; ++frame) {
-          require(nearly_equal(result.data[channel][frame],
-                               front.channels[channel][frame]),
-                  "latency-aligned bypass changed a sample");
+      require(result.frames && result.frames <= DPDFNET_MAX_REALTIME_PACKET_FRAMES,
+              "drained output exceeded its realtime buffer");
+      require(result.frames <= timestamps.size(), "processor emitted excess audio");
+      for (uint64_t i = 0; i < result.frames; ++i) {
+        const uint64_t timestamp = result.timestamp + i * NS_PER_SECOND / rate;
+        const uint64_t expected_timestamp = timestamps.front();
+        const uint64_t deviation = timestamp > expected_timestamp
+                                       ? timestamp - expected_timestamp
+                                       : expected_timestamp - timestamp;
+        require(deviation <= 2, "drained output changed sample timestamps or crossed a gap");
+        timestamps.pop_front();
+        for (size_t channel = 0; channel < 2; ++channel) {
+          require(result.data[channel][i] == expected[channel].front(),
+                  "packet draining lost, duplicated, or reordered a bypass sample");
+          expected[channel].pop_front();
         }
       }
-      last_output_timestamp = result.timestamp;
-      expected.pop_front();
+      received += result.frames;
       ++outputs;
     }
-    timestamp += static_cast<uint64_t>(static_cast<double>(frames) / 48000.0 *
-                                       NS_PER_SECOND);
   }
+  const auto *model = processor.model();
+  const uint64_t startup = static_cast<uint64_t>(
+      model->n_fft() + model->hop_size() * model->output_delay_hops());
+  const uint64_t bound = (startup * rate + model->sample_rate() - 1) /
+                         model->sample_rate() + prefill + 512;
+  require(outputs > 30, "processor failed to drain the packet stream");
+  require(sent - received <= bound, "packet size changes stranded buffered audio");
+  require(processor.state().capacity_failures == 0,
+          "valid packet stream exceeded the capacity plan");
+}
 
-  require(outputs > 60, "processor failed to drain variable packet stream");
-  require(expected.size() <=
-              static_cast<size_t>(processor.model()->output_delay_hops()) + 3,
-          "processor accumulated an unbounded backlog");
+void test_variable_packets_and_bypass(const std::string &model_path) {
+  const uint32_t sizes[] = {137, 441, 480, 512, 960, 1024};
+  std::vector<uint32_t> stream;
+  for (size_t i = 0; i < 80; ++i)
+    stream.push_back(sizes[i % std::size(sizes)]);
+  check_packet_drain(model_path, 48000, stream);
+  check_packet_drain(model_path, 48000, stream, true);
+}
+
+void test_packet_size_transitions(const std::string &model_path) {
+  for (uint32_t rate : {48000, 44100, 96000}) {
+    for (uint32_t large : {1024u, 2048u, DPDFNET_MAX_REALTIME_PACKET_FRAMES}) {
+      std::vector<uint32_t> stream(16, 64);
+      stream.insert(stream.end(), 48, large);
+      stream.insert(stream.end(), 1024, 1);
+      stream.insert(stream.end(), 48, large);
+      stream.insert(stream.end(), 80, 137);
+      check_packet_drain(model_path, rate, stream);
+    }
+  }
 }
 
 std::vector<float> process_signal(DpdfnetProcessor &processor,
@@ -596,7 +625,7 @@ void test_extreme_contract_stream(const std::filesystem::path &fixtures) {
     require(result.disposition != DpdfnetDisposition::Passthrough,
             "extreme contract stream reset at its former fixed capacity");
     if (result.disposition == DpdfnetDisposition::Processed) {
-      ++processed;
+      processed += result.frames;
       for (uint32_t frame = 0; frame < result.frames; ++frame) {
         require(std::isfinite(result.data[0][frame]),
                 "extreme contract stream produced non-finite audio");
@@ -604,7 +633,7 @@ void test_extreme_contract_stream(const std::filesystem::path &fixtures) {
     }
     timestamp += 20'000'000;
   }
-  require(processed > 60,
+  require(processed > 60 * data.size(),
           "extreme contract stream never reached processed output");
 }
 
@@ -1152,6 +1181,8 @@ int main(int argc, char **argv) {
   passed = run_test("variable packets and aligned bypass",
                     [&] { test_variable_packets_and_bypass(quality_model); }) &&
            passed;
+  passed = run_test("packet size transitions",
+                    [&] { test_packet_size_transitions(low_cpu_model); }) && passed;
   passed = run_test("bypass transitions",
                     [&] { test_bypass_transition(quality_model); }) &&
            passed;

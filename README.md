@@ -112,6 +112,10 @@ enhanced signal, dry mix, bypass, and timestamps describe the same input audio.
 The quality benchmark also receives this aligned output. Its corrected scores
 should not be compared directly with reports from versions before 1.0.1.
 
+Output packets can combine or split input packets to drain ready audio without
+accumulating latency when packet sizes change. Sample order and source timestamp
+gaps are preserved, and each output remains within the 8192-frame realtime limit.
+
 Custom ONNX models must declare integer `output_delay_hops` metadata between
 0 and 16. Set it to the model's spectral output delay, excluding STFT buffering
 and resampling. The legacy DPDFNet version 1 `dpdfnet2_48khz_hr` profile used by

@@ -233,8 +233,7 @@ private:
   size_t to_native_frames(size_t model_frames) const;
   bool push_input(const DpdfnetAudioPacket &audio);
   size_t process_available_hops();
-  DpdfnetProcessResult pop_output_packet(const DpdfnetPacketInfo &info,
-                                         size_t processed_hops);
+  DpdfnetProcessResult pop_output_packet(size_t processed_hops);
   DpdfnetProcessResult failure_result(const char *message);
   DpdfnetProcessResult capacity_failure_result(uint32_t frames, bool oversized);
 
@@ -251,6 +250,7 @@ private:
   uint64_t expected_timestamp_ = 0;
   bool have_timestamp_ = false;
   uint64_t output_latency_ns_ = 0;
+  uint32_t output_packet_offset_ = 0;
   size_t noisy_history_offset_ = 0;
   int warmup_hops_ = 0;
   bool resample_path_ = false;

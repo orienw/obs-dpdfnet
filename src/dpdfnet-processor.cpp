@@ -359,6 +359,7 @@ DpdfnetModelBundle DpdfnetProcessor::replace_model(DpdfnetModelBundle bundle) {
   last_timestamp_ = 0;
   expected_timestamp_ = 0;
   have_timestamp_ = false;
+  output_packet_offset_ = 0;
   noisy_history_offset_ = 0;
   warmup_hops_ = model_ ? model_->output_delay_hops() : 0;
   return old;
@@ -450,6 +451,7 @@ void DpdfnetProcessor::reset_audio_state(bool reset_model) {
   for (auto &buffer : realtime_.dry_buffers)
     buffer.clear();
   realtime_.info_queue.clear();
+  output_packet_offset_ = 0;
   last_timestamp_ = 0;
   expected_timestamp_ = 0;
   have_timestamp_ = false;
@@ -658,8 +660,44 @@ size_t DpdfnetProcessor::process_available_hops() {
 }
 
 DpdfnetProcessResult
-DpdfnetProcessor::pop_output_packet(const DpdfnetPacketInfo &info,
-                                    size_t processed_hops) {
+DpdfnetProcessor::pop_output_packet(size_t processed_hops) {
+  const auto available = static_cast<uint32_t>(std::min(
+      realtime_.output_mono.size(), static_cast<size_t>(MAX_AUDIO_PACKET_FRAMES)));
+  if (!available || realtime_.info_queue.empty() ||
+      !dry_buffers_have_frames(available)) {
+    DpdfnetProcessResult result;
+    result.disposition = DpdfnetDisposition::Pending;
+    result.processed_hops = processed_hops;
+    return result;
+  }
+
+  DpdfnetPacketInfo info;
+  info.timestamp = realtime_.info_queue.front().timestamp +
+                   output_packet_offset_ * NS_PER_SECOND / sample_rate_;
+  uint64_t next_timestamp = info.timestamp;
+  while (info.frames < available && !realtime_.info_queue.empty()) {
+    const auto &packet = realtime_.info_queue.front();
+    const uint64_t timestamp =
+        packet.timestamp + output_packet_offset_ * NS_PER_SECOND / sample_rate_;
+    const uint64_t gap = timestamp > next_timestamp
+                             ? timestamp - next_timestamp
+                             : next_timestamp - timestamp;
+    // Coalesce contiguous packets, allowing integer timestamp rounding, but
+    // retain real gaps in the source timeline as output packet boundaries.
+    if (info.frames && gap > 1)
+      break;
+    const uint32_t frames = std::min(available - info.frames,
+                                    packet.frames - output_packet_offset_);
+    info.frames += frames;
+    output_packet_offset_ += frames;
+    next_timestamp = packet.timestamp +
+                     output_packet_offset_ * NS_PER_SECOND / sample_rate_;
+    if (output_packet_offset_ == packet.frames) {
+      realtime_.info_queue.pop(1);
+      output_packet_offset_ = 0;
+    }
+  }
+
   realtime_.enhanced_scratch.resize(info.frames);
   realtime_.output_mono.peek(realtime_.enhanced_scratch.data(), info.frames);
   realtime_.output_mono.pop(info.frames);
@@ -707,7 +745,6 @@ DpdfnetProcessor::pop_output_packet(const DpdfnetPacketInfo &info,
     result.data[channel] = output_storage_[channel].data();
   }
 
-  realtime_.info_queue.pop(1);
   return result;
 }
 
@@ -854,19 +891,7 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
     return failure_result(ex.what());
   }
 
-  if (realtime_.info_queue.empty()) {
-    result.disposition = DpdfnetDisposition::Pending;
-    return result;
-  }
-
-  const DpdfnetPacketInfo info = realtime_.info_queue.front();
-  if (realtime_.output_mono.size() < info.frames ||
-      !dry_buffers_have_frames(info.frames)) {
-    result.disposition = DpdfnetDisposition::Pending;
-    result.processed_hops = processed_hops;
-    return result;
-  }
-  return pop_output_packet(info, processed_hops);
+  return pop_output_packet(processed_hops);
 }
 
 DpdfnetProcessorState DpdfnetProcessor::state() const {
