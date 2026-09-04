@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+file(COPY "${SOURCE}" DESTINATION "${DESTINATION}" FOLLOW_SYMLINK_CHAIN)

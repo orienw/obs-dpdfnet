@@ -59,9 +59,10 @@ function(dpdfnet_copy_runtime_dependencies target)
 
   foreach(runtime_dependency IN LISTS ONNXRUNTIME_RUNTIME_DEPENDENCIES)
     add_custom_command(TARGET ${target} POST_BUILD
-      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-        "${runtime_dependency}"
-        "$<TARGET_FILE_DIR:${target}>"
+      COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE=${runtime_dependency}"
+        "-DDESTINATION=$<TARGET_FILE_DIR:${target}>"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy-runtime.cmake"
       VERBATIM
     )
   endforeach()
@@ -209,6 +210,16 @@ if(DPDFNET_BUILD_TESTS)
     Threads::Threads
     ${DPDFNET_KISSFFT_TARGET}
   )
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Match Windows DLL isolation: count plugin allocations, not allocations
+    # inside shared dependencies that ELF symbol interposition would intercept.
+    target_link_options(obs-dpdfnet-filter-tests PRIVATE
+      "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/tests/filter-allocations.ld"
+    )
+    set_property(TARGET obs-dpdfnet-filter-tests APPEND PROPERTY LINK_DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/filter-allocations.ld"
+    )
+  endif()
   dpdfnet_copy_runtime_dependencies(obs-dpdfnet-filter-tests)
 
   add_executable(dpdfnet-model-contract-test
@@ -276,6 +287,10 @@ set_target_properties(obs-dpdfnet PROPERTIES
   OUTPUT_NAME "obs-dpdfnet"
 )
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
+  set_property(TARGET obs-dpdfnet APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+endif()
+
 install(TARGETS obs-dpdfnet
   RUNTIME DESTINATION "${DPDFNET_PLUGIN_DESTINATION}"
   LIBRARY DESTINATION "${DPDFNET_PLUGIN_DESTINATION}"
@@ -305,9 +320,13 @@ install(DIRECTORY LICENSES
 # with another ONNX-based OBS plugin's onnxruntime.dll in the shared
 # obs-plugins/64bit directory. Fine for isolated dev builds, not for shipping.
 if(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
+  if(IS_ABSOLUTE "${DPDFNET_PLUGIN_DESTINATION}")
+    set(runtime_destination "${DPDFNET_PLUGIN_DESTINATION}")
+  else()
+    set(runtime_destination "\${CMAKE_INSTALL_PREFIX}/${DPDFNET_PLUGIN_DESTINATION}")
+  endif()
   foreach(runtime_dependency IN LISTS ONNXRUNTIME_RUNTIME_DEPENDENCIES)
-    install(FILES "${runtime_dependency}"
-      DESTINATION "${DPDFNET_PLUGIN_DESTINATION}"
-    )
+    install(CODE "file(INSTALL \"${runtime_dependency}\"
+      DESTINATION \"${runtime_destination}\" FOLLOW_SYMLINK_CHAIN)")
   endforeach()
 endif()

@@ -828,6 +828,14 @@ int main(int argc, char **argv) {
 
   bool started = false;
   try {
+    const auto before = filter_test_instrumentation::callback_allocations.load();
+    {
+      CallbackScope callback;
+      void *memory = ::operator new(64);
+      ::operator delete(memory);
+    }
+    require(filter_test_instrumentation::callback_allocations.load() == before + 1,
+            "callback allocation instrumentation is inactive");
     const std::filesystem::path model =
         std::filesystem::absolute(argv[1]).lexically_normal();
     require(std::filesystem::is_regular_file(model),
