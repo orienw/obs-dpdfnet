@@ -321,6 +321,8 @@ int main(int argc, char **argv) {
     DpdfnetModel model(model_path);
     std::cout << std::fixed << std::setprecision(6)
               << "model_name=" << model.name() << "\n"
+              << "model_output_delay_hops=" << model.output_delay_hops() << "\n"
+              << "model_startup_delay_compensated=true\n"
               << "frames=" << frames << "\n"
               << "sample_rate=" << kSampleRate << "\n"
               << "snr_db=" << snr_db << "\n"

@@ -25,10 +25,15 @@ BASE_METADATA = {
     "spec_norm_state_size": "0",
     "erb_norm_init": "0",
     "spec_norm_init": "",
+    "output_delay_hops": "0",
 }
 
 CASES = (
     Case("valid_identity", {}),
+    Case("valid_delayed_identity", {"delay_hops": 4}),
+    Case("missing_output_delay", {"omit_delay": True}),
+    Case("negative_output_delay", {"metadata": {"output_delay_hops": "-1"}}),
+    Case("excessive_output_delay", {"metadata": {"output_delay_hops": "17"}}),
     Case(
         "valid_extreme_capacity",
         {
@@ -131,7 +136,12 @@ def constant_node(name: str, output: str, element_type: int, shape: tuple):
 
 def make_fixture(path: Path, **options) -> None:
     spec_shape = options.get("spec_shape", (1, 1, 481, 2))
-    state_shape = options.get("state_shape", (1,))
+    delay_hops = options.get("delay_hops", 0)
+    spectrum_size = 962
+    state_shape = (
+        (delay_hops * spectrum_size,)
+        if delay_hops else options.get("state_shape", (1,))
+    )
     element_type = options.get("element_type", TensorProto.FLOAT)
     input_count = options.get("input_count", 2)
     output_count = options.get("output_count", 2)
@@ -155,7 +165,25 @@ def make_fixture(path: Path, **options) -> None:
     if output_count >= 3:
         outputs.append(make_value("diagnostic", element_type, state_shape))
 
-    if options.get("nonfinite_spectrum"):
+    if delay_hops:
+        nodes = []
+        for name, values in {
+            "first": [0],
+            "next": [spectrum_size],
+            "last": [state_shape[0]],
+            "spec_shape": list(spec_shape),
+            "flat_shape": [spectrum_size],
+        }.items():
+            tensor = helper.make_tensor(name, TensorProto.INT64, [len(values)], values)
+            nodes.append(helper.make_node("Constant", [], [name], value=tensor))
+        nodes.extend([
+            helper.make_node("Slice", [state_in, "first", "next"], ["oldest"]),
+            helper.make_node("Reshape", ["oldest", "spec_shape"], [spec_out]),
+            helper.make_node("Slice", [state_in, "next", "last"], ["history"]),
+            helper.make_node("Reshape", [spec_in, "flat_shape"], ["current"]),
+            helper.make_node("Concat", ["history", "current"], [state_out], axis=0),
+        ])
+    elif options.get("nonfinite_spectrum"):
         nodes = [
             constant_node(
                 "nonfinite_spectrum", spec_out, element_type, spec_shape
@@ -182,7 +210,7 @@ def make_fixture(path: Path, **options) -> None:
     else:
         nodes = [helper.make_node("Identity", [spec_in], [spec_out])]
 
-    if output_count >= 2:
+    if output_count >= 2 and not delay_hops:
         if options.get("nonfinite_state"):
             nodes.append(
                 constant_node(
@@ -206,6 +234,15 @@ def make_fixture(path: Path, **options) -> None:
     model.ir_version = 9
 
     metadata = BASE_METADATA | options.get("metadata", {})
+    if delay_hops:
+        metadata |= {
+            "state_size": str(state_shape[0]),
+            "erb_norm_state_size": "0",
+            "erb_norm_init": "",
+            "output_delay_hops": str(delay_hops),
+        }
+    if options.get("omit_delay"):
+        del metadata["output_delay_hops"]
     for key, value in metadata.items():
         entry = model.metadata_props.add()
         entry.key = key

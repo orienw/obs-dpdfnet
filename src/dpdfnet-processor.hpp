@@ -41,6 +41,7 @@ struct DpdfnetRealtimeStorage {
   std::vector<float> zero_scratch;
   std::vector<float> frame;
   std::vector<float> enhanced_hop;
+  std::vector<float> noisy_history;
 };
 
 struct DpdfnetModelBundle {
@@ -50,7 +51,8 @@ struct DpdfnetModelBundle {
 };
 
 DpdfnetRealtimeCapacity plan_dpdfnet_realtime_capacity(int model_sample_rate,
-                                                       int n_fft);
+                                                       int n_fft,
+                                                       int delay_samples = 0);
 DpdfnetModelBundle prepare_dpdfnet_model(const std::string &path);
 void prefill_dpdfnet_model_bundle(DpdfnetModelBundle &bundle, size_t channels,
                                   size_t frames);
@@ -249,6 +251,8 @@ private:
   uint64_t expected_timestamp_ = 0;
   bool have_timestamp_ = false;
   uint64_t output_latency_ns_ = 0;
+  size_t noisy_history_offset_ = 0;
+  int warmup_hops_ = 0;
   bool resample_path_ = false;
   bool resamplers_valid_ = true;
   bool rate_warning_reported_ = false;

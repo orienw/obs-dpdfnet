@@ -18,6 +18,10 @@ struct ContractCase {
 
 constexpr ContractCase kCases[] = {
     {"valid_identity.onnx", nullptr},
+    {"valid_delayed_identity.onnx", nullptr},
+    {"missing_output_delay.onnx", "must declare output_delay_hops"},
+    {"negative_output_delay.onnx", "output_delay_hops is out of supported range"},
+    {"excessive_output_delay.onnx", "output_delay_hops is out of supported range"},
     {"valid_extreme_capacity.onnx", nullptr},
     {"valid_dynamic_arbitrary_names.onnx", nullptr},
     {"missing_input.onnx",

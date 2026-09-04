@@ -106,6 +106,19 @@ aligned dry lane. This prevents stale or reordered packets while comparing the
 processed and original signals. Disable the filter with OBS's filter toggle
 when the goal is to stop its CPU use completely.
 
+The bundled models have four hops (40 ms) of internal signal delay. The filter
+aligns the suppression blend to that delay and discards startup output so the
+enhanced signal, dry mix, bypass, and timestamps describe the same input audio.
+The quality benchmark also receives this aligned output. Its corrected scores
+should not be compared directly with reports from versions before 1.0.1.
+
+Custom ONNX models must declare integer `output_delay_hops` metadata between
+0 and 16. Set it to the model's spectral output delay, excluding STFT buffering
+and resampling. The legacy DPDFNet version 1 `dpdfnet2_48khz_hr` profile used by
+both bundled models is recognized as four hops when that metadata is absent.
+Other models without a declared delay are rejected instead of mixing
+unaligned audio.
+
 The diagnostics row distinguishes the selected model from the model that is
 actually active, reports native or resampled operation, and shows the model's
 frame and hop sizes. It also reports callback timing for the current active

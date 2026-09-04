@@ -262,6 +262,8 @@ void test_variable_packets_and_bypass(const std::string &model_path) {
       const auto &front = expected.front();
       require(result.frames == front.channels[0].size(),
               "processor changed packet frame count");
+      require(result.timestamp == front.timestamp,
+              "bypass changed the input samples' timestamp");
       require(result.timestamp >= last_output_timestamp,
               "processor output timestamps went backwards");
       for (size_t channel = 0; channel < 2; ++channel) {
@@ -280,7 +282,9 @@ void test_variable_packets_and_bypass(const std::string &model_path) {
   }
 
   require(outputs > 60, "processor failed to drain variable packet stream");
-  require(expected.size() <= 3, "processor accumulated an unbounded backlog");
+  require(expected.size() <=
+              static_cast<size_t>(processor.model()->output_delay_hops()) + 3,
+          "processor accumulated an unbounded backlog");
 }
 
 std::vector<float> process_signal(DpdfnetProcessor &processor,
@@ -374,6 +378,100 @@ void compare_results(const DpdfnetProcessResult &left,
   }
 }
 
+void test_model_delay_alignment(const std::filesystem::path &fixtures) {
+  for (uint32_t rate : {48000, 44100, 96000}) {
+    for (int mode = 0; mode < 4; ++mode) {
+      auto reference =
+          make_processor((fixtures / "valid_identity.onnx").string(), rate);
+      auto delayed = make_processor(
+          (fixtures / "valid_delayed_identity.onnx").string(), rate);
+      DpdfnetControls controls;
+      controls.attenuation_limit_db = mode == 0 ? 0.0 : 24.0;
+      controls.wet_mix = mode == 2 ? 0.5 : 1.0;
+      controls.bypass = mode == 3;
+      reference.set_controls(controls);
+      delayed.set_controls(controls);
+
+      const uint32_t frames = rate / 100;
+      std::vector<float> input(frames);
+      for (uint64_t epoch = 0; epoch < 2; ++epoch) {
+        if (epoch && rate != 48000) {
+          reference.replace_resamplers(
+              prepare_dpdfnet_resamplers(rate, 48000, 480));
+          delayed.replace_resamplers(
+              prepare_dpdfnet_resamplers(rate, 48000, 480));
+        }
+        reference.reset_state();
+        delayed.reset_state();
+        std::vector<float> expected, actual;
+        std::vector<uint64_t> expected_timestamps, actual_timestamps;
+        for (uint64_t index = 0; index < 40; ++index) {
+          for (size_t i = 0; i < frames; ++i)
+            input[i] = static_cast<float>(
+                0.1 * std::sin((index * frames + i) * 0.13 + epoch));
+          DpdfnetAudioPacket packet;
+          packet.data[0] = input.data();
+          packet.frames = frames;
+          packet.timestamp = (1 + epoch) * NS_PER_SECOND + index * 10'000'000;
+          const auto collect = [&](DpdfnetProcessor &processor,
+                                   std::vector<float> &samples,
+                                   std::vector<uint64_t> &timestamps) {
+            const auto result = processor.process(packet);
+            require(result.disposition != DpdfnetDisposition::Passthrough,
+                    "delay alignment failed open");
+            if (result.disposition == DpdfnetDisposition::Processed) {
+              samples.insert(samples.end(), result.data[0],
+                             result.data[0] + result.frames);
+              timestamps.push_back(result.timestamp);
+            }
+          };
+          collect(reference, expected, expected_timestamps);
+          collect(delayed, actual, actual_timestamps);
+        }
+        require(actual.size() >= 30 * frames,
+                "delayed model did not drain startup output");
+        require(actual.size() <= expected.size(),
+                "delayed model returned excess audio");
+        require(std::equal(actual_timestamps.begin(), actual_timestamps.end(),
+                           expected_timestamps.begin()),
+                "model delay changed the output timeline");
+        for (size_t i = 0; i < actual.size(); ++i)
+          require(nearly_equal(actual[i], expected[i], 2e-6f),
+                  "model delay misaligned audio: rate=" + std::to_string(rate) +
+                      " mode=" + std::to_string(mode) + " epoch=" +
+                      std::to_string(epoch) + " sample=" + std::to_string(i));
+      }
+    }
+  }
+}
+
+void test_bundled_model_delay(const std::string &path) {
+  DpdfnetModel model(path);
+  require(model.output_delay_hops() == 4,
+          "bundled model delay was not recognized");
+  std::mt19937 rng(71921);
+  std::uniform_real_distribution<float> sample(-0.3f, 0.3f);
+  std::vector<std::pair<float, float>> history;
+  for (int hop = 0; hop < 24; ++hop) {
+    for (size_t i = 0; i < model.spectrum_size(); ++i)
+      model.input_spectrum()[i] = sample(rng);
+    history.emplace_back(model.input_spectrum()[800],
+                         model.input_spectrum()[801]);
+    model.enhance();
+    if (hop < 8)
+      continue;
+    const double re = model.output_spectrum()[800];
+    const double im = model.output_spectrum()[801];
+    const double magnitude = std::hypot(re, im);
+    require(magnitude > 1e-30, "bundled delay probe produced no signal");
+    const auto [expected_re, expected_im] = history[hop - 4];
+    const double expected_magnitude = std::hypot(expected_re, expected_im);
+    require(std::hypot(re / magnitude - expected_re / expected_magnitude,
+                       im / magnitude - expected_im / expected_magnitude) < 1e-5,
+            "bundled model signal delay differs from its declared contract");
+  }
+}
+
 void test_channel_and_timestamp_resets(const std::string &model_path) {
   DpdfnetProcessor transitioned = make_processor(model_path, 48000, 2);
   DpdfnetControls left;
@@ -437,9 +535,11 @@ void test_channel_and_timestamp_resets(const std::string &model_path) {
 
   DpdfnetProcessor tolerated = make_processor(model_path, 48000, 2);
   tolerated.set_controls(right);
-  packet.timestamp = NS_PER_SECOND;
-  tolerated.process(packet);
-  packet.timestamp = NS_PER_SECOND + 20'000'000 + 49'000'000;
+  for (uint64_t index = 0; index < 8; ++index) {
+    packet.timestamp = NS_PER_SECOND + index * 20'000'000;
+    tolerated.process(packet);
+  }
+  packet.timestamp = NS_PER_SECOND + 8 * 20'000'000 + 49'000'000;
   require(tolerated.process(packet).disposition ==
               DpdfnetDisposition::Processed,
           "timestamp deviation below the tolerance reset the stream");
@@ -1055,6 +1155,12 @@ int main(int argc, char **argv) {
   passed = run_test("bypass transitions",
                     [&] { test_bypass_transition(quality_model); }) &&
            passed;
+  passed = run_test("delayed model lane and timestamp alignment",
+                    [&] { test_model_delay_alignment(fixtures); }) && passed;
+  passed = run_test("DPDFNet8 output delay",
+                    [&] { test_bundled_model_delay(quality_model); }) && passed;
+  passed = run_test("DPDFNet2 output delay",
+                    [&] { test_bundled_model_delay(low_cpu_model); }) && passed;
   passed =
       run_test("channel and timestamp resets",
                [&] { test_channel_and_timestamp_resets(low_cpu_model); }) &&

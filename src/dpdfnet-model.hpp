@@ -33,6 +33,7 @@ public:
   int n_fft() const { return n_fft_; }
   int hop_size() const { return hop_size_; }
   int freq_bins() const { return freq_bins_; }
+  int output_delay_hops() const { return output_delay_hops_; }
   const std::string &name() const { return name_; }
   const std::string &profile() const { return profile_; }
   const std::filesystem::path &path() const { return model_path_; }
@@ -80,6 +81,7 @@ private:
   int n_fft_ = 960;
   int hop_size_ = 480;
   int freq_bins_ = 481;
+  int output_delay_hops_ = 0;
   std::string name_;
   std::string profile_;
 };

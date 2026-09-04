@@ -128,6 +128,31 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
     throw std::runtime_error(
         "DPDFNet model metadata state_size is out of supported range");
 
+  auto delay = metadata.LookupCustomMetadataMapAllocated("output_delay_hops",
+                                                         allocator_);
+  if (delay) {
+    output_delay_hops_ = parse_int(delay.get(), "output_delay_hops");
+  } else {
+    auto type =
+        metadata.LookupCustomMetadataMapAllocated("model_type", allocator_);
+    auto version =
+        metadata.LookupCustomMetadataMapAllocated("version", allocator_);
+    // The original 48 kHz HR exports predate delay metadata. Both bundled
+    // networks use this profile, with two mask hops followed by two DF hops.
+    if (type && std::string_view(type.get()) == "dpdfnet" && version &&
+        std::string_view(version.get()) == "1" &&
+        profile_ == "dpdfnet2_48khz_hr" && sample_rate_ == 48000 &&
+        n_fft_ == 960 && hop_size_ == 480) {
+      output_delay_hops_ = 4;
+    } else {
+      throw std::runtime_error(
+          "Custom ONNX model must declare output_delay_hops metadata");
+    }
+  }
+  if (output_delay_hops_ < 0 || output_delay_hops_ > 16)
+    throw std::runtime_error(
+        "DPDFNet model metadata output_delay_hops is out of supported range");
+
   spec_shape_ = {1, 1, freq_bins_, 2};
   state_shape_ = {state_size};
 

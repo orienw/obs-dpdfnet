@@ -51,7 +51,7 @@ size_t scale_frames_ceil(size_t frames, uint32_t numerator,
 
 void include_capacity_for_rate(DpdfnetRealtimeCapacity &capacity,
                                uint32_t native_rate, uint32_t model_rate,
-                               size_t n_fft) {
+                               size_t n_fft, size_t delay_samples) {
   const bool resampling = native_rate != model_rate;
   const size_t input_gain =
       resampling ? scale_frames_ceil(DPDFNET_MAX_REALTIME_PACKET_FRAMES,
@@ -67,7 +67,9 @@ void include_capacity_for_rate(DpdfnetRealtimeCapacity &capacity,
       DPDFNET_MAX_REALTIME_PACKET_FRAMES + synthesized_samples;
   const size_t dry_samples = MAX_RESAMPLER_PREFILL_FRAMES +
                              DPDFNET_MAX_REALTIME_PACKET_FRAMES +
-                             output_samples;
+                             output_samples +
+                             scale_frames_ceil(delay_samples, native_rate,
+                                                model_rate);
 
   capacity.input_samples = std::max(capacity.input_samples, input_samples);
   capacity.output_samples = std::max(capacity.output_samples, output_samples);
@@ -180,20 +182,22 @@ ResampleProbe probe_resampler_pair(audio_resampler_t *in,
 } // namespace
 
 DpdfnetRealtimeCapacity plan_dpdfnet_realtime_capacity(int model_sample_rate,
-                                                       int n_fft) {
+                                                       int n_fft,
+                                                       int delay_samples) {
   DpdfnetRealtimeCapacity capacity{16384, 16384, 16384, 256};
   if (model_sample_rate < static_cast<int>(MIN_SUPPORTED_SAMPLE_RATE) ||
       model_sample_rate > static_cast<int>(MAX_SUPPORTED_SAMPLE_RATE) ||
-      n_fft <= 0 || n_fft > static_cast<int>(MAX_SUPPORTED_NFFT))
+      n_fft <= 0 || n_fft > static_cast<int>(MAX_SUPPORTED_NFFT) ||
+      delay_samples < 0)
     return capacity;
 
   const auto model_rate = static_cast<uint32_t>(model_sample_rate);
   include_capacity_for_rate(capacity, MIN_SUPPORTED_SAMPLE_RATE, model_rate,
-                            static_cast<size_t>(n_fft));
+                            static_cast<size_t>(n_fft), delay_samples);
   include_capacity_for_rate(capacity, model_rate, model_rate,
-                            static_cast<size_t>(n_fft));
+                            static_cast<size_t>(n_fft), delay_samples);
   include_capacity_for_rate(capacity, MAX_SUPPORTED_SAMPLE_RATE, model_rate,
-                            static_cast<size_t>(n_fft));
+                            static_cast<size_t>(n_fft), delay_samples);
   return capacity;
 }
 
@@ -208,7 +212,8 @@ DpdfnetModelBundle prepare_dpdfnet_model(const std::string &path) {
                                                 bundle.model->hop_size());
 
   const DpdfnetRealtimeCapacity capacity = plan_dpdfnet_realtime_capacity(
-      bundle.model->sample_rate(), bundle.model->n_fft());
+      bundle.model->sample_rate(), bundle.model->n_fft(),
+      bundle.model->output_delay_hops() * bundle.model->hop_size());
   bundle.realtime.input_mono.reserve(capacity.input_samples);
   bundle.realtime.output_mono.reserve(capacity.output_samples);
   bundle.realtime.info_queue.reserve(capacity.packet_infos);
@@ -225,6 +230,8 @@ DpdfnetModelBundle prepare_dpdfnet_model(const std::string &path) {
                                0.0f);
   bundle.realtime.enhanced_hop.assign(
       static_cast<size_t>(bundle.model->hop_size()), 0.0f);
+  bundle.realtime.noisy_history.resize(
+      bundle.model->output_delay_hops() * bundle.model->spectrum_size());
   return bundle;
 }
 
@@ -352,6 +359,8 @@ DpdfnetModelBundle DpdfnetProcessor::replace_model(DpdfnetModelBundle bundle) {
   last_timestamp_ = 0;
   expected_timestamp_ = 0;
   have_timestamp_ = false;
+  noisy_history_offset_ = 0;
+  warmup_hops_ = model_ ? model_->output_delay_hops() : 0;
   return old;
 }
 
@@ -454,6 +463,10 @@ void DpdfnetProcessor::reset_audio_state(bool reset_model) {
     model_->reset();
   if (reset_model && stft_)
     stft_->reset();
+  if (reset_model) {
+    noisy_history_offset_ = 0;
+    warmup_hops_ = model_ ? model_->output_delay_hops() : 0;
+  }
 }
 
 void DpdfnetProcessor::recompute_mix() {
@@ -470,14 +483,10 @@ void DpdfnetProcessor::recompute_path() {
 }
 
 void DpdfnetProcessor::recompute_latency() {
-  output_latency_ns_ = 0;
-  if (model_) {
-    output_latency_ns_ = static_cast<uint64_t>(
-        static_cast<double>(model_->hop_size()) /
-        static_cast<double>(model_->sample_rate()) * NS_PER_SECOND);
-  }
-  if (resample_path_)
-    output_latency_ns_ += resamplers_.delay_ns_;
+  // Model startup output is discarded, so packet timestamps already identify
+  // the enhanced samples. Only the resampler's retained samples remain ahead
+  // of the original input, mirrored by the dry lane's zero prefill.
+  output_latency_ns_ = resample_path_ ? resamplers_.delay_ns_ : 0;
 }
 
 bool DpdfnetProcessor::timestamp_jump(uint64_t timestamp) const {
@@ -603,8 +612,24 @@ size_t DpdfnetProcessor::process_available_hops() {
     realtime_.input_mono.peek(realtime_.frame.data(), window_size);
     stft_->analysis(realtime_.frame, noisy_spec);
     model_->enhance();
-    for (size_t i = 0; i < spec_n; ++i)
-      enhanced_spec[i] = alpha * noisy_spec[i] + beta * enhanced_spec[i];
+    float *delayed_spec = realtime_.noisy_history.empty()
+                              ? noisy_spec
+                              : realtime_.noisy_history.data() +
+                                    noisy_history_offset_;
+    for (size_t i = 0; i < spec_n; ++i) {
+      if (!warmup_hops_)
+        enhanced_spec[i] = alpha * delayed_spec[i] + beta * enhanced_spec[i];
+      delayed_spec[i] = noisy_spec[i];
+    }
+    if (!realtime_.noisy_history.empty())
+      noisy_history_offset_ =
+          (noisy_history_offset_ + spec_n) % realtime_.noisy_history.size();
+    if (warmup_hops_) {
+      --warmup_hops_;
+      realtime_.input_mono.pop(hop_size);
+      ++processed_hops;
+      continue;
+    }
     stft_->synthesis(enhanced_spec, realtime_.enhanced_hop);
 
     if (resample_path_) {
