@@ -11,7 +11,7 @@ runtime.
 
 ## Status
 
-This is the `1.0.0` release. Windows x64 is the primary tested path, including
+This is the `1.0.1` release. Windows x64 is the primary tested path, including
 the direct MSVC helper scripts in `scripts/`.
 
 Current filter:
@@ -297,17 +297,17 @@ To refresh, rebuild, and install:
 ## Release Workflow
 
 The Windows release flow is split in two: Windows PowerShell builds and stages
-the Windows artifact, then WSL publishes the GitHub tag and release with the
-GitHub auth configured for this checkout.
+the Windows artifact, then WSL or Linux publishes the GitHub tag and release
+with the GitHub auth configured for this checkout.
 
 From Windows PowerShell:
 
 ```powershell
-.\scripts\release-windows.ps1 -Version 1.0.0 `
+.\scripts\release-windows.ps1 -Version 1.0.1 `
   -Changelog @(
-    "Reorganized settings into clear processing and diagnostics groups."
-    "Added concise status reporting, control help, and recovery guidance."
-    "Updated the build and test baseline to OBS Studio 32.2.1."
+    "Aligned suppression, dry/wet mixing, bypass, and timestamps with model output."
+    "Fixed audio backlog and drops when input packet sizes change."
+    "Fixed ONNX Runtime loading from CMake Linux installs."
   )
 ```
 
@@ -315,10 +315,18 @@ The script rebuilds unless `-SkipBuild` is supplied, runs the mandatory Windows
 test gate either way, verifies clean source and test provenance, then writes the
 zip, checksum, and release notes under `build/`.
 
+The Windows CI also stages a `windows-release` artifact for successful pushes to
+`main`, using the same script and mandatory test gate. It contains the zip,
+checksum, notes, commit stamp, and test report. Download it into `build/` in a
+clean checkout of that commit, review the notes, and publish with the command
+below. CI packages the candidate; publication remains a separate step.
+
+For a portable OBS installation, pass `-ObsInstallDir` to the staging script.
+
 From WSL:
 
 ```bash
-./scripts/publish-release-wsl.sh 1.0.0
+./scripts/publish-release-wsl.sh 1.0.1
 ```
 
 For a draft release, add `--draft` to the WSL publish command.

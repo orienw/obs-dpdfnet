@@ -78,3 +78,26 @@ jobs:
         with:
           name: processor-benchmark
           path: build/processor-benchmark.txt
+
+      - name: Package release candidate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          . ./scripts/dependency-versions.ps1
+          ./scripts/release-windows.ps1 `
+            -Version $DpdfnetDefaultPluginVersion `
+            -ObsInstallDir $env:OBS_INSTALL_DIR `
+            -SkipBuild
+
+      - name: Upload release candidate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-release
+          if-no-files-found: error
+          path: |
+            build/obs-dpdfnet-*-windows-x64.zip
+            build/obs-dpdfnet-*-windows-x64.zip.sha256
+            build/release-notes-v*.md
+            build/release-commit-v*.txt
+            build/msvc/Release/tests-passed.txt

@@ -6,13 +6,14 @@
 # from WSL with scripts/publish-release-wsl.sh so git/gh use the WSL GitHub auth
 # that is already configured for this checkout.
 #
-#   .\scripts\release-windows.ps1 -Version 1.0.0
-#   .\scripts\release-windows.ps1 -Version 1.0.0 -SkipBuild
-#   ./scripts/publish-release-wsl.sh 1.0.0
+#   .\scripts\release-windows.ps1 -Version 1.0.1
+#   .\scripts\release-windows.ps1 -Version 1.0.1 -SkipBuild
+#   ./scripts/publish-release-wsl.sh 1.0.1
 
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Mandatory = $true)][string]$Version,
+    [string]$ObsInstallDir = "C:\Program Files\obs-studio",
     [string]$ObsVersion = "",
     [string]$OnnxRuntimeVersion = "",
     [string]$Repo = "orienw/obs-dpdfnet",
@@ -98,6 +99,7 @@ foreach ($StaleOutput in @($ZipPath, "$ZipPath.sha256", $NotesPath, $CommitPath)
 if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot "build-windows-msvc.ps1") `
         -PluginVersion $Version `
+        -ObsInstallDir $ObsInstallDir `
         -ObsVersion $ObsVersion `
         -OnnxRuntimeVersion $OnnxRuntimeVersion `
         -Configuration $Configuration
@@ -106,7 +108,7 @@ if (-not $SkipBuild) {
 # The behavioral gate always runs, including with -SkipBuild. It rejects stale
 # test binaries and a dirty source tree before any files enter release staging.
 & (Join-Path $PSScriptRoot "test-windows.ps1") `
-    -ObsInstallDir "C:\Program Files\obs-studio" `
+    -ObsInstallDir $ObsInstallDir `
     -Configuration $Configuration `
     -RequireCleanProvenance
 
@@ -283,7 +285,7 @@ $ReadmeInstallUrl
 
 ## Notes
 
-- Windows is the only tested path.
+- The downloadable binary is for Windows x64.
 - The binary is **unsigned**; Windows SmartScreen or Defender may warn on first run.
 - Built against **OBS Studio $ObsVersion** and **ONNX Runtime $OnnxRuntimeVersion**.
 
