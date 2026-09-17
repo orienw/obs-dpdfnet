@@ -37,6 +37,10 @@ constexpr const char *LOW_CPU_MODEL_FILE = "models/dpdfnet2_48khz_hr.onnx";
 // guard relaxes again and the retry schedule starts over.
 constexpr uint64_t OVERLOAD_PROBE_AUDIO_NS = 10'000'000'000ULL;
 
+// Model audio in the recent-load window after which it halves. The half-life
+// is half of this, about 2 s, the scale the realtime guard integrates over.
+constexpr uint64_t LOAD_WINDOW_NS = 4'000'000'000ULL;
+
 std::string module_file(const char *relative_path) {
   char *path = obs_module_file(relative_path);
   if (!path)
@@ -127,8 +131,10 @@ struct TimingSnapshot {
   uint64_t process_p99_ns = 0;
   uint64_t total_p99_ns = 0;
   uint64_t total_max_ns = 0;
-  uint64_t realtime_processing_ns = 0;
-  uint64_t realtime_budget_ns = 0;
+  uint64_t window_processing_ns = 0;
+  uint64_t window_budget_ns = 0;
+  uint64_t epoch_processing_ns = 0;
+  uint64_t epoch_budget_ns = 0;
   std::array<uint64_t, 4> hop_callbacks = {};
   std::array<uint64_t, 4> hop_process_p99_ns = {};
 };
@@ -146,8 +152,17 @@ public:
     if (deadline_ns && total_ns > deadline_ns)
       ++missed_deadlines_;
     if (realtime_budget_ns) {
-      realtime_processing_ns_ += realtime_processing_ns;
-      realtime_budget_ns_ += realtime_budget_ns;
+      window_processing_ns_ += realtime_processing_ns;
+      window_budget_ns_ += realtime_budget_ns;
+      epoch_processing_ns_ += realtime_processing_ns;
+      epoch_budget_ns_ += realtime_budget_ns;
+      // Halve instead of zeroing, so the meter has no sawtooth and the
+      // first window stays a plain average during warm-up. Loop in case a
+      // future callback ever covers more than one window.
+      while (window_budget_ns_ >= LOAD_WINDOW_NS) {
+        window_processing_ns_ = (window_processing_ns_ + 1) / 2;
+        window_budget_ns_ = (window_budget_ns_ + 1) / 2;
+      }
     }
   }
 
@@ -159,8 +174,10 @@ public:
     result.process_p99_ns = process_.percentile_upper_ns(0.99);
     result.total_p99_ns = total_.percentile_upper_ns(0.99);
     result.total_max_ns = total_.max_ns();
-    result.realtime_processing_ns = realtime_processing_ns_;
-    result.realtime_budget_ns = realtime_budget_ns_;
+    result.window_processing_ns = window_processing_ns_;
+    result.window_budget_ns = window_budget_ns_;
+    result.epoch_processing_ns = epoch_processing_ns_;
+    result.epoch_budget_ns = epoch_budget_ns_;
     for (size_t i = 0; i < process_by_hops_.size(); ++i) {
       result.hop_callbacks[i] = process_by_hops_[i].count();
       result.hop_process_p99_ns[i] =
@@ -177,8 +194,10 @@ private:
   TimingHistogram total_;
   std::array<TimingHistogram, 4> process_by_hops_;
   uint64_t missed_deadlines_ = 0;
-  uint64_t realtime_processing_ns_ = 0;
-  uint64_t realtime_budget_ns_ = 0;
+  uint64_t window_processing_ns_ = 0;
+  uint64_t window_budget_ns_ = 0;
+  uint64_t epoch_processing_ns_ = 0;
+  uint64_t epoch_budget_ns_ = 0;
 };
 
 enum class StatusSeverity { Normal, Warning, Error };
@@ -220,6 +239,14 @@ public:
            static_cast<unsigned long long>(timing.missed_deadlines),
            timing.lock_p99_ns / 1e6, timing.process_p99_ns / 1e6,
            timing.total_p99_ns / 1e6, timing.total_max_ns / 1e6);
+      if (timing.epoch_budget_ns) {
+        blog(LOG_INFO,
+             "[obs-dpdfnet] active-processing load epoch: avg=%.1f%% over "
+             "%.1f s of audio",
+             static_cast<double>(timing.epoch_processing_ns) * 100.0 /
+                 static_cast<double>(timing.epoch_budget_ns),
+             timing.epoch_budget_ns / 1e9);
+      }
       constexpr const char *hop_labels[] = {"0 hops", "1 hop", "2 hops",
                                             "3+ hops"};
       for (size_t hops = 0; hops < timing.hop_callbacks.size(); ++hops) {
@@ -860,10 +887,10 @@ public:
         summary << ", resampling from " << khz(snapshot.sample_rate) << " kHz";
       if (probe)
         summary << ", recovering after an overload";
-      if (timing.realtime_budget_ns) {
-        const uint64_t load_percent = static_cast<uint64_t>(std::llround(
-            static_cast<double>(timing.realtime_processing_ns) * 100.0 /
-            static_cast<double>(timing.realtime_budget_ns)));
+      if (timing.window_budget_ns) {
+        const uint64_t load_percent = static_cast<uint64_t>(
+            std::llround(static_cast<double>(timing.window_processing_ns) *
+                         100.0 / static_cast<double>(timing.window_budget_ns)));
         summary << ", " << load_percent << "% processing load";
       }
     }

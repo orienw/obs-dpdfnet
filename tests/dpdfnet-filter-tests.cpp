@@ -465,6 +465,16 @@ void verify_status_property(obs_properties_t *properties) {
           "status details do not report the active model");
 }
 
+// Only meaningful before any audio callbacks have run.
+void verify_no_processing_load(obs_properties_t *properties) {
+  obs_property_t *summary = obs_properties_get(properties, "status_summary");
+  const char *description =
+      summary ? obs_property_description(summary) : nullptr;
+  require(description && std::string(description).find("% processing load") ==
+                             std::string::npos,
+          "status reports a processing load before any audio was processed");
+}
+
 void verify_properties_layout(obs_properties_t *properties,
                               obs_data_t *settings) {
   constexpr std::array<const char *, 4> root_order = {
@@ -583,6 +593,7 @@ void test_direct_callbacks(const std::string &model_path) {
 
     verify_properties_layout(properties, settings);
     verify_status_property(properties);
+    verify_no_processing_load(properties);
     obs_property_t *details_toggle =
         obs_properties_get(properties, "show_details");
     obs_property_t *details = obs_properties_get(properties, "status_info");
@@ -635,6 +646,16 @@ void test_direct_callbacks(const std::string &model_path) {
       wait_for_processed_audio(filter.get(), storage, 1000000000ULL);
   require(output->frames > 0 && output->data[0] && output->data[1],
           "processed callback returned incomplete audio");
+
+  {
+    ObsProperties properties(dpdfnet_filter_info.get_properties(filter.get()));
+    const char *summary = obs_property_description(
+        obs_properties_get(properties, "status_summary"));
+    require(summary && std::string(summary).find("% processing load") !=
+                           std::string::npos,
+            "status does not report the processing load after audio was "
+            "processed");
+  }
 
   const struct obs_audio_data published = *output;
   const size_t frames = published.frames;
@@ -694,6 +715,20 @@ void test_direct_callbacks(const std::string &model_path) {
   require(filter_test_instrumentation::callback_allocations.load(
               std::memory_order_relaxed) == steady_allocations_before,
           "steady-state processing allocated on the audio callback");
+
+  // Reset clears the timing epoch, so the meter disappears until new audio is
+  // processed.
+  {
+    ObsProperties properties(dpdfnet_filter_info.get_properties(filter.get()));
+    obs_property_t *reset = obs_properties_get(properties, "reset_state");
+    require(reset && obs_property_button_clicked(reset, nullptr),
+            "post-audio reset failed");
+    const char *summary = obs_property_description(
+        obs_properties_get(properties, "status_summary"));
+    require(summary && std::string(summary).find("% processing load") ==
+                           std::string::npos,
+            "reset did not clear the processing load");
+  }
 
   std::array<std::vector<float>, 2> oversized_storage = {
       std::vector<float>(DPDFNET_MAX_REALTIME_PACKET_FRAMES + 1, 0.025f),
