@@ -127,6 +127,8 @@ struct TimingSnapshot {
   uint64_t process_p99_ns = 0;
   uint64_t total_p99_ns = 0;
   uint64_t total_max_ns = 0;
+  uint64_t realtime_processing_ns = 0;
+  uint64_t realtime_budget_ns = 0;
   std::array<uint64_t, 4> hop_callbacks = {};
   std::array<uint64_t, 4> hop_process_p99_ns = {};
 };
@@ -134,7 +136,8 @@ struct TimingSnapshot {
 class CallbackTimings {
 public:
   void record(uint64_t lock_wait_ns, uint64_t process_ns, uint64_t total_ns,
-              uint64_t deadline_ns, size_t processed_hops) {
+              uint64_t deadline_ns, size_t processed_hops,
+              uint64_t realtime_processing_ns, uint64_t realtime_budget_ns) {
     lock_wait_.record(lock_wait_ns);
     process_.record(process_ns);
     total_.record(total_ns);
@@ -142,6 +145,10 @@ public:
     process_by_hops_[hop_bucket].record(process_ns);
     if (deadline_ns && total_ns > deadline_ns)
       ++missed_deadlines_;
+    if (realtime_budget_ns) {
+      realtime_processing_ns_ += realtime_processing_ns;
+      realtime_budget_ns_ += realtime_budget_ns;
+    }
   }
 
   TimingSnapshot snapshot() const {
@@ -152,6 +159,8 @@ public:
     result.process_p99_ns = process_.percentile_upper_ns(0.99);
     result.total_p99_ns = total_.percentile_upper_ns(0.99);
     result.total_max_ns = total_.max_ns();
+    result.realtime_processing_ns = realtime_processing_ns_;
+    result.realtime_budget_ns = realtime_budget_ns_;
     for (size_t i = 0; i < process_by_hops_.size(); ++i) {
       result.hop_callbacks[i] = process_by_hops_[i].count();
       result.hop_process_p99_ns[i] =
@@ -168,6 +177,8 @@ private:
   TimingHistogram total_;
   std::array<TimingHistogram, 4> process_by_hops_;
   uint64_t missed_deadlines_ = 0;
+  uint64_t realtime_processing_ns_ = 0;
+  uint64_t realtime_budget_ns_ = 0;
 };
 
 enum class StatusSeverity { Normal, Warning, Error };
@@ -522,20 +533,24 @@ public:
     const uint64_t processor_started = os_gettime_ns();
     DpdfnetProcessResult result = processor_.process(packet);
     const uint64_t processor_finished = os_gettime_ns();
+    const uint64_t realtime_processing_ns =
+        processor_finished - processor_started;
+    uint64_t realtime_budget_ns = 0;
     const bool active_processing_result =
         result.disposition != DpdfnetDisposition::Passthrough;
     uint64_t overload_retry_delay_ns = 0;
 
     if (timing_eligible && active_processing_result) {
-      const DpdfnetRealtimeObservation observation = realtime_guard_.observe(
-          processor_finished - processor_started, result.processed_hops,
-          active.hop_size, active.model_rate);
+      const DpdfnetRealtimeObservation observation =
+          realtime_guard_.observe(realtime_processing_ns, result.processed_hops,
+                                  active.hop_size, active.model_rate);
+      realtime_budget_ns = observation.budget_ns;
       if (observation.tripped) {
         std::snprintf(result.message.data(), result.message.size(),
                       "processing took %.1f ms for %.1f ms of audio, debt "
                       "%.1f ms",
-                      (processor_finished - processor_started) / 1e6,
-                      observation.budget_ns / 1e6, observation.debt_ns / 1e6);
+                      realtime_processing_ns / 1e6, observation.budget_ns / 1e6,
+                      observation.debt_ns / 1e6);
         if (processor_.disable_for_realtime_overload(result.message.data())) {
           result.fail_open();
           result.event = DpdfnetEvent::RealtimeOverloadCircuitOpened;
@@ -583,10 +598,10 @@ public:
         static_cast<uint64_t>(static_cast<double>(audio->frames) /
                               static_cast<double>(obs_rate) * 1e9);
     if (timing_eligible && active_processing_result) {
-      timings_.record(lock_acquired - lock_start,
-                      processing_finished - lock_acquired,
-                      processing_finished - callback_start, deadline_ns,
-                      result.processed_hops);
+      timings_.record(
+          lock_acquired - lock_start, processing_finished - lock_acquired,
+          processing_finished - callback_start, deadline_ns,
+          result.processed_hops, realtime_processing_ns, realtime_budget_ns);
     }
     lock.unlock();
 
@@ -845,6 +860,12 @@ public:
         summary << ", resampling from " << khz(snapshot.sample_rate) << " kHz";
       if (probe)
         summary << ", recovering after an overload";
+      if (timing.realtime_budget_ns) {
+        const uint64_t load_percent = static_cast<uint64_t>(std::llround(
+            static_cast<double>(timing.realtime_processing_ns) * 100.0 /
+            static_cast<double>(timing.realtime_budget_ns)));
+        summary << ", " << load_percent << "% processing load";
+      }
     }
 
     // Details are a readout: key and value per line, no periods.
