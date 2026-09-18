@@ -2,7 +2,7 @@
 
 $DpdfnetDefaultObsVersion = "32.2.1"
 $DpdfnetDefaultOnnxRuntimeVersion = "1.27.0"
-$DpdfnetDefaultPluginVersion = "1.0.1"
+$DpdfnetDefaultPluginVersion = "1.1.0"
 $DpdfnetDefaultModelName = "dpdfnet8_48khz_hr"
 $DpdfnetDefaultModelNames = @("dpdfnet8_48khz_hr", "dpdfnet2_48khz_hr")
 
