@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -95,23 +96,21 @@ private:
   bool probe_ = false;
 };
 
-// Delays before processing is retried after a realtime overload. Once the
-// schedule is exhausted, processing stays off until a manual reset.
+// Delays before processing is retried after a realtime overload. The last
+// delay repeats, so a paused filter keeps retrying until one succeeds.
 class DpdfnetOverloadRetrySchedule {
 public:
-  static constexpr size_t MAX_ATTEMPTS = 3;
-
   uint64_t next_delay_ns() noexcept {
-    if (attempts_ >= DELAYS_NS.size())
-      return 0;
-    return DELAYS_NS[attempts_++];
+    const size_t step = std::min(attempts_, DELAYS_NS.size() - 1);
+    ++attempts_;
+    return DELAYS_NS[step];
   }
 
   size_t attempts() const noexcept { return attempts_; }
   void reset() noexcept { attempts_ = 0; }
 
 private:
-  static constexpr std::array<uint64_t, MAX_ATTEMPTS> DELAYS_NS = {
+  static constexpr std::array<uint64_t, 3> DELAYS_NS = {
       10'000'000'000ULL, 30'000'000'000ULL, 60'000'000'000ULL};
 
   size_t attempts_ = 0;

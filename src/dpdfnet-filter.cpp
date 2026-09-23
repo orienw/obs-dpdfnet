@@ -714,8 +714,8 @@ public:
     }
     blog(LOG_INFO,
          "[obs-dpdfnet] retrying processing after realtime overload "
-         "(attempt %zu of %zu)",
-         attempt, DpdfnetOverloadRetrySchedule::MAX_ATTEMPTS);
+         "(attempt %zu)",
+         attempt);
   }
 
   void reset_stream_boundary() {
@@ -836,16 +836,14 @@ public:
     // Two lines: a state word, then one plain sentence or a spec line.
     FilterStatus result;
     std::ostringstream summary;
-    const uint64_t retry_in_s = (retry_in_ns + 999'999'999) / 1'000'000'000;
-    if (overload && retry_in_ns) {
+    // A retry that is starting clears its deadline first; count it as 1 s.
+    const uint64_t retry_in_s =
+        std::max<uint64_t>(1, (retry_in_ns + 999'999'999) / 1'000'000'000);
+    if (overload) {
       result.severity = StatusSeverity::Warning;
       summary << "Paused\nAudio is passing through without noise suppression. "
                  "Processing will retry in "
               << retry_in_s << (retry_in_s == 1 ? " second." : " seconds.");
-    } else if (overload) {
-      result.severity = StatusSeverity::Error;
-      summary << "Off\nProcessing overloaded repeatedly. Switch to DPDFNet2 or "
-                 "reduce system load, then press Reset processing.";
     } else if (snapshot.processing_disabled) {
       result.severity = StatusSeverity::Error;
       summary << "Off\nProcessing failed repeatedly. Press Reset processing to "
@@ -926,12 +924,9 @@ public:
     if (!snapshot.last_error.empty())
       text << (overload ? "\nLast overload: " : "\nLast error: ")
            << snapshot.last_error;
-    if (overload && retry_in_ns) {
+    if (overload) {
       text << "\nNext retry: in " << retry_in_s << " s, attempt "
-           << retry_attempts << " of "
-           << DpdfnetOverloadRetrySchedule::MAX_ATTEMPTS;
-    } else if (overload) {
-      text << "\nNext retry: none, automatic retries are exhausted";
+           << retry_attempts;
     }
     if (snapshot.bypass)
       text << "\nBypass: on, delay-matched original audio with the model kept "
@@ -1050,21 +1045,13 @@ private:
            diagnostic.message.data());
     } else if (diagnostic.event ==
                DpdfnetEvent::RealtimeOverloadCircuitOpened) {
-      if (diagnostic.retry_delay_ns) {
-        blog(LOG_ERROR,
-             "[obs-dpdfnet] sustained realtime overload: %s; noise "
-             "suppression is paused and audio is passing through without it; "
-             "retrying in %llu s",
-             diagnostic.message.data(),
-             static_cast<unsigned long long>(diagnostic.retry_delay_ns /
-                                             1'000'000'000ULL));
-      } else {
-        blog(LOG_ERROR,
-             "[obs-dpdfnet] sustained realtime overload: %s; automatic "
-             "retries are exhausted, processing is disabled and audio is "
-             "passing through until processing is reset",
-             diagnostic.message.data());
-      }
+      blog(LOG_ERROR,
+           "[obs-dpdfnet] sustained realtime overload: %s; noise "
+           "suppression is paused and audio is passing through without it; "
+           "retrying in %llu s",
+           diagnostic.message.data(),
+           static_cast<unsigned long long>(diagnostic.retry_delay_ns /
+                                           1'000'000'000ULL));
     } else if (diagnostic.event == DpdfnetEvent::RealtimeOverloadRecovered) {
       blog(LOG_INFO,
            "[obs-dpdfnet] processing recovered after realtime overload");

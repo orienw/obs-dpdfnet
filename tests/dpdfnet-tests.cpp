@@ -179,10 +179,10 @@ void test_overload_retry_schedule() {
           "second retry was not scheduled after 30 s");
   require(schedule.next_delay_ns() == 60'000'000'000ULL,
           "third retry was not scheduled after 60 s");
-  require(schedule.attempts() == DpdfnetOverloadRetrySchedule::MAX_ATTEMPTS,
-          "retry schedule miscounted attempts");
-  require(schedule.next_delay_ns() == 0 && schedule.next_delay_ns() == 0,
-          "exhausted retry schedule kept retrying");
+  for (int retry = 0; retry < 100; ++retry)
+    require(schedule.next_delay_ns() == 60'000'000'000ULL,
+            "later retries did not repeat every 60 s");
+  require(schedule.attempts() == 103, "retry schedule miscounted attempts");
   schedule.reset();
   require(schedule.attempts() == 0 &&
               schedule.next_delay_ns() == 10'000'000'000ULL,
