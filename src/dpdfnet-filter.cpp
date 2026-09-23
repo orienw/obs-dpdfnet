@@ -38,7 +38,7 @@ constexpr const char *LOW_CPU_MODEL_FILE = "models/dpdfnet2_48khz_hr.onnx";
 constexpr uint64_t OVERLOAD_PROBE_AUDIO_NS = 10'000'000'000ULL;
 
 // Model audio in the recent-load window after which it halves. The half-life
-// is half of this, about 2 s, the scale the realtime guard integrates over.
+// is half of this, about 2 s, long enough for a steady reading.
 constexpr uint64_t LOAD_WINDOW_NS = 4'000'000'000ULL;
 
 std::string module_file(const char *relative_path) {

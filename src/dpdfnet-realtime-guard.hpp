@@ -63,7 +63,7 @@ public:
 private:
   static constexpr uint64_t NS_PER_SECOND = 1'000'000'000ULL;
   static constexpr uint64_t MAX_DEBT_NS = 500'000'000ULL;
-  static constexpr uint64_t MIN_OBSERVED_AUDIO_NS = 2'000'000'000ULL;
+  static constexpr uint64_t MIN_OBSERVED_AUDIO_NS = 500'000'000ULL;
   static constexpr uint64_t PROBE_MAX_DEBT_NS = 100'000'000ULL;
   static constexpr uint64_t PROBE_MIN_OBSERVED_AUDIO_NS = 100'000'000ULL;
 

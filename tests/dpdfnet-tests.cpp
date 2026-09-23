@@ -94,9 +94,9 @@ void test_realtime_budget_guard() {
   require(guard.debt_ns() == 0,
           "exact realtime budget accumulated overload debt");
 
-  for (size_t hop = 1; hop <= 200; ++hop) {
+  for (size_t hop = 1; hop <= 50; ++hop) {
     const auto observation = guard.observe(2 * hop_budget, 1, 480, 48000);
-    require(observation.tripped == (hop == 200),
+    require(observation.tripped == (hop == 50),
             "2x realtime load tripped at the wrong point");
     require(observation.debt_ns == hop * hop_budget,
             "overload observation reported the wrong accumulated debt");
@@ -130,6 +130,14 @@ void test_realtime_budget_guard() {
             "healthy processing tripped while repaying a stall");
   require(guard.debt_ns() == 0 && guard.observed_audio_ns() == 0,
           "healthy processing did not repay a one-second stall");
+
+  guard.reset();
+  require(!guard.observe(1'000'000'000, 1, 480, 48000).tripped,
+          "a one-second stall opened the overload circuit");
+  for (size_t hop = 1; hop <= 49; ++hop)
+    require(guard.observe(hop_budget + 1'000'000, 1, 480, 48000).tripped ==
+                (hop == 49),
+            "overload that continued after a stall tripped at the wrong point");
 
   guard.reset();
   require(!guard.observe(19'000'000, 2, 480, 48000).tripped,
