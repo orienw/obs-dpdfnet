@@ -1,0 +1,87 @@
+name: Linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: build-and-test (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            flags: ""
+          - name: sanitizers
+            flags: >-
+              -fsanitize=address,undefined -fno-sanitize-recover=undefined
+              -fno-omit-frame-pointer
+    env:
+      # Keep the version in step with scripts/dependency-versions.ps1.
+      ONNXRUNTIME_VERSION: 1.27.0
+      ONNXRUNTIME_SHA256: 547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ libobs-dev patchelf xvfb
+
+      - name: Download ONNX Runtime
+        run: |
+          archive="onnxruntime-linux-x64-$ONNXRUNTIME_VERSION.tgz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v$ONNXRUNTIME_VERSION/$archive"
+          echo "$ONNXRUNTIME_SHA256  $archive" | sha256sum -c -
+          tar -xzf "$archive"
+          echo "ONNXRUNTIME_ROOT=$PWD/onnxruntime-linux-x64-$ONNXRUNTIME_VERSION" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          FLAGS: ${{ matrix.flags }}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_C_FLAGS="$FLAGS" \
+            -DCMAKE_CXX_FLAGS="$FLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS="$FLAGS" \
+            -DCMAKE_MODULE_LINKER_FLAGS="$FLAGS" \
+            -DDPDFNET_BUILD_TESTS=ON \
+            -DDPDFNET_PLUGIN_DESTINATION=bin/64bit \
+            -DDPDFNET_DATA_DESTINATION=data
+          cmake --build build
+
+      # libobs needs an X display to start, even for audio-only tests.
+      - name: Test
+        run: xvfb-run -a ctest --test-dir build --output-on-failure
+
+      - name: Check the installed ONNX Runtime name
+        if: matrix.name == 'release'
+        run: |
+          cmake --install build --prefix install
+          needed="$(readelf -d install/bin/64bit/obs-dpdfnet.so | grep NEEDED)"
+          echo "$needed"
+          grep -qF 'libonnxruntime_dpdfnet.so' <<< "$needed"
+          if grep -qF 'libonnxruntime.so' <<< "$needed"; then
+            echo "the plugin still needs the stock ONNX Runtime soname"
+            exit 1
+          fi
+          test -f install/bin/64bit/libonnxruntime_dpdfnet.so
+          # Only OBS entry points may be exported; anything else, especially
+          # a GNU unique symbol, can be shared with another plugin.
+          exports="$(nm -D --defined-only install/bin/64bit/obs-dpdfnet.so)"
+          echo "$exports"
+          if grep -v ' obs_module_' <<< "$exports"; then
+            echo "the plugin exports symbols other than OBS entry points"
+            exit 1
+          fi
