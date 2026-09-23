@@ -189,28 +189,6 @@ void test_overload_retry_schedule() {
           "retry schedule did not restart after reset");
 }
 
-void test_process_result_fail_open() {
-  DpdfnetProcessResult result;
-  result.disposition = DpdfnetDisposition::Pending;
-  result.data[0] = reinterpret_cast<float *>(uintptr_t{1});
-  result.frames = 8192;
-  result.timestamp = NS_PER_SECOND;
-  result.processed_hops = 16;
-  result.resampler_refresh_needed = true;
-  result.event = DpdfnetEvent::RealtimeOverloadCircuitOpened;
-  result.message[0] = 'x';
-
-  result.fail_open();
-  require(result.disposition == DpdfnetDisposition::Passthrough &&
-              result.data[0] == nullptr && result.frames == 0 &&
-              result.timestamp == 0,
-          "fail-open transition retained pending output state");
-  require(result.processed_hops == 16 && result.resampler_refresh_needed &&
-              result.event == DpdfnetEvent::RealtimeOverloadCircuitOpened &&
-              result.message[0] == 'x',
-          "fail-open transition discarded diagnostic state");
-}
-
 void test_timestamp_floor() {
   DpdfnetTimestampFloor floor;
   floor.observe_input(NS_PER_SECOND);
@@ -826,18 +804,114 @@ void test_realtime_overload_disable(const std::string &model_path) {
   packet.data[0] = data.data();
   packet.frames = static_cast<uint32_t>(data.size());
   packet.timestamp = NS_PER_SECOND;
-  require(processor.process(packet).disposition ==
+  require(processor.process(packet).disposition !=
               DpdfnetDisposition::Passthrough,
-          "open realtime circuit retried processing");
+          "overload pause dropped out of the delay-matched pipeline");
 
   processor.reset_state();
   snapshot = processor.snapshot();
   require(!snapshot.processing_disabled &&
               snapshot.disable_reason == DpdfnetDisableReason::None,
           "Reset did not close the realtime overload circuit");
+  packet.timestamp += 20'000'000;
   require(processor.process(packet).disposition !=
               DpdfnetDisposition::Passthrough,
           "Reset did not resume processing after realtime overload");
+
+  require(!processor.resume_after_overload(),
+          "resume acted without an overload pause");
+  require(processor.disable_for_realtime_overload("second overload") &&
+              processor.resume_after_overload(),
+          "resume did not close the realtime overload circuit");
+  snapshot = processor.snapshot();
+  require(!snapshot.processing_disabled && snapshot.last_error.empty(),
+          "resume left the overload state behind");
+}
+
+// With a delayed-identity model, enhanced and paused output are the same
+// signal, so a stream that pauses and resumes must match one that never
+// paused: no dropped, repeated, or shifted samples at either transition.
+void test_overload_pause_continuity(const std::filesystem::path &fixtures) {
+  const std::string model = (fixtures / "valid_delayed_identity.onnx").string();
+  for (uint32_t rate : {48000, 44100, 96000}) {
+    auto reference = make_processor(model, rate);
+    auto paused = make_processor(model, rate);
+    const uint32_t frames = rate / 100;
+    std::vector<float> input(frames);
+    std::vector<float> expected, actual;
+    std::vector<uint64_t> expected_timestamps, actual_timestamps;
+    for (uint64_t index = 0; index < 60; ++index) {
+      if (index == 15)
+        require(paused.disable_for_realtime_overload("test overload"),
+                "overload pause did not open");
+      if (index == 35)
+        require(paused.resume_after_overload(), "overload pause did not close");
+      for (size_t i = 0; i < frames; ++i)
+        input[i] =
+            static_cast<float>(0.1 * std::sin((index * frames + i) * 0.13));
+      DpdfnetAudioPacket packet;
+      packet.data[0] = input.data();
+      packet.frames = frames;
+      packet.timestamp = NS_PER_SECOND + index * 10'000'000;
+      const auto collect = [&](DpdfnetProcessor &processor,
+                               std::vector<float> &samples,
+                               std::vector<uint64_t> &timestamps) {
+        const auto result = processor.process(packet);
+        require(result.disposition != DpdfnetDisposition::Passthrough &&
+                    result.event == DpdfnetEvent::None,
+                "overload pause left the delay-matched pipeline");
+        if (result.disposition == DpdfnetDisposition::Processed) {
+          samples.insert(samples.end(), result.data[0],
+                         result.data[0] + result.frames);
+          timestamps.push_back(result.timestamp);
+        }
+      };
+      collect(reference, expected, expected_timestamps);
+      collect(paused, actual, actual_timestamps);
+    }
+    require(actual.size() == expected.size() &&
+                actual_timestamps == expected_timestamps,
+            "overload pause changed the output timeline at " +
+                std::to_string(rate) + " Hz");
+    for (size_t i = 0; i < actual.size(); ++i)
+      require(nearly_equal(actual[i], expected[i], 2e-6f),
+              "overload pause changed the audio at " + std::to_string(rate) +
+                  " Hz, sample " + std::to_string(i));
+  }
+}
+
+void test_overload_pause_skips_model(const std::filesystem::path &fixtures) {
+  auto processor = make_processor(
+      (fixtures / "runtime_nonfinite_spectrum_output.onnx").string());
+  require(processor.disable_for_realtime_overload("test overload"),
+          "overload pause did not open");
+  std::vector<float> data(960, 0.1f);
+  DpdfnetAudioPacket packet;
+  packet.data[0] = data.data();
+  packet.frames = static_cast<uint32_t>(data.size());
+  size_t processed = 0;
+  for (uint64_t index = 0; index < 12; ++index) {
+    packet.timestamp = NS_PER_SECOND + index * 20'000'000;
+    const auto result = processor.process(packet);
+    require(result.disposition != DpdfnetDisposition::Passthrough &&
+                result.event == DpdfnetEvent::None,
+            "overload pause ran the model");
+    if (result.disposition == DpdfnetDisposition::Processed) {
+      ++processed;
+      // The first hop fades in through overlap-add; later hops carry the
+      // constant input unchanged.
+      if (processed > 1) {
+        for (uint32_t frame = 0; frame < result.frames; ++frame)
+          require(nearly_equal(result.data[0][frame], 0.1f, 1e-5f),
+                  "overload pause did not pass the delayed input through");
+      }
+    }
+  }
+  require(processed > 6, "overload pause produced no delayed audio");
+  require(processor.resume_after_overload(), "overload pause did not close");
+  packet.timestamp = NS_PER_SECOND + 12 * 20'000'000;
+  require(processor.process(packet).event == DpdfnetEvent::ProcessingFailure,
+          "resume did not run the model again");
 }
 
 void test_output_storage_survives_format_update(const std::string &model_path) {
@@ -1189,9 +1263,6 @@ int main(int argc, char **argv) {
       run_test("realtime budget guard", test_realtime_budget_guard) && passed;
   passed = run_test("overload retry schedule", test_overload_retry_schedule) &&
            passed;
-  passed =
-      run_test("process result fail open", test_process_result_fail_open) &&
-      passed;
   passed = run_test("timestamp floor", test_timestamp_floor) && passed;
   passed = run_test("model selection migration",
                     [&] {
@@ -1223,6 +1294,12 @@ int main(int argc, char **argv) {
       passed;
   passed = run_test("realtime overload disable",
                     [&] { test_realtime_overload_disable(low_cpu_model); }) &&
+           passed;
+  passed = run_test("overload pause continuity",
+                    [&] { test_overload_pause_continuity(fixtures); }) &&
+           passed;
+  passed = run_test("overload pause skips the model",
+                    [&] { test_overload_pause_skips_model(fixtures); }) &&
            passed;
   passed = run_test("returned audio survives format update",
                     [&] {

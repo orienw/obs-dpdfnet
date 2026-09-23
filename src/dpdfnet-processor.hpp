@@ -145,13 +145,6 @@ struct DpdfnetProcessResult {
   size_t processed_hops = 0;
   bool resampler_refresh_needed = false;
   std::array<char, 256> message = {};
-
-  void fail_open() noexcept {
-    disposition = DpdfnetDisposition::Passthrough;
-    data.fill(nullptr);
-    frames = 0;
-    timestamp = 0;
-  }
 };
 
 struct DpdfnetProcessorSnapshot {
@@ -207,6 +200,7 @@ public:
   void reset_state();
   void reset_stream();
   bool disable_for_realtime_overload(const char *message);
+  bool resume_after_overload();
 
   DpdfnetProcessResult process(const DpdfnetAudioPacket &audio);
   DpdfnetProcessorState state() const;
@@ -254,6 +248,7 @@ private:
   uint32_t output_packet_offset_ = 0;
   size_t noisy_history_offset_ = 0;
   int warmup_hops_ = 0;
+  int bridge_hops_ = 0;
   bool resample_path_ = false;
   bool resamplers_valid_ = true;
   bool rate_warning_reported_ = false;

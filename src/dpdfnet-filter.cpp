@@ -579,7 +579,6 @@ public:
                       realtime_processing_ns / 1e6, observation.budget_ns / 1e6,
                       observation.debt_ns / 1e6);
         if (processor_.disable_for_realtime_overload(result.message.data())) {
-          result.fail_open();
           result.event = DpdfnetEvent::RealtimeOverloadCircuitOpened;
           overload_retry_delay_ns = overload_retries_.next_delay_ns();
         }
@@ -637,24 +636,13 @@ public:
     return output;
   }
 
-  void reset_state() { reset_processing(false); }
-
-  // Shared by the Reset button and the automatic retry after a realtime
-  // overload. A retry only acts while processing is still paused for that
-  // reason, resumes on probe thresholds, and keeps the retry count.
-  bool reset_processing(bool automatic_retry) {
-    size_t attempt = 0;
+  void reset_state() {
     {
       std::lock_guard<std::mutex> update_lock(update_mutex_);
       DpdfnetProcessorState state;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         state = processor_.state();
-        if (automatic_retry &&
-            (!state.processing_disabled ||
-             state.disable_reason != DpdfnetDisableReason::RealtimeOverload))
-          return false;
-        attempt = overload_retries_.attempts();
       }
 
       DpdfnetResamplers fresh;
@@ -693,10 +681,9 @@ public:
           last_resampler_error_.swap(prepared_resampler_error);
         processor_.reset_state();
         reset_timing_epoch();
-        realtime_guard_.set_probe(automatic_retry);
+        realtime_guard_.set_probe(false);
         probe_audio_ns_ = 0;
-        if (!automatic_retry)
-          overload_retries_.reset();
+        overload_retries_.reset();
         have_failed_model_path_ = false;
         failed_model_path_.swap(discarded_failed_path);
         last_load_error_.swap(discarded_load_error);
@@ -706,17 +693,29 @@ public:
       std::lock_guard<std::mutex> lock(resampler_request_mutex_);
       overload_retry_deadline_ns_ = 0;
     }
-    if (automatic_retry) {
-      blog(LOG_INFO,
-           "[obs-dpdfnet] retrying processing after realtime overload "
-           "(attempt %zu of %zu)",
-           attempt, DpdfnetOverloadRetrySchedule::MAX_ATTEMPTS);
-    }
 
     obs_data_t *settings = obs_source_get_settings(source_);
     update(settings);
     obs_data_release(settings);
-    return true;
+  }
+
+  // Resumes the model where the overload paused it. The audio lanes kept
+  // running, so the retry needs no fresh resamplers or stream reset.
+  void retry_after_overload() {
+    size_t attempt = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!processor_.resume_after_overload())
+        return;
+      attempt = overload_retries_.attempts();
+      reset_timing_epoch();
+      realtime_guard_.set_probe(true);
+      probe_audio_ns_ = 0;
+    }
+    blog(LOG_INFO,
+         "[obs-dpdfnet] retrying processing after realtime overload "
+         "(attempt %zu of %zu)",
+         attempt, DpdfnetOverloadRetrySchedule::MAX_ATTEMPTS);
   }
 
   void reset_stream_boundary() {
@@ -840,8 +839,8 @@ public:
     const uint64_t retry_in_s = (retry_in_ns + 999'999'999) / 1'000'000'000;
     if (overload && retry_in_ns) {
       result.severity = StatusSeverity::Warning;
-      summary << "Paused\nAudio is passing through unprocessed. Processing "
-                 "will retry in "
+      summary << "Paused\nAudio is passing through without noise suppression. "
+                 "Processing will retry in "
               << retry_in_s << (retry_in_s == 1 ? " second." : " seconds.");
     } else if (overload) {
       result.severity = StatusSeverity::Error;
@@ -1053,8 +1052,9 @@ private:
                DpdfnetEvent::RealtimeOverloadCircuitOpened) {
       if (diagnostic.retry_delay_ns) {
         blog(LOG_ERROR,
-             "[obs-dpdfnet] sustained realtime overload: %s; processing is "
-             "paused and audio is passing through; retrying in %llu s",
+             "[obs-dpdfnet] sustained realtime overload: %s; noise "
+             "suppression is paused and audio is passing through without it; "
+             "retrying in %llu s",
              diagnostic.message.data(),
              static_cast<unsigned long long>(diagnostic.retry_delay_ns /
                                              1'000'000'000ULL));
@@ -1109,7 +1109,7 @@ private:
       if (refresh_resamplers)
         rebuild_resamplers_after_discontinuity();
       if (retry_overload)
-        reset_processing(true);
+        retry_after_overload();
       request_lock.lock();
     }
   }

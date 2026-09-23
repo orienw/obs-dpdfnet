@@ -362,6 +362,7 @@ DpdfnetModelBundle DpdfnetProcessor::replace_model(DpdfnetModelBundle bundle) {
   output_packet_offset_ = 0;
   noisy_history_offset_ = 0;
   warmup_hops_ = model_ ? model_->output_delay_hops() : 0;
+  bridge_hops_ = 0;
   return old;
 }
 
@@ -468,6 +469,7 @@ void DpdfnetProcessor::reset_audio_state(bool reset_model) {
   if (reset_model) {
     noisy_history_offset_ = 0;
     warmup_hops_ = model_ ? model_->output_delay_hops() : 0;
+    bridge_hops_ = 0;
   }
 }
 
@@ -608,24 +610,35 @@ size_t DpdfnetProcessor::process_available_hops() {
   float *enhanced_spec = model_->output_spectrum();
   const float alpha = attenuation_alpha_;
   const float beta = 1.0f - alpha;
+  // An overload pause skips the model but keeps the STFT lanes running, so
+  // the delayed noisy spectrum fills the enhanced output slots. The latency
+  // and timeline stay the same, and overlap-add crossfades each transition.
+  const bool run_model = disable_reason_ == DpdfnetDisableReason::None;
   size_t processed_hops = 0;
 
   while (realtime_.input_mono.size() >= window_size) {
     realtime_.input_mono.peek(realtime_.frame.data(), window_size);
     stft_->analysis(realtime_.frame, noisy_spec);
-    model_->enhance();
+    if (run_model)
+      model_->enhance();
+    const bool model_output = run_model && !bridge_hops_;
     float *delayed_spec = realtime_.noisy_history.empty()
                               ? noisy_spec
                               : realtime_.noisy_history.data() +
                                     noisy_history_offset_;
     for (size_t i = 0; i < spec_n; ++i) {
-      if (!warmup_hops_)
-        enhanced_spec[i] = alpha * delayed_spec[i] + beta * enhanced_spec[i];
+      if (!warmup_hops_) {
+        enhanced_spec[i] =
+            model_output ? alpha * delayed_spec[i] + beta * enhanced_spec[i]
+                         : delayed_spec[i];
+      }
       delayed_spec[i] = noisy_spec[i];
     }
     if (!realtime_.noisy_history.empty())
       noisy_history_offset_ =
           (noisy_history_offset_ + spec_n) % realtime_.noisy_history.size();
+    if (bridge_hops_)
+      --bridge_hops_;
     if (warmup_hops_) {
       --warmup_hops_;
       realtime_.input_mono.pop(hop_size);
@@ -817,9 +830,23 @@ bool DpdfnetProcessor::disable_for_realtime_overload(const char *message) {
   consecutive_failures_ = 0;
   process_error_reported_ = false;
   std::snprintf(last_error_.data(), last_error_.size(), "%s", message);
-  if (resample_path_)
-    resamplers_valid_ = false;
-  reset_audio_state();
+  return true;
+}
+
+bool DpdfnetProcessor::resume_after_overload() {
+  if (disable_reason_ != DpdfnetDisableReason::RealtimeOverload)
+    return false;
+
+  disable_reason_ = DpdfnetDisableReason::None;
+  consecutive_failures_ = 0;
+  process_error_reported_ = false;
+  last_error_.fill(0);
+  // The restarted model has not seen the audio already in its delay line, so
+  // its first output_delay_hops outputs are replaced with the noisy spectrum.
+  if (model_) {
+    model_->reset();
+    bridge_hops_ = model_->output_delay_hops();
+  }
   return true;
 }
 
@@ -828,7 +855,7 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
   DenormalModeGuard denormal_guard;
   DpdfnetProcessResult result;
   if (!audio.frames || !model_ || !stft_ ||
-      disable_reason_ != DpdfnetDisableReason::None)
+      disable_reason_ == DpdfnetDisableReason::RepeatedProcessingFailures)
     return result;
 
   if (audio.frames > MAX_AUDIO_PACKET_FRAMES)

@@ -52,7 +52,7 @@ public:
 
   // Probe mode trips on the old, tight thresholds. It covers the first
   // seconds after an automatic retry so a machine that still cannot keep
-  // up fails open again before OBS buffering grows much.
+  // up pauses again before OBS buffering grows much.
   void set_probe(bool probe) noexcept { probe_ = probe; }
   bool probe() const noexcept { return probe_; }
 
