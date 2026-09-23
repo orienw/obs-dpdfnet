@@ -247,6 +247,7 @@ private:
 
   uint32_t sample_rate_ = 0;
   size_t channels_ = 0;
+  size_t lfe_channel_ = DPDFNET_MAX_AUDIO_PLANES;
   uint64_t last_timestamp_ = 0;
   uint64_t expected_timestamp_ = 0;
   bool have_timestamp_ = false;

@@ -50,7 +50,8 @@ speak. `40 dB` is aggressive; `60 dB` is a diagnostic extreme.
 
 Use the filter on a microphone, not on desktop audio or music. It enhances one
 channel: on stereo sources pick the mic channel, or `Mix all channels` if you
-really want the average. Other OBS sample rates work; the voice lane is
+really want the average. The enhanced voice goes to every output channel
+except LFE. Other OBS sample rates work; the voice lane is
 resampled to and from the model's 48 kHz.
 
 `DPDFNet8` sounds best but costs more CPU. If the machine cannot keep up, the

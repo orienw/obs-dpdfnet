@@ -175,6 +175,21 @@ ResampleProbe probe_resampler_pair(audio_resampler_t *in,
   probe.ok = true;
   return probe;
 }
+
+// OBS speaker layouts are identified by their channel count. The layouts with
+// an LFE channel carry it third (2.1) or fourth (4.1, 5.1, 7.1).
+size_t lfe_channel_for(size_t channels) {
+  switch (channels) {
+  case 3:
+    return 2;
+  case 5:
+  case 6:
+  case 8:
+    return 3;
+  default:
+    return DPDFNET_MAX_AUDIO_PLANES;
+  }
+}
 } // namespace
 
 float dpdfnet_db_to_amp(double db) {
@@ -407,6 +422,7 @@ void DpdfnetProcessor::set_format(uint32_t sample_rate, size_t channels) {
     resamplers_valid_ = false;
   sample_rate_ = sample_rate;
   channels_ = channels;
+  lfe_channel_ = lfe_channel_for(channels);
   rate_warning_reported_ = false;
   reset_audio_state();
 }
@@ -740,6 +756,17 @@ DpdfnetProcessor::pop_output_packet(size_t processed_hops) {
     if (controls_.bypass) {
       std::copy(realtime_.dry_scratch.begin(), realtime_.dry_scratch.end(),
                 output_storage_[channel].begin());
+    } else if (channel == lfe_channel_) {
+      // The enhanced voice stays out of the LFE channel, which keeps only
+      // the dry share of its own input.
+      if (need_dry) {
+        for (uint32_t frame = 0; frame < info.frames; ++frame)
+          output_storage_[channel][frame] =
+              realtime_.dry_scratch[frame] * dry_gain_;
+      } else {
+        std::fill(output_storage_[channel].begin(),
+                  output_storage_[channel].end(), 0.0f);
+      }
     } else if (need_dry) {
       for (uint32_t frame = 0; frame < info.frames; ++frame) {
         output_storage_[channel][frame] =

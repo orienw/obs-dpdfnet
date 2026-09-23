@@ -914,6 +914,61 @@ void test_overload_pause_skips_model(const std::filesystem::path &fixtures) {
           "resume did not run the model again");
 }
 
+void test_lfe_channel(const std::filesystem::path &fixtures) {
+  const std::string model = (fixtures / "valid_identity.onnx").string();
+  const std::pair<size_t, size_t> layouts[] = {{2, 2}, {3, 2}, {4, 4},
+                                               {5, 3}, {6, 3}, {8, 3}};
+  for (const auto &[channels, lfe] : layouts) {
+    auto bypass = make_processor(model, 48000, channels);
+    auto wet = make_processor(model, 48000, channels);
+    auto half = make_processor(model, 48000, channels);
+    DpdfnetControls controls;
+    controls.bypass = true;
+    bypass.set_controls(controls);
+    controls.bypass = false;
+    wet.set_controls(controls);
+    controls.wet_mix = 0.5;
+    half.set_controls(controls);
+
+    std::array<std::vector<float>, DPDFNET_MAX_AUDIO_PLANES> input;
+    size_t processed = 0;
+    for (uint64_t index = 0; index < 30; ++index) {
+      DpdfnetAudioPacket packet;
+      packet.frames = 480;
+      packet.timestamp = NS_PER_SECOND + index * 10'000'000;
+      for (size_t channel = 0; channel < channels; ++channel) {
+        input[channel].resize(packet.frames);
+        for (size_t i = 0; i < packet.frames; ++i)
+          input[channel][i] = static_cast<float>(
+              0.05 * std::sin((index * packet.frames + i) * 0.07 + channel));
+        packet.data[channel] = input[channel].data();
+      }
+      const auto dry = bypass.process(packet);
+      const auto full = wet.process(packet);
+      const auto mixed = half.process(packet);
+      if (full.disposition != DpdfnetDisposition::Processed)
+        continue;
+      require(dry.frames == full.frames && mixed.frames == full.frames,
+              "LFE test processors drifted apart");
+      ++processed;
+      for (size_t channel = 0; channel < channels; ++channel) {
+        for (uint32_t frame = 0; frame < full.frames; ++frame) {
+          const float expected_wet =
+              channel == lfe ? 0.0f : full.data[0][frame];
+          require(full.data[channel][frame] == expected_wet,
+                  "enhanced voice reached the wrong channels with " +
+                      std::to_string(channels) + " channels");
+          if (channel == lfe)
+            require(nearly_equal(mixed.data[channel][frame],
+                                 0.5f * dry.data[channel][frame]),
+                    "LFE channel lost its dry share");
+        }
+      }
+    }
+    require(processed > 20, "LFE test produced no processed audio");
+  }
+}
+
 void test_output_storage_survives_format_update(const std::string &model_path) {
   DpdfnetProcessor processor = make_processor(model_path);
   DpdfnetControls controls;
@@ -1301,6 +1356,8 @@ int main(int argc, char **argv) {
   passed = run_test("overload pause skips the model",
                     [&] { test_overload_pause_skips_model(fixtures); }) &&
            passed;
+  passed =
+      run_test("LFE channel", [&] { test_lfe_channel(fixtures); }) && passed;
   passed = run_test("returned audio survives format update",
                     [&] {
                       test_output_storage_survives_format_update(low_cpu_model);
