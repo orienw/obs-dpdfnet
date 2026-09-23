@@ -83,10 +83,6 @@ std::string selected_model_path(obs_data_t *settings,
   return path ? path : "";
 }
 
-float db_to_amp(double db) {
-  return static_cast<float>(std::pow(10.0, db / 20.0));
-}
-
 class TimingHistogram {
 public:
   void record(uint64_t nanoseconds) {
@@ -275,8 +271,8 @@ public:
         obs_data_get_double(settings, SETTING_ATTENUATION_LIMIT_DB);
     controls.wet_mix = std::clamp(
         obs_data_get_double(settings, SETTING_WET_MIX) / 100.0, 0.0, 1.0);
-    controls.output_gain =
-        db_to_amp(obs_data_get_double(settings, SETTING_OUTPUT_GAIN_DB));
+    controls.output_gain = dpdfnet_db_to_amp(
+        obs_data_get_double(settings, SETTING_OUTPUT_GAIN_DB));
     controls.bypass = obs_data_get_bool(settings, SETTING_BYPASS);
     const bool show_details = obs_data_get_bool(settings, SETTING_SHOW_DETAILS);
 
@@ -645,40 +641,18 @@ public:
         state = processor_.state();
       }
 
-      DpdfnetResamplers fresh;
-      const bool needs_fresh_resamplers =
-          state.has_model && state.sample_rate &&
-          state.sample_rate != static_cast<uint32_t>(state.model_rate);
-      std::string resampler_error;
-      if (needs_fresh_resamplers) {
-        try {
-          fresh = prepare_dpdfnet_resamplers(state.sample_rate,
-                                             state.model_rate, state.hop_size);
-        } catch (const std::exception &ex) {
-          resampler_error = ex.what();
-          blog(LOG_ERROR,
-               "[obs-dpdfnet] reset resampler preparation failed: %s",
-               ex.what());
-        }
+      FreshResamplers fresh = prepare_fresh_resamplers(state);
+      if (!fresh.error.empty()) {
+        blog(LOG_ERROR, "[obs-dpdfnet] reset resampler preparation failed: %s",
+             fresh.error.c_str());
       }
 
       DpdfnetResamplers old;
-      std::string prepared_resampler_error = resampler_error;
-      std::string discarded_resampler_error;
       std::string discarded_failed_path;
       std::string discarded_load_error;
       {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (fresh)
-          old = processor_.replace_resamplers(std::move(fresh));
-        else if (needs_fresh_resamplers)
-          old = processor_.replace_resamplers({});
-        else if (state.resampler_refresh_required)
-          old = processor_.release_invalid_resamplers();
-        if (resampler_error.empty())
-          last_resampler_error_.swap(discarded_resampler_error);
-        else
-          last_resampler_error_.swap(prepared_resampler_error);
+        old = install_fresh_resamplers(fresh, state.resampler_refresh_required);
         processor_.reset_state();
         reset_timing_epoch();
         realtime_guard_.set_probe(false);
@@ -726,37 +700,16 @@ public:
       state = processor_.state();
     }
 
-    const bool needs_fresh_resamplers =
-        state.has_model && state.sample_rate &&
-        state.sample_rate != static_cast<uint32_t>(state.model_rate);
-    DpdfnetResamplers fresh;
-    std::string resampler_error;
-    if (needs_fresh_resamplers) {
-      try {
-        fresh = prepare_dpdfnet_resamplers(state.sample_rate, state.model_rate,
-                                           state.hop_size);
-      } catch (const std::exception &ex) {
-        resampler_error = ex.what();
-        blog(LOG_ERROR,
-             "[obs-dpdfnet] stream-boundary resampler preparation failed: %s",
-             ex.what());
-      }
+    FreshResamplers fresh = prepare_fresh_resamplers(state);
+    if (!fresh.error.empty()) {
+      blog(LOG_ERROR,
+           "[obs-dpdfnet] stream-boundary resampler preparation failed: %s",
+           fresh.error.c_str());
     }
 
     DpdfnetResamplers old;
-    std::string prepared_resampler_error = resampler_error;
-    std::string discarded_resampler_error;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (fresh)
-      old = processor_.replace_resamplers(std::move(fresh));
-    else if (needs_fresh_resamplers)
-      old = processor_.replace_resamplers({});
-    else if (state.resampler_refresh_required)
-      old = processor_.release_invalid_resamplers();
-    if (resampler_error.empty())
-      last_resampler_error_.swap(discarded_resampler_error);
-    else
-      last_resampler_error_.swap(prepared_resampler_error);
+    old = install_fresh_resamplers(fresh, state.resampler_refresh_required);
     processor_.reset_stream();
     reset_timing_epoch();
     timestamp_floor_.reset();
@@ -765,7 +718,6 @@ public:
   FilterStatus status() const {
     std::lock_guard<std::mutex> update_lock(update_mutex_);
     DpdfnetProcessorState state;
-    DpdfnetProcessorSnapshot snapshot;
     TimingSnapshot timing;
     const DpdfnetModel *model = nullptr;
     bool probe = false;
@@ -778,26 +730,9 @@ public:
       probe = realtime_guard_.probe();
       retry_attempts = overload_retries_.attempts();
     }
-    snapshot.has_model = state.has_model;
-    snapshot.resampling = state.resampling;
-    snapshot.bypass = state.bypass;
-    snapshot.processing_disabled = state.processing_disabled;
-    snapshot.disable_reason = state.disable_reason;
-    snapshot.resampler_refresh_required = state.resampler_refresh_required;
-    snapshot.capacity_recovery_pending = state.capacity_recovery_pending;
-    snapshot.sample_rate = state.sample_rate;
-    snapshot.channels = state.channels;
-    snapshot.model_rate = state.model_rate;
-    snapshot.n_fft = state.n_fft;
-    snapshot.hop_size = state.hop_size;
-    snapshot.consecutive_failures = state.consecutive_failures;
-    snapshot.oversized_packets = state.oversized_packets;
-    snapshot.capacity_failures = state.capacity_failures;
-    snapshot.last_error = state.last_error.data();
-    if (model) {
-      snapshot.model_path = model->path().string();
-      snapshot.model_name = model->name();
-    }
+    // Only update() replaces the model, and it holds update_mutex_.
+    const DpdfnetProcessorSnapshot snapshot =
+        make_dpdfnet_snapshot(state, model);
     const std::string load_error = last_load_error_;
     const std::string resampler_error = last_resampler_error_;
     uint64_t retry_in_ns = 0;
@@ -981,6 +916,47 @@ private:
     realtime_guard_.reset();
   }
 
+  struct FreshResamplers {
+    bool needed = false;
+    DpdfnetResamplers resamplers;
+    std::string error;
+  };
+
+  // Prepares resamplers for the processor's current format outside the audio
+  // lock. They are needed whenever the model rate differs from OBS's.
+  static FreshResamplers
+  prepare_fresh_resamplers(const DpdfnetProcessorState &state) {
+    FreshResamplers fresh;
+    fresh.needed = state.has_model && state.sample_rate &&
+                   state.sample_rate != static_cast<uint32_t>(state.model_rate);
+    if (fresh.needed) {
+      try {
+        fresh.resamplers = prepare_dpdfnet_resamplers(
+            state.sample_rate, state.model_rate, state.hop_size);
+      } catch (const std::exception &ex) {
+        fresh.error = ex.what();
+      }
+    }
+    return fresh;
+  }
+
+  // Requires mutex_. Installs the prepared resamplers, or clears stale ones,
+  // and records the preparation error. The previous error text lands in
+  // `fresh` and the previous resamplers are returned, so the caller frees
+  // both after releasing the lock.
+  DpdfnetResamplers install_fresh_resamplers(FreshResamplers &fresh,
+                                             bool refresh_required) {
+    DpdfnetResamplers old;
+    if (fresh.resamplers)
+      old = processor_.replace_resamplers(std::move(fresh.resamplers));
+    else if (fresh.needed)
+      old = processor_.replace_resamplers({});
+    else if (refresh_required)
+      old = processor_.release_invalid_resamplers();
+    last_resampler_error_.swap(fresh.error);
+    return old;
+  }
+
   void request_worker(bool resampler_refresh,
                       const DpdfnetProcessResult &result,
                       uint64_t overload_retry_delay_ns) {
@@ -1111,18 +1087,9 @@ private:
     if (!requested.resampler_refresh_required)
       return;
 
-    DpdfnetResamplers fresh;
-    std::string error;
-    const bool needs_resampling =
-        requested.sample_rate != static_cast<uint32_t>(requested.model_rate);
-    if (needs_resampling) {
-      try {
-        fresh = prepare_dpdfnet_resamplers(
-            requested.sample_rate, requested.model_rate, requested.hop_size);
-      } catch (const std::exception &ex) {
-        error = ex.what();
-      }
-    }
+    FreshResamplers fresh = prepare_fresh_resamplers(requested);
+    const bool needs_resampling = fresh.needed;
+    const std::string error = fresh.error;
 
     DpdfnetResamplers old;
     bool applied = false;
@@ -1135,9 +1102,9 @@ private:
                                  current.sample_rate == requested.sample_rate &&
                                  current.model_rate == requested.model_rate &&
                                  current.hop_size == requested.hop_size;
-      if (still_current && (fresh || !needs_resampling)) {
+      if (still_current && (fresh.resamplers || !needs_resampling)) {
         if (needs_resampling)
-          old = processor_.replace_resamplers(std::move(fresh));
+          old = processor_.replace_resamplers(std::move(fresh.resamplers));
         else
           old = processor_.release_invalid_resamplers();
         last_resampler_error_.swap(discarded_error);

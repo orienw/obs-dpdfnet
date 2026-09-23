@@ -50,6 +50,7 @@ struct DpdfnetModelBundle {
   DpdfnetRealtimeStorage realtime;
 };
 
+float dpdfnet_db_to_amp(double db);
 DpdfnetRealtimeCapacity plan_dpdfnet_realtime_capacity(int model_sample_rate,
                                                        int n_fft,
                                                        int delay_samples = 0);
@@ -187,6 +188,12 @@ struct DpdfnetProcessorState {
   std::array<char, 256> last_error = {};
 };
 
+// Copies a processor state and the identity of its model. The caller keeps
+// the model alive for the duration of the call.
+DpdfnetProcessorSnapshot
+make_dpdfnet_snapshot(const DpdfnetProcessorState &state,
+                      const DpdfnetModel *model);
+
 class DpdfnetProcessor {
 public:
   DpdfnetProcessor();
@@ -212,7 +219,6 @@ public:
 private:
   static constexpr uint32_t MAX_AUDIO_PACKET_FRAMES =
       DPDFNET_MAX_REALTIME_PACKET_FRAMES;
-  static constexpr size_t RESAMPLE_BOUND_SLACK = 256;
   static constexpr unsigned MAX_CONSECUTIVE_FAILURES = 3;
   static constexpr uint64_t NS_PER_SECOND = 1000000000ULL;
   static constexpr uint64_t MAX_TIMESTAMP_DEVIATION_NS = 50000000ULL;

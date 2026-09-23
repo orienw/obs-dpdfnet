@@ -39,10 +39,6 @@ private:
 struct DenormalModeGuard {};
 #endif
 
-float db_to_amp(double db) {
-  return static_cast<float>(std::pow(10.0, db / 20.0));
-}
-
 size_t scale_frames_ceil(size_t frames, uint32_t numerator,
                          uint32_t denominator) {
   return (frames * static_cast<size_t>(numerator) + denominator - 1) /
@@ -180,6 +176,10 @@ ResampleProbe probe_resampler_pair(audio_resampler_t *in,
   return probe;
 }
 } // namespace
+
+float dpdfnet_db_to_amp(double db) {
+  return static_cast<float>(std::pow(10.0, db / 20.0));
+}
 
 DpdfnetRealtimeCapacity plan_dpdfnet_realtime_capacity(int model_sample_rate,
                                                        int n_fft,
@@ -474,7 +474,7 @@ void DpdfnetProcessor::reset_audio_state(bool reset_model) {
 }
 
 void DpdfnetProcessor::recompute_mix() {
-  attenuation_alpha_ = db_to_amp(-controls_.attenuation_limit_db);
+  attenuation_alpha_ = dpdfnet_db_to_amp(-controls_.attenuation_limit_db);
   dry_gain_ =
       static_cast<float>((1.0 - controls_.wet_mix) * controls_.output_gain);
   wet_gain_ = static_cast<float>(controls_.wet_mix * controls_.output_gain);
@@ -945,27 +945,32 @@ DpdfnetProcessorState DpdfnetProcessor::state() const {
 }
 
 DpdfnetProcessorSnapshot DpdfnetProcessor::snapshot() const {
-  const DpdfnetProcessorState current = state();
+  return make_dpdfnet_snapshot(state(), model_.get());
+}
+
+DpdfnetProcessorSnapshot
+make_dpdfnet_snapshot(const DpdfnetProcessorState &state,
+                      const DpdfnetModel *model) {
   DpdfnetProcessorSnapshot result;
-  result.has_model = current.has_model;
-  result.resampling = current.resampling;
-  result.bypass = current.bypass;
-  result.processing_disabled = current.processing_disabled;
-  result.disable_reason = current.disable_reason;
-  result.resampler_refresh_required = current.resampler_refresh_required;
-  result.capacity_recovery_pending = current.capacity_recovery_pending;
-  result.sample_rate = current.sample_rate;
-  result.channels = current.channels;
-  result.model_rate = current.model_rate;
-  result.n_fft = current.n_fft;
-  result.hop_size = current.hop_size;
-  result.consecutive_failures = current.consecutive_failures;
-  result.oversized_packets = current.oversized_packets;
-  result.capacity_failures = current.capacity_failures;
-  result.last_error = current.last_error.data();
-  if (model_) {
-    result.model_path = model_->path().string();
-    result.model_name = model_->name();
+  result.has_model = state.has_model;
+  result.resampling = state.resampling;
+  result.bypass = state.bypass;
+  result.processing_disabled = state.processing_disabled;
+  result.disable_reason = state.disable_reason;
+  result.resampler_refresh_required = state.resampler_refresh_required;
+  result.capacity_recovery_pending = state.capacity_recovery_pending;
+  result.sample_rate = state.sample_rate;
+  result.channels = state.channels;
+  result.model_rate = state.model_rate;
+  result.n_fft = state.n_fft;
+  result.hop_size = state.hop_size;
+  result.consecutive_failures = state.consecutive_failures;
+  result.oversized_packets = state.oversized_packets;
+  result.capacity_failures = state.capacity_failures;
+  result.last_error = state.last_error.data();
+  if (model) {
+    result.model_path = model->path().string();
+    result.model_name = model->name();
   }
   return result;
 }
