@@ -6,9 +6,9 @@
 # from WSL with scripts/publish-release-wsl.sh so git/gh use the WSL GitHub auth
 # that is already configured for this checkout.
 #
-#   .\scripts\release-windows.ps1 -Version 1.1.0
-#   .\scripts\release-windows.ps1 -Version 1.1.0 -SkipBuild
-#   ./scripts/publish-release-wsl.sh 1.1.0
+#   .\scripts\release-windows.ps1 -Version 1.1.1
+#   .\scripts\release-windows.ps1 -Version 1.1.1 -SkipBuild
+#   ./scripts/publish-release-wsl.sh 1.1.1
 
 [CmdletBinding(PositionalBinding = $false)]
 param(
