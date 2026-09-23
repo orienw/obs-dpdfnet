@@ -88,6 +88,9 @@ if(DPDFNET_FETCH_KISSFFT)
     GIT_TAG 131.1.0
   )
   FetchContent_MakeAvailable(kissfft)
+  # KissFFT is linked statically, so keep its headers, archive, and package
+  # files out of the plugin install. It still builds as a dependency.
+  set_property(DIRECTORY "${kissfft_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL ON)
   set(DPDFNET_KISSFFT_TARGET kissfft::kissfft)
 else()
   find_package(kissfft CONFIG REQUIRED COMPONENTS float)
