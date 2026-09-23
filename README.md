@@ -64,9 +64,10 @@ processing fails repeatedly, it stays off until you press `Reset processing`.
 keeps the model warm for A/B comparison. Disable the filter in OBS to stop its
 CPU use.
 
-The bundled models add 40 ms of internal delay. The filter aligns the dry mix,
-bypass, and timestamps to that delay so every output describes the same input
-audio.
+With the bundled models, the filter delays audio by 50 ms: 40 ms inside the
+model and 10 ms of STFT overlap. The dry mix, bypass, and timestamps are
+aligned to that delay so every output describes the same input audio, and OBS
+keeps it in sync with video. Audio monitoring hears the delay.
 
 Custom ONNX models must expose the DPDFNet two-input, two-output float32 tensor
 contract and declare integer `output_delay_hops` metadata from 0 to 16: the
