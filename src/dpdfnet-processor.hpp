@@ -144,6 +144,7 @@ struct DpdfnetProcessResult {
   uint32_t frames = 0;
   uint64_t timestamp = 0;
   size_t processed_hops = 0;
+  size_t inference_hops = 0;
   bool resampler_refresh_needed = false;
   std::array<char, 256> message = {};
 };
@@ -233,7 +234,7 @@ private:
   size_t to_model_frames(size_t native_frames) const;
   size_t to_native_frames(size_t model_frames) const;
   bool push_input(const DpdfnetAudioPacket &audio);
-  size_t process_available_hops();
+  void process_available_hops(size_t &processed_hops, size_t &inference_hops);
   DpdfnetProcessResult pop_output_packet(size_t processed_hops);
   DpdfnetProcessResult failure_result(const char *message);
   DpdfnetProcessResult capacity_failure_result(uint32_t frames, bool oversized);
@@ -256,6 +257,12 @@ private:
   size_t noisy_history_offset_ = 0;
   int warmup_hops_ = 0;
   int bridge_hops_ = 0;
+  int fade_in_hops_ = 1;
+  int fade_out_hops_ = 1;
+  // Suppression depth in steps of 1 / (fade_in_hops_ * fade_out_hops_).
+  int depth_steps_ = 1;
+  // Whether any processed audio has gone out since the lanes were last reset.
+  bool emitted_since_reset_ = false;
   bool resample_path_ = false;
   bool resamplers_valid_ = true;
   bool rate_warning_reported_ = false;

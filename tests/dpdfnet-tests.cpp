@@ -888,36 +888,418 @@ void test_overload_pause_continuity(const std::filesystem::path &fixtures) {
   }
 }
 
+struct FadeRun {
+  std::vector<float> output;
+  // Model inferences per input packet.
+  std::vector<size_t> inference;
+};
+
+// Feeds 480-frame packets, pausing and resuming before the given packets. The
+// stream must stay delay-matched: Pending only during startup, then one
+// contiguous, finite 480-frame packet out per packet in, so a test cannot
+// pass on audio from before the transition it checks.
+FadeRun run_fade(DpdfnetProcessor &processor, const std::vector<float> &input,
+                 uint64_t pause_at, uint64_t resume_at) {
+  FadeRun run;
+  bool started = false;
+  size_t startup = 0;
+  uint64_t next_timestamp = 0;
+  for (uint64_t index = 0; index * 480 < input.size(); ++index) {
+    if (index == pause_at)
+      require(processor.disable_for_realtime_overload("test overload"),
+              "overload pause did not open");
+    if (index == resume_at)
+      require(processor.resume_after_overload(),
+              "overload pause did not close");
+    DpdfnetAudioPacket packet;
+    packet.data[0] = input.data() + index * 480;
+    packet.frames = 480;
+    packet.timestamp = NS_PER_SECOND + index * 10'000'000;
+    const auto result = processor.process(packet);
+    const std::string at = " at packet " + std::to_string(index);
+    require(result.disposition != DpdfnetDisposition::Passthrough &&
+                result.event == DpdfnetEvent::None,
+            "fade test left the delay-matched pipeline" + at);
+    run.inference.push_back(result.inference_hops);
+    if (result.disposition == DpdfnetDisposition::Pending) {
+      require(!started, "fade test stopped receiving audio" + at);
+      ++startup;
+      continue;
+    }
+    require(result.frames == 480 &&
+                (!started || result.timestamp == next_timestamp),
+            "fade test broke the output timeline" + at);
+    started = true;
+    next_timestamp = result.timestamp + 10'000'000;
+    for (uint32_t frame = 0; frame < result.frames; ++frame)
+      require(std::isfinite(result.data[0][frame]),
+              "fade test produced non-finite audio" + at);
+    run.output.insert(run.output.end(), result.data[0],
+                      result.data[0] + result.frames);
+  }
+  require(started && startup <= 6, "fade test startup took too long");
+  return run;
+}
+
+// Heard-to-input level ratio per 10 ms block for noise at a 50 dB limit,
+// with an overload pause and resume at the given packets.
+std::vector<double> fade_trace(const std::filesystem::path &model, double wet,
+                               uint64_t pause_at, uint64_t resume_at,
+                               uint64_t packets) {
+  auto processor = make_processor(model.string());
+  DpdfnetControls controls;
+  controls.attenuation_limit_db = 50.0;
+  controls.wet_mix = wet;
+  processor.set_controls(controls);
+  std::mt19937 rng(11);
+  std::normal_distribution<float> noise(0.0f, 0.05f);
+  std::vector<float> input(packets * 480);
+  for (float &sample : input)
+    sample = noise(rng);
+  const auto output = run_fade(processor, input, pause_at, resume_at).output;
+  std::vector<double> ratio;
+  for (size_t block = 0; (block + 1) * 480 <= output.size(); ++block) {
+    double in = 0.0;
+    double out = 0.0;
+    for (size_t i = block * 480; i < (block + 1) * 480; ++i) {
+      in += static_cast<double>(input[i]) * input[i];
+      out += static_cast<double>(output[i]) * output[i];
+    }
+    ratio.push_back(10.0 * std::log10(out / in + 1e-30));
+  }
+  return ratio;
+}
+
+// A pause and a resume must fade the noise floor instead of switching it. At a
+// 50 dB limit, switching in one hop steps the level by about 45 dB, which
+// sounds like a click. The pause fades about 5 dB per 10 ms.
+void test_overload_pause_fades(const std::string &model_path) {
+  auto processor = make_processor(model_path);
+  DpdfnetControls controls;
+  controls.attenuation_limit_db = 50.0;
+  processor.set_controls(controls);
+  std::mt19937 rng(7);
+  std::normal_distribution<float> noise(0.0f, 0.01f);
+  std::vector<float> input(900 * 480);
+  for (float &sample : input)
+    sample = noise(rng);
+  const auto output = run_fade(processor, input, 300, 600).output;
+  std::vector<double> levels;
+  for (size_t block = 0; (block + 1) * 480 <= output.size(); ++block) {
+    double energy = 0.0;
+    for (size_t i = block * 480; i < (block + 1) * 480; ++i)
+      energy += static_cast<double>(output[i]) * output[i];
+    levels.push_back(10.0 * std::log10(energy / 480.0 + 1e-20));
+  }
+  const double input_db = 20.0 * std::log10(0.01);
+  const auto level_at = [&](double seconds) {
+    return levels[static_cast<size_t>(seconds * 100.0)];
+  };
+  require(level_at(2.5) < input_db - 30.0 && level_at(3.5) > input_db - 3.0 &&
+              level_at(6.5) < input_db - 30.0,
+          "fade test did not pause and resume suppression");
+  for (size_t block = 250; block + 1 < 700; ++block) {
+    require(std::fabs(levels[block + 1] - levels[block]) < 8.0,
+            "overload pause or resume stepped the noise floor by " +
+                std::to_string(levels[block + 1] - levels[block]) + " dB at " +
+                std::to_string(block / 100.0) + " s");
+  }
+}
+
+size_t first_block(const std::vector<double> &ratio, size_t from, bool above,
+                   double level) {
+  for (size_t block = from; block < ratio.size(); ++block) {
+    if (above ? ratio[block] > level : ratio[block] < level)
+      return block;
+  }
+  throw TestFailure("fade never crossed " + std::to_string(level) + " dB");
+}
+
+// A pause must raise the level from -50 dB to 0 dB over 100 ms in steps of
+// about 5 dB, and a resume lower it back over 200 ms in steps of about
+// 2.5 dB, starting output_delay_hops later because the model restarts.
+void check_fade_envelope(const std::vector<double> &ratio, const char *name) {
+  const std::string label = std::string(name) + ": ";
+  for (size_t block = 50; block < 90; ++block)
+    require(std::fabs(ratio[block] + 50.0) < 0.5,
+            label + "steady suppression is not the 50 dB limit");
+  const size_t pause_start = first_block(ratio, 90, true, -49.5);
+  const size_t pause_end = first_block(ratio, pause_start, true, -0.5);
+  const size_t resume_start = first_block(ratio, pause_end + 2, false, -0.5);
+  const size_t resume_end = first_block(ratio, resume_start, false, -49.5);
+  require(pause_end - pause_start >= 9 && pause_end - pause_start <= 11,
+          label + "pause fade did not last 100 ms");
+  require(resume_end - resume_start >= 19 && resume_end - resume_start <= 21,
+          label + "resume fade did not last 200 ms");
+  const int pause_lag = static_cast<int>(pause_start) - 100;
+  const int resume_lag = static_cast<int>(resume_start) - 200;
+  require(resume_lag - pause_lag == 4,
+          label + "resume did not bridge output_delay_hops before fading: " +
+              "pause lag " + std::to_string(pause_lag) + ", resume lag " +
+              std::to_string(resume_lag));
+  for (size_t block = pause_end; block < resume_start; ++block)
+    require(std::fabs(ratio[block]) < 0.5,
+            label + "paused audio is not the unsuppressed input");
+  for (size_t block = 90; block + 1 < ratio.size(); ++block) {
+    const double step = ratio[block + 1] - ratio[block];
+    require(std::fabs(step) < 6.0, label + "level stepped by " +
+                                       std::to_string(step) + " dB at block " +
+                                       std::to_string(block));
+    // Levels only rise until the resume fade begins, then only fall.
+    require(block + 1 < resume_start ? step > -0.5 : step < 0.5,
+            label + "fade reversed direction at block " +
+                std::to_string(block));
+  }
+}
+
+void test_overload_fade_envelope(const std::filesystem::path &fixtures) {
+  check_fade_envelope(
+      fade_trace(fixtures / "valid_delayed_silence.onnx", 1.0, 100, 200, 300),
+      "silence model");
+  // Enhanced output is the inverted input, so a 50% mix cancels to the limit.
+  // Fading anything but the whole mix would unmask the full level at once.
+  check_fade_envelope(
+      fade_trace(fixtures / "valid_delayed_negation.onnx", 0.5, 100, 200, 300),
+      "phase-inverting model at 50% mix");
+}
+
+// A retry can land before a pause has faded out, for example when callbacks
+// stall. The model is still running, so the fade must turn around without a
+// jump or a bridge.
+void test_overload_fade_interrupted(const std::filesystem::path &fixtures) {
+  for (const char *name :
+       {"valid_delayed_silence.onnx", "valid_delayed_negation.onnx"}) {
+    const double wet =
+        std::string(name).find("negation") != std::string::npos ? 0.5 : 1.0;
+    const auto ratio = fade_trace(fixtures / name, wet, 100, 105, 200);
+    double peak = -100.0;
+    for (size_t block = 90; block + 1 < ratio.size(); ++block) {
+      peak = std::max(peak, ratio[block]);
+      require(std::fabs(ratio[block + 1] - ratio[block]) < 6.0,
+              std::string(name) + ": interrupted fade stepped by " +
+                  std::to_string(ratio[block + 1] - ratio[block]) + " dB");
+    }
+    require(peak > -35.0 && peak < -15.0,
+            std::string(name) + ": interrupted fade did not turn around");
+    require(std::fabs(ratio.back() + 50.0) < 0.5,
+            std::string(name) +
+                ": interrupted fade did not return to the limit");
+  }
+}
+
+// Inference during a pause runs from the first packet after it.
+size_t inference_after(const FadeRun &run, size_t from) {
+  size_t total = 0;
+  for (size_t index = from; index < run.inference.size(); ++index)
+    total += run.inference[index];
+  return total;
+}
+
+// A pause fades out only enhanced audio that has been heard. Before the first
+// processed hop goes out there is none, whether startup output is still
+// discarded or the delay line has just filled, so the model stops at once.
+void test_overload_pause_during_startup(const std::filesystem::path &fixtures) {
+  std::mt19937 rng(11);
+  std::normal_distribution<float> noise(0.0f, 0.05f);
+  std::vector<float> input(100 * 480);
+  for (float &sample : input)
+    sample = noise(rng);
+  // The four-hop delay model's first processed hop goes out at packet 5.
+  for (uint64_t pause_at = 0; pause_at <= 6; ++pause_at) {
+    auto processor =
+        make_processor((fixtures / "valid_delayed_silence.onnx").string());
+    const auto run = run_fade(processor, input, pause_at, 1000);
+    const size_t expected = pause_at <= 5 ? 0 : 9;
+    require(inference_after(run, pause_at) == expected,
+            "pause before packet " + std::to_string(pause_at) +
+                " ran the model " +
+                std::to_string(inference_after(run, pause_at)) + " times");
+  }
+  // With nothing to fade, output is the delayed input once the first hop has
+  // faded in through overlap-add.
+  auto processor =
+      make_processor((fixtures / "valid_delayed_silence.onnx").string());
+  const auto run = run_fade(processor, input, 0, 1000);
+  for (size_t i = 2 * 480; i < run.output.size(); ++i)
+    require(nearly_equal(run.output[i], input[i], 1e-5f),
+            "pause during startup did not pass the input through");
+}
+
+// A pause runs the model only while its output can still be heard, then stops
+// it, and a resume from a full pause restarts it on every hop.
+void test_overload_fade_out_inference(const std::filesystem::path &fixtures) {
+  const std::vector<float> input(200 * 480, 0.01f);
+  struct Setting {
+    const char *name;
+    bool bypass;
+    double wet_mix;
+    double limit_db;
+    size_t fade_out_inferences;
+  };
+  for (const Setting &setting : {Setting{"heard", false, 1.0, 50.0, 9},
+                                 Setting{"Bypass", true, 1.0, 50.0, 0},
+                                 Setting{"0% mix", false, 0.0, 50.0, 0},
+                                 Setting{"0 dB limit", false, 1.0, 0.0, 0}}) {
+    auto processor =
+        make_processor((fixtures / "valid_delayed_silence.onnx").string());
+    DpdfnetControls controls;
+    controls.bypass = setting.bypass;
+    controls.wet_mix = setting.wet_mix;
+    controls.attenuation_limit_db = setting.limit_db;
+    processor.set_controls(controls);
+    const auto run = run_fade(processor, input, 100, 150);
+    size_t paused = 0;
+    for (size_t index = 100; index < 150; ++index)
+      paused += run.inference[index];
+    require(paused == setting.fade_out_inferences,
+            std::string(setting.name) + ": fade-out ran the model " +
+                std::to_string(paused) + " times");
+    for (size_t index = 150; index < 200; ++index)
+      require(run.inference[index] == 1,
+              std::string(setting.name) +
+                  ": resume did not run the model on every hop");
+  }
+}
+
+// A callback that fails still reports the inference it spent, whether it was
+// processing normally or fading out a pause.
+void test_failure_reports_inference(const std::filesystem::path &fixtures) {
+  const auto model =
+      (fixtures / "runtime_nonfinite_spectrum_output.onnx").string();
+  std::vector<float> silence(960, 0.0f);
+  std::vector<float> data(960, 0.1f);
+  for (bool paused : {false, true}) {
+    auto processor = make_processor(model);
+    DpdfnetAudioPacket packet;
+    packet.frames = static_cast<uint32_t>(data.size());
+    // The model stays finite on silence, so the stream reaches steady output.
+    for (uint64_t index = 0; index < 4; ++index) {
+      packet.data[0] = silence.data();
+      packet.timestamp = NS_PER_SECOND + index * 20'000'000;
+      require(processor.process(packet).event == DpdfnetEvent::None,
+              "silent warm-up failed");
+    }
+    if (paused)
+      require(processor.disable_for_realtime_overload("test overload"),
+              "overload pause did not open");
+    packet.data[0] = data.data();
+    packet.timestamp = NS_PER_SECOND + 4 * 20'000'000;
+    const auto result = processor.process(packet);
+    require(result.event == DpdfnetEvent::ProcessingFailure &&
+                result.inference_hops == 1,
+            std::string(paused ? "paused" : "normal") +
+                " failure did not report its inference");
+  }
+}
+
+std::vector<float> tone(size_t packets, float peak) {
+  std::vector<float> signal(packets * 480);
+  for (size_t i = 0; i < signal.size(); ++i)
+    signal[i] =
+        peak * static_cast<float>(std::sin(2.0 * kPi * 1000.0 * i / 48000.0));
+  return signal;
+}
+
+// A fade must not amplify: a quiet stretch right before a pause once made a
+// held output-to-input ratio push a tone far past full scale.
+void test_overload_fade_gain_bound(const std::string &model_path) {
+  auto processor = make_processor(model_path);
+  DpdfnetControls controls;
+  controls.attenuation_limit_db = 50.0;
+  processor.set_controls(controls);
+  auto input = tone(160, 0.1f);
+  for (size_t i = 94 * 480; i < 100 * 480; ++i)
+    input[i] *= 0.1f;
+  const auto output = run_fade(processor, input, 100, 1000).output;
+  float peak = 0.0f;
+  for (float sample : output)
+    peak = std::max(peak, std::fabs(sample));
+  require(peak < 0.15f,
+          "overload fade amplified audio to a peak of " + std::to_string(peak));
+}
+
+// Model output on silent input must fade like any other: it once stayed
+// silent until the last resume hop and then appeared at full level.
+void test_overload_fade_model_residual(const std::filesystem::path &fixtures) {
+  auto processor =
+      make_processor((fixtures / "valid_constant_tone.onnx").string());
+  DpdfnetControls controls;
+  controls.attenuation_limit_db = 50.0;
+  processor.set_controls(controls);
+  const std::vector<float> silence(300 * 480, 0.0f);
+  const auto output = run_fade(processor, silence, 100, 200).output;
+  std::vector<double> levels;
+  for (size_t block = 0; (block + 1) * 480 <= output.size(); ++block) {
+    double energy = 0.0;
+    for (size_t i = block * 480; i < (block + 1) * 480; ++i)
+      energy += static_cast<double>(output[i]) * output[i];
+    levels.push_back(10.0 * std::log10(energy / 480.0 + 1e-30));
+  }
+  const double steady = levels[80];
+  require(steady > -60.0, "constant-tone model produced no steady tone");
+  const size_t silent = first_block(levels, 90, false, -250.0);
+  const size_t audible = first_block(levels, silent, true, -250.0);
+  require(audible > 150 && audible <= 201,
+          "model output did not start fading in with the resume");
+  require(levels[audible] > steady - 20.0 && levels[audible + 3] > steady - 6.0,
+          "model output did not start fading in with the resume");
+  for (size_t block = audible; block + 1 < levels.size(); ++block) {
+    require(levels[block + 1] >= levels[block] - 0.1 &&
+                levels[block] < steady + 0.5,
+            "model output did not rise steadily to its level");
+  }
+  require(std::fabs(levels[audible + 20] - steady) < 0.5,
+          "model output did not reach its level in 200 ms");
+}
+
+// A fade must keep the waveform continuous even when the model inverts the
+// signal, where the heard transfer passes from -1 to +1.
+void test_overload_fade_waveform(const std::filesystem::path &fixtures) {
+  auto processor =
+      make_processor((fixtures / "valid_delayed_negation.onnx").string());
+  DpdfnetControls controls;
+  controls.attenuation_limit_db = 50.0;
+  processor.set_controls(controls);
+  const auto output = run_fade(processor, tone(300, 0.1f), 100, 200).output;
+  float steady_step = 0.0f;
+  for (size_t i = 60 * 480; i < 90 * 480; ++i)
+    steady_step = std::max(steady_step, std::fabs(output[i] - output[i - 1]));
+  for (size_t i = 90 * 480; i < output.size(); ++i)
+    require(std::fabs(output[i] - output[i - 1]) < 1.2f * steady_step,
+            "overload fade broke the waveform at sample " + std::to_string(i));
+}
+
 void test_overload_pause_skips_model(const std::filesystem::path &fixtures) {
   auto processor = make_processor(
       (fixtures / "runtime_nonfinite_spectrum_output.onnx").string());
   require(processor.disable_for_realtime_overload("test overload"),
           "overload pause did not open");
+  // The model stays finite on silence, which carries the pause's 100 ms
+  // fade-out. After it, input the model would reject must pass untouched.
+  std::vector<float> silence(960, 0.0f);
   std::vector<float> data(960, 0.1f);
   DpdfnetAudioPacket packet;
-  packet.data[0] = data.data();
   packet.frames = static_cast<uint32_t>(data.size());
-  size_t processed = 0;
-  for (uint64_t index = 0; index < 12; ++index) {
+  size_t checked = 0;
+  for (uint64_t index = 0; index < 18; ++index) {
+    packet.data[0] = index < 6 ? silence.data() : data.data();
     packet.timestamp = NS_PER_SECOND + index * 20'000'000;
     const auto result = processor.process(packet);
     require(result.disposition != DpdfnetDisposition::Passthrough &&
                 result.event == DpdfnetEvent::None,
-            "overload pause ran the model");
-    if (result.disposition == DpdfnetDisposition::Processed) {
-      ++processed;
-      // The first hop fades in through overlap-add; later hops carry the
-      // constant input unchanged.
-      if (processed > 1) {
-        for (uint32_t frame = 0; frame < result.frames; ++frame)
-          require(nearly_equal(result.data[0][frame], 0.1f, 1e-5f),
-                  "overload pause did not pass the delayed input through");
-      }
+            "overload pause ran the model after its fade-out");
+    // Output lags the input by a packet and a hop, and the switch from
+    // silence fades in through overlap-add.
+    if (index >= 9 && result.disposition == DpdfnetDisposition::Processed) {
+      ++checked;
+      for (uint32_t frame = 0; frame < result.frames; ++frame)
+        require(nearly_equal(result.data[0][frame], 0.1f, 1e-5f),
+                "overload pause did not pass the delayed input through");
     }
   }
-  require(processed > 6, "overload pause produced no delayed audio");
+  require(checked > 6, "overload pause produced no delayed audio");
   require(processor.resume_after_overload(), "overload pause did not close");
-  packet.timestamp = NS_PER_SECOND + 12 * 20'000'000;
+  packet.timestamp = NS_PER_SECOND + 18 * 20'000'000;
   require(processor.process(packet).event == DpdfnetEvent::ProcessingFailure,
           "resume did not run the model again");
 }
@@ -1360,6 +1742,33 @@ int main(int argc, char **argv) {
            passed;
   passed = run_test("overload pause continuity",
                     [&] { test_overload_pause_continuity(fixtures); }) &&
+           passed;
+  passed = run_test("overload pause fades",
+                    [&] { test_overload_pause_fades(low_cpu_model); }) &&
+           passed;
+  passed = run_test("overload fade envelope",
+                    [&] { test_overload_fade_envelope(fixtures); }) &&
+           passed;
+  passed = run_test("interrupted overload fade",
+                    [&] { test_overload_fade_interrupted(fixtures); }) &&
+           passed;
+  passed = run_test("overload pause during startup",
+                    [&] { test_overload_pause_during_startup(fixtures); }) &&
+           passed;
+  passed = run_test("failure reports inference",
+                    [&] { test_failure_reports_inference(fixtures); }) &&
+           passed;
+  passed = run_test("overload fade-out inference",
+                    [&] { test_overload_fade_out_inference(fixtures); }) &&
+           passed;
+  passed = run_test("overload fade gain bound",
+                    [&] { test_overload_fade_gain_bound(low_cpu_model); }) &&
+           passed;
+  passed = run_test("overload fade of model residual",
+                    [&] { test_overload_fade_model_residual(fixtures); }) &&
+           passed;
+  passed = run_test("overload fade waveform",
+                    [&] { test_overload_fade_waveform(fixtures); }) &&
            passed;
   passed = run_test("overload pause skips the model",
                     [&] { test_overload_pause_skips_model(fixtures); }) &&

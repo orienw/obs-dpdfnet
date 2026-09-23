@@ -299,6 +299,7 @@ if(DPDFNET_BUILD_TESTS)
   )
   add_test(NAME filter-integration COMMAND obs-dpdfnet-filter-tests
     "${CMAKE_CURRENT_SOURCE_DIR}/models/dpdfnet8_48khz_hr.onnx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/model-contract"
   )
   if(WIN32)
     # Use the runtime directory from the imported OBS target. This also makes

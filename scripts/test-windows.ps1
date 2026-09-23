@@ -215,7 +215,7 @@ Invoke-TestExecutable -Name "obs-dpdfnet-tests" -Arguments @(
     $QualityModel, $LowCpuModel, $Fixtures
 )
 Invoke-TestExecutable -Name "obs-dpdfnet-filter-tests" -Arguments @(
-    $QualityModel
+    $QualityModel, $Fixtures
 )
 
 @(

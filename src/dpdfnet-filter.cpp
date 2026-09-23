@@ -561,9 +561,10 @@ public:
     uint64_t realtime_budget_ns = 0;
     const bool active_processing_result =
         result.disposition != DpdfnetDisposition::Passthrough;
+    const bool guard_observed = timing_eligible && active_processing_result;
     uint64_t overload_retry_delay_ns = 0;
 
-    if (timing_eligible && active_processing_result) {
+    if (guard_observed) {
       const DpdfnetRealtimeObservation observation =
           realtime_guard_.observe(realtime_processing_ns, result.processed_hops,
                                   active.hop_size, active.model_rate);
@@ -587,6 +588,17 @@ public:
           result.event = DpdfnetEvent::RealtimeOverloadRecovered;
         }
       }
+    }
+
+    // Inference the guard did not observe, during a pause's fade-out or in a
+    // callback that failed, still counts toward timing and load.
+    const bool unobserved_inference =
+        !guard_observed && result.inference_hops > 0;
+    if (unobserved_inference) {
+      // A hop whose inference failed was attempted but not processed.
+      realtime_budget_ns = DpdfnetRealtimeBudgetGuard::audio_budget_ns(
+          std::max(result.processed_hops, result.inference_hops),
+          active.hop_size, active.model_rate);
     }
 
     struct obs_audio_data *output = audio;
@@ -619,7 +631,7 @@ public:
     const uint64_t deadline_ns =
         static_cast<uint64_t>(static_cast<double>(audio->frames) /
                               static_cast<double>(obs_rate) * 1e9);
-    if (timing_eligible && active_processing_result) {
+    if (guard_observed || unobserved_inference) {
       timings_.record(
           lock_acquired - lock_start, processing_finished - lock_acquired,
           processing_finished - callback_start, deadline_ns,

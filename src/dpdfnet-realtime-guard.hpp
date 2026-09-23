@@ -46,6 +46,26 @@ public:
                 observed_audio_ns_ >= min_observed_ns};
   }
 
+  // Duration of processed_hops model hops, saturating.
+  static uint64_t audio_budget_ns(size_t processed_hops, int hop_size,
+                                  int model_rate) noexcept {
+    if (!processed_hops || hop_size <= 0 || model_rate <= 0)
+      return 0;
+
+    const uint64_t max = std::numeric_limits<uint64_t>::max();
+    const uint64_t hops = static_cast<uint64_t>(processed_hops);
+    const uint64_t hop = static_cast<uint64_t>(hop_size);
+    const uint64_t rate = static_cast<uint64_t>(model_rate);
+    const uint64_t frames = hops > max / hop ? max : hops * hop;
+    const uint64_t seconds = frames / rate;
+    const uint64_t remainder = frames % rate;
+    if (seconds > max / NS_PER_SECOND)
+      return max;
+    const uint64_t whole_ns = seconds * NS_PER_SECOND;
+    const uint64_t partial_ns = remainder * NS_PER_SECOND / rate;
+    return saturating_add(whole_ns, partial_ns);
+  }
+
   void reset() noexcept {
     debt_ns_ = 0;
     observed_audio_ns_ = 0;
@@ -70,25 +90,6 @@ private:
   static uint64_t saturating_add(uint64_t left, uint64_t right) noexcept {
     const uint64_t max = std::numeric_limits<uint64_t>::max();
     return right > max - left ? max : left + right;
-  }
-
-  static uint64_t audio_budget_ns(size_t processed_hops, int hop_size,
-                                  int model_rate) noexcept {
-    if (!processed_hops || hop_size <= 0 || model_rate <= 0)
-      return 0;
-
-    const uint64_t max = std::numeric_limits<uint64_t>::max();
-    const uint64_t hops = static_cast<uint64_t>(processed_hops);
-    const uint64_t hop = static_cast<uint64_t>(hop_size);
-    const uint64_t rate = static_cast<uint64_t>(model_rate);
-    const uint64_t frames = hops > max / hop ? max : hops * hop;
-    const uint64_t seconds = frames / rate;
-    const uint64_t remainder = frames % rate;
-    if (seconds > max / NS_PER_SECOND)
-      return max;
-    const uint64_t whole_ns = seconds * NS_PER_SECOND;
-    const uint64_t partial_ns = remainder * NS_PER_SECOND / rate;
-    return saturating_add(whole_ns, partial_ns);
   }
 
   uint64_t debt_ns_ = 0;

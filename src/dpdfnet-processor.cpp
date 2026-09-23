@@ -21,6 +21,12 @@ constexpr uint32_t MAX_SUPPORTED_SAMPLE_RATE = 384000;
 constexpr size_t MAX_SUPPORTED_NFFT = 8192;
 constexpr size_t MAX_RESAMPLER_PREFILL_FRAMES = 8192;
 constexpr size_t RESAMPLE_BOUND_SLACK = 256;
+// Around an overload pause, suppression fades out over the first time and
+// back in over the second, so the noise floor never jumps by the full limit in
+// one hop. The fade-out runs the model while the CPU is overloaded, so it is
+// the shorter one.
+constexpr double PAUSE_FADE_OUT_SECONDS = 0.1;
+constexpr double RESUME_FADE_IN_SECONDS = 0.2;
 
 #if defined(_M_X64) || defined(__x86_64__)
 constexpr unsigned int MXCSR_FLUSH_ZERO = 0x8000;
@@ -245,8 +251,8 @@ DpdfnetModelBundle prepare_dpdfnet_model(const std::string &path) {
                                0.0f);
   bundle.realtime.enhanced_hop.assign(
       static_cast<size_t>(bundle.model->hop_size()), 0.0f);
-  bundle.realtime.noisy_history.resize(
-      bundle.model->output_delay_hops() * bundle.model->spectrum_size());
+  bundle.realtime.noisy_history.resize(bundle.model->output_delay_hops() *
+                                       bundle.model->spectrum_size());
   return bundle;
 }
 
@@ -378,6 +384,16 @@ DpdfnetModelBundle DpdfnetProcessor::replace_model(DpdfnetModelBundle bundle) {
   noisy_history_offset_ = 0;
   warmup_hops_ = model_ ? model_->output_delay_hops() : 0;
   bridge_hops_ = 0;
+  const auto fade_hops = [this](double seconds) {
+    return model_ ? std::max(1, static_cast<int>(std::lround(
+                                    seconds * model_->sample_rate() /
+                                    model_->hop_size())))
+                  : 1;
+  };
+  fade_in_hops_ = fade_hops(RESUME_FADE_IN_SECONDS);
+  fade_out_hops_ = fade_hops(PAUSE_FADE_OUT_SECONDS);
+  depth_steps_ = fade_in_hops_ * fade_out_hops_;
+  emitted_since_reset_ = false;
   return old;
 }
 
@@ -468,6 +484,7 @@ void DpdfnetProcessor::reset_audio_state(bool reset_model) {
   for (auto &buffer : realtime_.dry_buffers)
     buffer.clear();
   realtime_.info_queue.clear();
+  emitted_since_reset_ = false;
   output_packet_offset_ = 0;
   last_timestamp_ = 0;
   expected_timestamp_ = 0;
@@ -486,6 +503,9 @@ void DpdfnetProcessor::reset_audio_state(bool reset_model) {
     noisy_history_offset_ = 0;
     warmup_hops_ = model_ ? model_->output_delay_hops() : 0;
     bridge_hops_ = 0;
+    depth_steps_ = disable_reason_ == DpdfnetDisableReason::RealtimeOverload
+                       ? 0
+                       : fade_in_hops_ * fade_out_hops_;
   }
 }
 
@@ -618,38 +638,63 @@ bool DpdfnetProcessor::push_input(const DpdfnetAudioPacket &audio) {
   return true;
 }
 
-size_t DpdfnetProcessor::process_available_hops() {
+void DpdfnetProcessor::process_available_hops(size_t &processed_hops,
+                                              size_t &inference_hops) {
   const size_t hop_size = static_cast<size_t>(model_->hop_size());
   const size_t window_size = static_cast<size_t>(model_->n_fft());
   const size_t spec_n = model_->spectrum_size();
   float *noisy_spec = model_->input_spectrum();
   float *enhanced_spec = model_->output_spectrum();
-  const float alpha = attenuation_alpha_;
-  const float beta = 1.0f - alpha;
-  // An overload pause skips the model but keeps the STFT lanes running, so
-  // the delayed noisy spectrum fills the enhanced output slots. The latency
-  // and timeline stay the same, and overlap-add crossfades each transition.
-  const bool run_model = disable_reason_ == DpdfnetDisableReason::None;
-  size_t processed_hops = 0;
+  const int full_depth = fade_in_hops_ * fade_out_hops_;
+  const bool paused = disable_reason_ != DpdfnetDisableReason::None;
+  // An overload pause keeps the STFT lanes running, so latency and timeline
+  // stay the same, and fades suppression out on the model before stopping it.
+  // Each hop moves the depth one step toward none while paused and toward
+  // full while the model produces output, so a retry that lands mid-fade
+  // turns it around. Every step is a setting of the suppression limit, which
+  // moves evenly in dB. A pause stops the model at once when no enhanced audio
+  // can be heard: nothing has gone out since the last reset, or Bypass, a 0%
+  // mix, or a 0 dB limit hides the model.
+  const bool enhancement_heard =
+      !controls_.bypass && controls_.wet_mix > 0.0 && attenuation_alpha_ < 1.0f;
 
   while (realtime_.input_mono.size() >= window_size) {
     realtime_.input_mono.peek(realtime_.frame.data(), window_size);
     stft_->analysis(realtime_.frame, noisy_spec);
-    if (run_model)
+    // A paused hop steps the depth down first, so the model runs only while
+    // its output still counts.
+    if (paused) {
+      depth_steps_ = emitted_since_reset_ && enhancement_heard
+                         ? std::max(0, depth_steps_ - fade_in_hops_)
+                         : 0;
+    }
+    const bool run_model = !paused || depth_steps_ > 0;
+    if (run_model) {
+      ++inference_hops;
       model_->enhance();
-    const bool model_output = run_model && !bridge_hops_;
+    }
     float *delayed_spec = realtime_.noisy_history.empty()
                               ? noisy_spec
                               : realtime_.noisy_history.data() +
                                     noisy_history_offset_;
-    for (size_t i = 0; i < spec_n; ++i) {
-      if (!warmup_hops_) {
-        enhanced_spec[i] =
-            model_output ? alpha * delayed_spec[i] + beta * enhanced_spec[i]
-                         : delayed_spec[i];
-      }
-      delayed_spec[i] = noisy_spec[i];
+    const bool model_output = run_model && !bridge_hops_;
+    if (!paused && !warmup_hops_ && model_output)
+      depth_steps_ = std::min(full_depth, depth_steps_ + fade_out_hops_);
+    if (warmup_hops_) {
+      // Startup output is discarded.
+    } else if (model_output) {
+      float alpha = attenuation_alpha_;
+      if (depth_steps_ < full_depth)
+        alpha = std::pow(alpha, static_cast<float>(depth_steps_) /
+                                    static_cast<float>(full_depth));
+      const float beta = 1.0f - alpha;
+      for (size_t i = 0; i < spec_n; ++i)
+        enhanced_spec[i] = alpha * delayed_spec[i] + beta * enhanced_spec[i];
+    } else {
+      std::copy(delayed_spec, delayed_spec + spec_n, enhanced_spec);
     }
+    if (delayed_spec != noisy_spec)
+      std::copy(noisy_spec, noisy_spec + spec_n, delayed_spec);
     if (!realtime_.noisy_history.empty())
       noisy_history_offset_ =
           (noisy_history_offset_ + spec_n) % realtime_.noisy_history.size();
@@ -684,8 +729,8 @@ size_t DpdfnetProcessor::process_available_hops() {
     }
     realtime_.input_mono.pop(hop_size);
     ++processed_hops;
+    emitted_since_reset_ = true;
   }
-  return processed_hops;
 }
 
 DpdfnetProcessResult
@@ -868,9 +913,11 @@ bool DpdfnetProcessor::resume_after_overload() {
   consecutive_failures_ = 0;
   process_error_reported_ = false;
   last_error_.fill(0);
-  // The restarted model has not seen the audio already in its delay line, so
-  // its first output_delay_hops outputs are replaced with the noisy spectrum.
-  if (model_) {
+  // The model kept running through an unfinished fade-out, so it continues in
+  // place. Otherwise it restarts without the audio already in its delay line,
+  // and its first output_delay_hops outputs are replaced with the noisy
+  // spectrum.
+  if (model_ && depth_steps_ == 0) {
     model_->reset();
     bridge_hops_ = model_->output_delay_hops();
   }
@@ -935,17 +982,24 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
   capacity_recovery_pending_ = false;
 
   size_t processed_hops = 0;
+  size_t inference_hops = 0;
   try {
-    processed_hops = process_available_hops();
+    process_available_hops(processed_hops, inference_hops);
     if (processed_hops) {
       consecutive_failures_ = 0;
       process_error_reported_ = false;
     }
   } catch (const std::exception &ex) {
-    return failure_result(ex.what());
+    // The work done before the failure still took time on the audio thread.
+    DpdfnetProcessResult failure = failure_result(ex.what());
+    failure.processed_hops = processed_hops;
+    failure.inference_hops = inference_hops;
+    return failure;
   }
 
-  return pop_output_packet(processed_hops);
+  DpdfnetProcessResult output = pop_output_packet(processed_hops);
+  output.inference_hops = inference_hops;
+  return output;
 }
 
 DpdfnetProcessorState DpdfnetProcessor::state() const {

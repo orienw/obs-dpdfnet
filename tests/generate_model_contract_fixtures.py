@@ -31,6 +31,9 @@ BASE_METADATA = {
 CASES = (
     Case("valid_identity", {}),
     Case("valid_delayed_identity", {"delay_hops": 4}),
+    Case("valid_delayed_silence", {"delay_hops": 4, "output_scale": 0.0}),
+    Case("valid_delayed_negation", {"delay_hops": 4, "output_scale": -1.0}),
+    Case("valid_constant_tone", {"output_tone": True}),
     Case("missing_output_delay", {"omit_delay": True}),
     Case("negative_output_delay", {"metadata": {"output_delay_hops": "-1"}}),
     Case("excessive_output_delay", {"metadata": {"output_delay_hops": "17"}}),
@@ -143,6 +146,7 @@ def make_fixture(path: Path, **options) -> None:
         if delay_hops else options.get("state_shape", (1,))
     )
     element_type = options.get("element_type", TensorProto.FLOAT)
+    output_scale = options.get("output_scale")
     input_count = options.get("input_count", 2)
     output_count = options.get("output_count", 2)
 
@@ -178,11 +182,21 @@ def make_fixture(path: Path, **options) -> None:
             nodes.append(helper.make_node("Constant", [], [name], value=tensor))
         nodes.extend([
             helper.make_node("Slice", [state_in, "first", "next"], ["oldest"]),
-            helper.make_node("Reshape", ["oldest", "spec_shape"], [spec_out]),
+            helper.make_node(
+                "Reshape",
+                ["oldest", "spec_shape"],
+                [spec_out if output_scale is None else "unscaled"],
+            ),
             helper.make_node("Slice", [state_in, "next", "last"], ["history"]),
             helper.make_node("Reshape", [spec_in, "flat_shape"], ["current"]),
             helper.make_node("Concat", ["history", "current"], [state_out], axis=0),
         ])
+        if output_scale is not None:
+            scale = helper.make_tensor("scale", element_type, [], [output_scale])
+            nodes.extend([
+                helper.make_node("Constant", [], ["scale"], value=scale),
+                helper.make_node("Mul", ["unscaled", "scale"], [spec_out]),
+            ])
     elif options.get("nonfinite_spectrum"):
         nodes = [
             constant_node(
@@ -207,6 +221,12 @@ def make_fixture(path: Path, **options) -> None:
                 [spec_out],
             ),
         ]
+    elif options.get("output_tone"):
+        # A 1 kHz bin at a fixed level, whatever the input.
+        values = [0.0] * spectrum_size
+        values[2 * 20] = 10.0
+        tone = helper.make_tensor("tone", element_type, list(spec_shape), values)
+        nodes = [helper.make_node("Constant", [], [spec_out], value=tone)]
     else:
         nodes = [helper.make_node("Identity", [spec_in], [spec_out])]
 

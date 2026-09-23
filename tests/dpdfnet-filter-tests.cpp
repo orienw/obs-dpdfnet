@@ -12,7 +12,9 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -198,6 +200,8 @@ public:
   CallbackScope &operator=(const CallbackScope &) = delete;
 };
 
+// Counts logs written on the audio callback. Install it before obs_startup,
+// like LogCapture.
 class CallbackLogProbe {
 public:
   CallbackLogProbe() {
@@ -232,6 +236,63 @@ private:
   log_handler_t previous_handler_ = nullptr;
   void *previous_parameter_ = nullptr;
   std::atomic<uint64_t> synchronous_logs_{0};
+};
+
+// Collects every log line, including ones libobs writes from other threads.
+// Install it before obs_startup: libobs publishes the handler through plain
+// globals, so only threads started afterwards are ordered after it.
+class LogCapture {
+public:
+  LogCapture() {
+    base_get_log_handler(&previous_handler_, &previous_parameter_);
+    base_set_log_handler(handle_log, this);
+  }
+
+  ~LogCapture() {
+    base_set_log_handler(previous_handler_, previous_parameter_);
+  }
+
+  LogCapture(const LogCapture &) = delete;
+  LogCapture &operator=(const LogCapture &) = delete;
+
+  size_t size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return lines_.size();
+  }
+
+  // Whether a line logged at or after index `from` contains `text`.
+  bool contains(const std::string &text, size_t from) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::any_of(lines_.begin() + static_cast<std::ptrdiff_t>(
+                                            std::min(from, lines_.size())),
+                       lines_.end(), [&](const std::string &line) {
+                         return line.find(text) != std::string::npos;
+                       });
+  }
+
+private:
+  static void handle_log(int level, const char *message, va_list arguments,
+                         void *parameter) {
+    auto *capture = static_cast<LogCapture *>(parameter);
+    char line[1024];
+    va_list copy;
+    va_copy(copy, arguments);
+    std::vsnprintf(line, sizeof(line), message, copy);
+    va_end(copy);
+    {
+      std::lock_guard<std::mutex> lock(capture->mutex_);
+      capture->lines_.emplace_back(line);
+    }
+    if (capture->previous_handler_) {
+      capture->previous_handler_(level, message, arguments,
+                                 capture->previous_parameter_);
+    }
+  }
+
+  log_handler_t previous_handler_ = nullptr;
+  void *previous_parameter_ = nullptr;
+  mutable std::mutex mutex_;
+  std::vector<std::string> lines_;
 };
 
 class ObsData {
@@ -587,12 +648,12 @@ void test_empty_custom_model_error() {
   require_cached_error();
 }
 
-void test_direct_callbacks(const std::string &model_path) {
+void test_direct_callbacks(const std::string &model_path,
+                           const CallbackLogProbe &log_probe) {
   ObsData settings;
   configure_custom_model(settings, model_path);
   ObsSource source(obs_source_create_private(TEST_SOURCE_ID,
                                              "direct filter owner", settings));
-  CallbackLogProbe log_probe;
   DirectFilter filter(settings, source);
 
   {
@@ -808,6 +869,37 @@ void test_direct_callbacks(const std::string &model_path) {
   dpdfnet_filter_info.update(filter.get(), settings);
 }
 
+// A callback whose first inference fails processes no hop, but the time it
+// spent still counts toward processing load.
+void test_failed_inference_counts_toward_load(
+    const std::filesystem::path &fixtures, const LogCapture &logs) {
+  const size_t first_line = logs.size();
+  {
+    ObsData settings;
+    configure_custom_model(
+        settings,
+        (fixtures / "runtime_nonfinite_spectrum_output.onnx").string());
+    ObsSource source(obs_source_create_private(
+        TEST_SOURCE_ID, "failed inference owner", settings));
+    DirectFilter filter(settings, source);
+    PacketStorage storage;
+    for (uint64_t packet = 0; packet < 2; ++packet) {
+      struct obs_audio_data input =
+          storage.direct_packet(1000000000ULL + packet * PACKET_DURATION_NS);
+      (void)dpdfnet_filter_info.filter_audio(filter.get(), &input);
+    }
+    ObsProperties properties(dpdfnet_filter_info.get_properties(filter.get()));
+    const char *summary = obs_property_description(
+        obs_properties_get(properties, "status_summary"));
+    require(summary && std::string(summary).find("processing error") !=
+                           std::string::npos,
+            "runtime-failure model did not fail its first inference");
+  }
+  // The filter logs its load epoch when it is destroyed.
+  require(logs.contains("active-processing load epoch", first_line),
+          "failed inference was left out of processing load");
+}
+
 struct CaptureState {
   std::atomic<uint64_t> callbacks{0};
 };
@@ -921,11 +1013,18 @@ void test_obs_lifecycle(const std::string &model_path) {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    std::cerr << "usage: dpdfnet-filter-tests <model.onnx>\n";
+  if (argc != 3) {
+    std::cerr << "usage: dpdfnet-filter-tests <model.onnx> "
+                 "<fixture-directory>\n";
     return 2;
   }
 
+  // libobs sets the log handler and its parameter as two separate plain
+  // writes, so a handler installed while libobs threads run can be called
+  // with another handler's parameter. Install both before obs_startup starts
+  // any thread, and keep them until after obs_shutdown.
+  LogCapture logs;
+  CallbackLogProbe log_probe;
   bool started = false;
   try {
 #if DPDFNET_COUNT_ALLOCATIONS
@@ -959,8 +1058,9 @@ int main(int argc, char **argv) {
     obs_register_source(&dpdfnet_filter_info);
 
     test_empty_custom_model_error();
-    test_direct_callbacks(model.string());
+    test_direct_callbacks(model.string(), log_probe);
     test_obs_lifecycle(model.string());
+    test_failed_inference_counts_toward_load(argv[2], logs);
 
     obs_shutdown();
     std::cout << "[PASS] filter callback and OBS lifecycle integration\n";
