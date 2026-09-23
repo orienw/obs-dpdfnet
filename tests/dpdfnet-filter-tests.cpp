@@ -27,10 +27,25 @@
 #include <malloc.h>
 #endif
 
+// AddressSanitizer brings its own allocator, and mixing it with the
+// replacement operators below reports false mismatches. Sanitizer builds
+// skip allocation counting and check everything else.
+#if defined(__SANITIZE_ADDRESS__)
+#define DPDFNET_COUNT_ALLOCATIONS 0
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define DPDFNET_COUNT_ALLOCATIONS 0
+#endif
+#endif
+#ifndef DPDFNET_COUNT_ALLOCATIONS
+#define DPDFNET_COUNT_ALLOCATIONS 1
+#endif
+
 namespace filter_test_instrumentation {
 thread_local bool callback_scope = false;
 std::atomic<uint64_t> callback_allocations{0};
 
+#if DPDFNET_COUNT_ALLOCATIONS
 void record_allocation() {
   if (callback_scope)
     callback_allocations.fetch_add(1, std::memory_order_relaxed);
@@ -63,8 +78,10 @@ void free_aligned(void *memory) noexcept {
   std::free(memory);
 #endif
 }
+#endif
 } // namespace filter_test_instrumentation
 
+#if DPDFNET_COUNT_ALLOCATIONS
 void *operator new(size_t size) {
   return filter_test_instrumentation::allocate(size);
 }
@@ -147,6 +164,7 @@ void operator delete[](void *memory, std::align_val_t,
                        const std::nothrow_t &) noexcept {
   filter_test_instrumentation::free_aligned(memory);
 }
+#endif
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-dpdfnet", "en-US")
@@ -910,6 +928,7 @@ int main(int argc, char **argv) {
 
   bool started = false;
   try {
+#if DPDFNET_COUNT_ALLOCATIONS
     const auto before =
         filter_test_instrumentation::callback_allocations.load();
     {
@@ -920,6 +939,9 @@ int main(int argc, char **argv) {
     require(filter_test_instrumentation::callback_allocations.load() ==
                 before + 1,
             "callback allocation instrumentation is inactive");
+#else
+    std::cout << "[SKIP] allocation counting under AddressSanitizer\n";
+#endif
     const std::filesystem::path model =
         std::filesystem::absolute(argv[1]).lexically_normal();
     require(std::filesystem::is_regular_file(model),
