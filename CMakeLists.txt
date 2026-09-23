@@ -32,6 +32,48 @@ find_package(libobs CONFIG REQUIRED)
 find_package(ONNXRuntime REQUIRED)
 find_package(Threads REQUIRED)
 
+# The plugin links and ships these. On Linux the bundled ONNX Runtime gets a
+# private soname: the dynamic loader shares libraries by soname across all
+# plugins, so another ONNX-based plugin's libonnxruntime.so.1 would otherwise
+# replace ours, or ours theirs, whichever loads first.
+set(DPDFNET_ONNXRUNTIME_TARGET ONNXRuntime::ONNXRuntime)
+set(DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES ${ONNXRUNTIME_RUNTIME_DEPENDENCIES})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
+  find_program(DPDFNET_PATCHELF patchelf)
+  if(DPDFNET_PATCHELF)
+    set(private_onnxruntime_name "libonnxruntime_dpdfnet.so")
+    set(private_onnxruntime
+      "${CMAKE_BINARY_DIR}/onnxruntime-private/${private_onnxruntime_name}")
+    file(REAL_PATH "${ONNXRUNTIME_LIBRARY}" stock_onnxruntime)
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/onnxruntime-private")
+    file(COPY_FILE "${stock_onnxruntime}" "${private_onnxruntime}")
+    execute_process(
+      COMMAND "${DPDFNET_PATCHELF}" --set-soname "${private_onnxruntime_name}"
+        "${private_onnxruntime}"
+      RESULT_VARIABLE patchelf_result
+    )
+    if(NOT patchelf_result EQUAL 0)
+      message(FATAL_ERROR "patchelf could not rename ${private_onnxruntime}")
+    endif()
+    add_library(ONNXRuntime::Private SHARED IMPORTED)
+    set_target_properties(ONNXRuntime::Private PROPERTIES
+      IMPORTED_LOCATION "${private_onnxruntime}"
+      IMPORTED_SONAME "${private_onnxruntime_name}"
+      INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}"
+    )
+    set(DPDFNET_ONNXRUNTIME_TARGET ONNXRuntime::Private)
+    set(DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES "${private_onnxruntime}")
+    if(ONNXRUNTIME_PROVIDERS_SHARED_LIBRARY)
+      list(APPEND DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES
+        "${ONNXRUNTIME_PROVIDERS_SHARED_LIBRARY}")
+    endif()
+  else()
+    message(WARNING "patchelf was not found, so the bundled ONNX Runtime keeps "
+      "its stock soname and can clash with another ONNX-based OBS plugin. "
+      "Install patchelf and reconfigure to give it a private name.")
+  endif()
+endif()
+
 if(DPDFNET_FETCH_KISSFFT)
   include(FetchContent)
   set(KISSFFT_DATATYPE "float" CACHE STRING "" FORCE)
@@ -52,12 +94,17 @@ else()
   set(DPDFNET_KISSFFT_TARGET kissfft::kissfft)
 endif()
 
+# Copies ONNX Runtime next to a target, or the given libraries instead.
 function(dpdfnet_copy_runtime_dependencies target)
   if(NOT DPDFNET_COPY_RUNTIME_DEPENDENCIES)
     return()
   endif()
 
-  foreach(runtime_dependency IN LISTS ONNXRUNTIME_RUNTIME_DEPENDENCIES)
+  set(runtime_dependencies ${ARGN})
+  if(NOT runtime_dependencies)
+    set(runtime_dependencies ${ONNXRUNTIME_RUNTIME_DEPENDENCIES})
+  endif()
+  foreach(runtime_dependency IN LISTS runtime_dependencies)
     add_custom_command(TARGET ${target} POST_BUILD
       COMMAND "${CMAKE_COMMAND}"
         "-DSOURCE=${runtime_dependency}"
@@ -85,12 +132,13 @@ target_compile_definitions(obs-dpdfnet PRIVATE
 
 target_link_libraries(obs-dpdfnet PRIVATE
   OBS::libobs
-  ONNXRuntime::ONNXRuntime
+  ${DPDFNET_ONNXRUNTIME_TARGET}
   Threads::Threads
   ${DPDFNET_KISSFFT_TARGET}
 )
 
-dpdfnet_copy_runtime_dependencies(obs-dpdfnet)
+dpdfnet_copy_runtime_dependencies(obs-dpdfnet
+  ${DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES})
 
 if(DPDFNET_BUILD_MODEL_SMOKE)
   add_executable(dpdfnet-model-smoke
@@ -282,10 +330,27 @@ else()
   endforeach()
 endif()
 
+# Export only the OBS entry points, which obs-module.h marks explicitly. GCC
+# gives inline statics such as the ONNX Runtime C++ wrapper's cached API table
+# STB_GNU_UNIQUE binding, and the loader shares those across plugins even under
+# RTLD_LOCAL, so another ONNX-based plugin could hand us its runtime.
 set_target_properties(obs-dpdfnet PROPERTIES
   PREFIX ""
   OUTPUT_NAME "obs-dpdfnet"
+  C_VISIBILITY_PRESET hidden
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
 )
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Static libraries such as KissFFT and standard-library template
+  # instantiations stay private too.
+  target_link_options(obs-dpdfnet PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/exports.ld"
+  )
+  set_property(TARGET obs-dpdfnet APPEND PROPERTY LINK_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/exports.ld"
+  )
+endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
   set_property(TARGET obs-dpdfnet APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
@@ -315,17 +380,18 @@ install(DIRECTORY LICENSES
   DESTINATION "${DPDFNET_DATA_DESTINATION}"
 )
 
-# Ships ONNX Runtime under its stock name. Unlike the PowerShell release path,
-# this does not rename onnxruntime.dll, so a CMake-installed plugin can collide
-# with another ONNX-based OBS plugin's onnxruntime.dll in the shared
-# obs-plugins/64bit directory. Fine for isolated dev builds, not for shipping.
+# On Windows and macOS this ships ONNX Runtime under its stock name. Unlike the
+# PowerShell release path, it does not rename onnxruntime.dll, so a
+# CMake-installed plugin can collide with another ONNX-based OBS plugin's
+# onnxruntime.dll in the shared obs-plugins/64bit directory. Fine for isolated
+# dev builds, not for shipping. Linux installs the private copy made above.
 if(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
   if(IS_ABSOLUTE "${DPDFNET_PLUGIN_DESTINATION}")
     set(runtime_destination "${DPDFNET_PLUGIN_DESTINATION}")
   else()
     set(runtime_destination "\${CMAKE_INSTALL_PREFIX}/${DPDFNET_PLUGIN_DESTINATION}")
   endif()
-  foreach(runtime_dependency IN LISTS ONNXRUNTIME_RUNTIME_DEPENDENCIES)
+  foreach(runtime_dependency IN LISTS DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES)
     install(CODE "file(INSTALL \"${runtime_dependency}\"
       DESTINATION \"${runtime_destination}\" FOLLOW_SYMLINK_CHAIN)")
   endforeach()

@@ -137,7 +137,9 @@ The install layout defaults to `obs-plugins/64bit` and
 `DPDFNET_DATA_DESTINATION` for other packages. ONNX Runtime shared libraries
 are copied next to built targets and installed with the plugin unless
 `DPDFNET_COPY_RUNTIME_DEPENDENCIES` or `DPDFNET_INSTALL_RUNTIME_DEPENDENCIES`
-is off.
+is off. On Linux, install `patchelf` before configuring: the build uses it to
+install ONNX Runtime as `libonnxruntime_dpdfnet.so`, so it cannot clash with
+another OBS plugin's copy.
 
 `DPDFNET_BUILD_TESTS` registers the processor, model contract, and libobs
 filter lifecycle tests with CTest. `DPDFNET_BUILD_MODEL_SMOKE`,
