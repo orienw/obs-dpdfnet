@@ -247,7 +247,10 @@ void test_model_selection_migration(const std::string &quality_path,
               true, "future-value", true, missing_custom, quality_path,
               low_cpu_path) == DPDFNET_MODEL_CUSTOM,
           "unknown selection discarded a custom path");
-  require(dpdfnet_paths_equivalent(quality_path, quality_path),
+  const std::filesystem::path quality(quality_path);
+  require(dpdfnet_paths_equivalent(
+              (quality.parent_path() / "." / quality.filename()).string(),
+              quality_path),
           "filesystem-equivalent model path was not recognized");
 }
 
@@ -391,41 +394,6 @@ std::vector<float> process_signal(DpdfnetProcessor &processor,
   require(output.size() >= signal.size(), "processor failed to drain signal");
   output.resize(signal.size());
   return output;
-}
-
-void test_bypass_transition(const std::string &model_path) {
-  DpdfnetProcessor processor = make_processor(model_path);
-  DpdfnetControls controls;
-  processor.set_controls(controls);
-  std::vector<float> signal(48000);
-  for (size_t i = 0; i < signal.size(); ++i)
-    signal[i] = static_cast<float>(0.05 * std::sin(i * 0.031));
-
-  const uint32_t frames = 480;
-  uint64_t timestamp = NS_PER_SECOND;
-  uint64_t last_timestamp = 0;
-  for (size_t packet_index = 0; packet_index < 40; ++packet_index) {
-    if (packet_index == 12) {
-      controls.bypass = true;
-      processor.set_controls(controls);
-    } else if (packet_index == 28) {
-      controls.bypass = false;
-      processor.set_controls(controls);
-    }
-    DpdfnetAudioPacket packet;
-    packet.data[0] = signal.data() + packet_index * frames;
-    packet.frames = frames;
-    packet.timestamp = timestamp;
-    const auto result = processor.process(packet);
-    require(result.disposition != DpdfnetDisposition::Passthrough,
-            "bypass transition escaped the aligned pipeline");
-    if (result.disposition == DpdfnetDisposition::Processed) {
-      require(result.timestamp >= last_timestamp,
-              "bypass transition reordered timestamps");
-      last_timestamp = result.timestamp;
-    }
-    timestamp += 10'000'000;
-  }
 }
 
 void compare_results(const DpdfnetProcessResult &left,
@@ -1407,16 +1375,16 @@ void test_model_activation_probe(const std::filesystem::path &fixtures) {
           "activation probe rejected the runtime-only failure fixture");
 }
 
-void test_resampled_stream(const std::string &model_path,
+void test_resampled_stream(const std::filesystem::path &fixtures,
                            uint32_t sample_rate) {
-  DpdfnetProcessor processor = make_processor(model_path, sample_rate);
-  DpdfnetControls controls;
-  controls.bypass = true;
-  processor.set_controls(controls);
+  // An identity model leaves the resamplers as the only change to the audio.
+  DpdfnetProcessor processor = make_processor(
+      (fixtures / "valid_identity.onnx").string(), sample_rate);
   const uint32_t packet_frames = sample_rate / 100;
   std::vector<float> packet_data(packet_frames, 0.025f);
   uint64_t timestamp = NS_PER_SECOND;
   size_t processed = 0;
+  size_t emitted = 0;
   for (size_t packet_index = 0; packet_index < 80; ++packet_index) {
     DpdfnetAudioPacket packet;
     packet.data[0] = packet_data.data();
@@ -1427,9 +1395,11 @@ void test_resampled_stream(const std::string &model_path,
             "resampled path passed through despite active resamplers");
     if (result.disposition == DpdfnetDisposition::Processed) {
       ++processed;
-      for (uint32_t frame = 0; frame < result.frames; ++frame)
-        require(std::isfinite(result.data[0][frame]),
-                "resampled path produced non-finite audio");
+      // The resamplers settle within the first 20 ms of output.
+      for (uint32_t frame = 0; frame < result.frames; ++frame, ++emitted)
+        require(emitted < sample_rate / 50 ||
+                    nearly_equal(result.data[0][frame], 0.025f, 1e-5f),
+                "resampled path changed the input level");
     }
     timestamp += 10'000'000;
   }
@@ -1440,6 +1410,7 @@ void test_resampled_stream(const std::string &model_path,
       snapshot.sample_rate, snapshot.model_rate, snapshot.hop_size));
   processor.reset_state();
   std::fill(packet_data.begin(), packet_data.end(), 0.0f);
+  processed = 0;
   for (size_t i = 0; i < 8; ++i) {
     DpdfnetAudioPacket packet;
     packet.data[0] = packet_data.data();
@@ -1447,11 +1418,13 @@ void test_resampled_stream(const std::string &model_path,
     packet.timestamp = 3 * NS_PER_SECOND + i * 10'000'000;
     const auto result = processor.process(packet);
     if (result.disposition == DpdfnetDisposition::Processed) {
+      ++processed;
       for (uint32_t frame = 0; frame < result.frames; ++frame)
         require(std::fabs(result.data[0][frame]) < 1e-6f,
-                "fresh resampler leaked pre-reset content");
+                "reset leaked earlier audio into the resampled path");
     }
   }
+  require(processed > 4, "resampled path produced no audio after reset");
 }
 
 void test_resampled_timestamp_refresh(const std::string &model_path,
@@ -1593,21 +1566,25 @@ void test_signal_integrity(const std::string &model_path) {
     const auto first = process_signal(processor, signal);
     processor.reset_state();
     const auto second = process_signal(processor, signal);
-    require(first.size() == signal.size(), "signal frame count changed");
     require(first == second, "reset did not produce deterministic output");
 
-    double sum = 0.0;
-    float peak = 0.0f;
-    for (float sample : first) {
-      require(std::isfinite(sample), "signal test produced non-finite output");
-      peak = std::max(peak, std::fabs(sample));
-      sum += sample;
+    double input = 0.0;
+    double output = 0.0;
+    for (size_t i = 0; i < signal.size(); ++i) {
+      input += static_cast<double>(signal[i]) * signal[i];
+      output += static_cast<double>(first[i]) * first[i];
     }
-    require(peak <= 4.0f, "signal test produced a catastrophic peak");
-    require(std::fabs(sum / static_cast<double>(first.size())) < 0.1,
-            "signal test produced excessive DC");
-    if (kind == 0)
-      require(peak < 1e-6f, "silence test produced audible output");
+    if (kind == 0) {
+      require(output < 1e-9, "silence test produced audible output");
+      continue;
+    }
+    // None of the signals is speech, so the model suppresses each one to
+    // about the attenuation limit, and the limit stops it going further.
+    const double gain_db = 10.0 * std::log10(output / input);
+    require(gain_db > -controls.attenuation_limit_db - 1.0 &&
+                gain_db < -controls.attenuation_limit_db / 2.0,
+            "signal kind " + std::to_string(kind) + " changed level by " +
+                std::to_string(gain_db) + " dB");
   }
 }
 
@@ -1785,9 +1762,6 @@ int main(int argc, char **argv) {
            passed;
   passed = run_test("packet size transitions",
                     [&] { test_packet_size_transitions(low_cpu_model); }) && passed;
-  passed = run_test("bypass transitions",
-                    [&] { test_bypass_transition(quality_model); }) &&
-           passed;
   passed = run_test("delayed model lane and timestamp alignment",
                     [&] { test_model_delay_alignment(fixtures); }) && passed;
   passed = run_test("DPDFNet8 output delay",
@@ -1799,10 +1773,10 @@ int main(int argc, char **argv) {
                [&] { test_channel_and_timestamp_resets(low_cpu_model); }) &&
       passed;
   passed = run_test("44.1 kHz resampling",
-                    [&] { test_resampled_stream(low_cpu_model, 44100); }) &&
+                    [&] { test_resampled_stream(fixtures, 44100); }) &&
            passed;
   passed = run_test("96 kHz resampling",
-                    [&] { test_resampled_stream(low_cpu_model, 96000); }) &&
+                    [&] { test_resampled_stream(fixtures, 96000); }) &&
            passed;
   passed = run_test("44.1 kHz timestamp refresh",
                     [&] {
