@@ -315,12 +315,16 @@ $null = Invoke-DownloadZip `
     -ArchiveRootName "kissfft-131.1.0" `
     -ExpectedSha256 $KissArchiveSha256
 
-$modelPath = Join-Path $Models "$ModelName.onnx"
-if (!(Test-Path $modelPath)) {
+# Fetch every bundled model, not only the default: the manifest lists them
+# all, and the test gate checks each one.
+$missingModels = @($DpdfnetDefaultModelNames + @($ModelName) | Where-Object {
+    !(Test-Path (Join-Path $Models "$_.onnx"))
+})
+if ($missingModels.Count -gt 0) {
     & (Join-Path $PSScriptRoot "update-windows.ps1") `
         -OnnxRuntimeVersion $OnnxRuntimeVersion `
         -DefaultModelName $ModelName `
-        -ModelNames @($ModelName)
+        -ModelNames $DpdfnetDefaultModelNames
 }
 
 Set-Content -Encoding ASCII -Path (Join-Path $GeneratedObs "obsconfig.h") -Value @"

@@ -154,6 +154,25 @@ function Update-DpdfnetModels {
         }
     }
 
+    # The manifest is tracked. Rewrite it only when the models it describes
+    # change, so checking current models leaves the working tree clean. The
+    # revision and timestamp record when the files last changed.
+    $manifestPath = Join-Path $Models "manifest.json"
+    $describe = {
+        param($DefaultModel, $ModelRecords)
+        (@($DefaultModel) + @($ModelRecords | ForEach-Object {
+            "$($_.name)|$($_.file)|$($_.sha256)|$($_.size)"
+        })) -join "`n"
+    }
+    if (Test-Path $manifestPath) {
+        $current = Get-Content -Raw $manifestPath | ConvertFrom-Json
+        if ((& $describe $current.defaultModel $current.models) -ceq
+            (& $describe $DefaultModelName $records)) {
+            Write-Host "Model manifest is current."
+            return
+        }
+    }
+
     [PSCustomObject]@{
         updatedAt = (Get-Date).ToUniversalTime().ToString("o")
         source = "Ceva-IP/DPDFNet"
@@ -161,7 +180,7 @@ function Update-DpdfnetModels {
         defaultModel = $DefaultModelName
         models = $records
     } | ConvertTo-Json -Depth 5 |
-        Set-Content -Encoding ASCII -Path (Join-Path $Models "manifest.json")
+        Set-Content -Encoding ASCII -Path $manifestPath
 }
 
 $resolvedOnnxRuntimeVersion = Update-OnnxRuntime
