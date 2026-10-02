@@ -781,18 +781,26 @@ void test_direct_callbacks(const std::string &model_path,
         storage.direct_packet(steady_start + packet * PACKET_DURATION_NS);
     (void)dpdfnet_filter_info.filter_audio(filter.get(), &input);
   }
-  struct obs_audio_data steady =
-      storage.direct_packet(steady_start + 8 * PACKET_DURATION_NS);
+  // 4.5 s of callbacks, so the load meter's 4 s window rolls over inside
+  // the scope too.
+  constexpr uint64_t steady_packets = 450;
   const uint64_t steady_allocations_before =
       filter_test_instrumentation::callback_allocations.load(
           std::memory_order_relaxed);
-  struct obs_audio_data *steady_output = nullptr;
-  {
-    CallbackScope callback_scope;
-    steady_output = dpdfnet_filter_info.filter_audio(filter.get(), &steady);
+  uint64_t steady_processed = 0;
+  for (uint64_t packet = 8; packet < 8 + steady_packets; ++packet) {
+    struct obs_audio_data steady =
+        storage.direct_packet(steady_start + packet * PACKET_DURATION_NS);
+    struct obs_audio_data *steady_output = nullptr;
+    {
+      CallbackScope callback_scope;
+      steady_output = dpdfnet_filter_info.filter_audio(filter.get(), &steady);
+    }
+    if (steady_output && steady_output != &steady)
+      ++steady_processed;
   }
-  require(steady_output && steady_output != &steady,
-          "steady-state callback did not produce processed audio");
+  require(steady_processed == steady_packets,
+          "steady-state callbacks did not all produce processed audio");
   require(filter_test_instrumentation::callback_allocations.load(
               std::memory_order_relaxed) == steady_allocations_before,
           "steady-state processing allocated on the audio callback");
@@ -818,7 +826,8 @@ void test_direct_callbacks(const std::string &model_path,
   oversized.data[0] = reinterpret_cast<uint8_t *>(oversized_storage[0].data());
   oversized.data[1] = reinterpret_cast<uint8_t *>(oversized_storage[1].data());
   oversized.frames = DPDFNET_MAX_REALTIME_PACKET_FRAMES + 1;
-  oversized.timestamp = steady_start + 9 * PACKET_DURATION_NS;
+  oversized.timestamp =
+      steady_start + (8 + steady_packets) * PACKET_DURATION_NS;
   const uint64_t oversized_allocations_before =
       filter_test_instrumentation::callback_allocations.load(
           std::memory_order_relaxed);
