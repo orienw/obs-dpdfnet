@@ -254,6 +254,36 @@ void test_model_selection_migration(const std::string &quality_path,
           "filesystem-equivalent model path was not recognized");
 }
 
+// OBS hands the filter UTF-8 paths. Windows decodes a narrow path with the
+// ANSI code page, so this only fails there, on a directory outside it.
+void test_utf8_model_path(const std::filesystem::path &fixtures) {
+  const std::string directory_name =
+      "obs-dpdfnet-Zo\xC3\xAB-\xE6\xA8\xA1\xE5\x9E\x8B";
+  const std::filesystem::path directory =
+      std::filesystem::temp_directory_path() /
+      std::filesystem::u8path(directory_name);
+  std::filesystem::create_directories(directory);
+  const std::filesystem::path model = directory / "valid_identity.onnx";
+  std::filesystem::copy_file(fixtures / "valid_identity.onnx", model,
+                             std::filesystem::copy_options::overwrite_existing);
+  const std::string utf8_path = model.u8string();
+  try {
+    auto bundle = prepare_dpdfnet_model(utf8_path);
+    require(bundle.model->name() == "valid_identity",
+            "UTF-8 model path produced the wrong model name");
+    const DpdfnetProcessorSnapshot snapshot =
+        make_dpdfnet_snapshot(DpdfnetProcessorState{}, bundle.model.get());
+    require(snapshot.model_path == utf8_path,
+            "UTF-8 model path did not round-trip through the snapshot");
+    require(dpdfnet_paths_equivalent(utf8_path, utf8_path),
+            "UTF-8 model path was not equivalent to itself");
+  } catch (...) {
+    std::filesystem::remove_all(directory);
+    throw;
+  }
+  std::filesystem::remove_all(directory);
+}
+
 void check_packet_drain(const std::string &model_path, uint32_t rate,
                         const std::vector<uint32_t> &sizes, bool gaps = false) {
   auto processor = make_processor(model_path, rate, 2);
@@ -1691,6 +1721,9 @@ int main(int argc, char **argv) {
                       test_model_selection_migration(quality_model,
                                                      low_cpu_model, fixtures);
                     }) &&
+           passed;
+  passed = run_test("UTF-8 model path",
+                    [&] { test_utf8_model_path(fixtures); }) &&
            passed;
   passed = run_test("model activation probe",
                     [&] { test_model_activation_probe(fixtures); }) &&

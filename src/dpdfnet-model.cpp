@@ -63,11 +63,11 @@ DpdfnetModel::DpdfnetModel(const std::filesystem::path &model_path)
     : model_path_(model_path) {
   if (!std::filesystem::is_regular_file(model_path_))
     throw std::runtime_error("ONNX model file does not exist: " +
-                             model_path_.string());
+                             model_path_.u8string());
 
-  name_ = model_path_.stem().string();
+  name_ = model_path_.stem().u8string();
   if (name_.empty())
-    name_ = model_path_.filename().string();
+    name_ = model_path_.filename().u8string();
 
   session_options_.SetIntraOpNumThreads(1);
   session_options_.SetInterOpNumThreads(1);

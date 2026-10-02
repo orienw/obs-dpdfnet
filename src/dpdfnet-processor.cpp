@@ -224,7 +224,8 @@ DpdfnetRealtimeCapacity plan_dpdfnet_realtime_capacity(int model_sample_rate,
 
 DpdfnetModelBundle prepare_dpdfnet_model(const std::string &path) {
   DpdfnetModelBundle bundle;
-  bundle.model = std::make_unique<DpdfnetModel>(path);
+  bundle.model =
+      std::make_unique<DpdfnetModel>(std::filesystem::u8path(path));
   std::fill_n(bundle.model->input_spectrum(), bundle.model->spectrum_size(),
               0.0f);
   bundle.model->enhance();
@@ -1050,7 +1051,7 @@ make_dpdfnet_snapshot(const DpdfnetProcessorState &state,
   result.capacity_failures = state.capacity_failures;
   result.last_error = state.last_error.data();
   if (model) {
-    result.model_path = model->path().string();
+    result.model_path = model->path().u8string();
     result.model_name = model->name();
   }
   return result;

@@ -8,14 +8,18 @@ bool dpdfnet_paths_equivalent(const std::string &left,
                               const std::string &right) {
   if (left.empty() || right.empty())
     return false;
+  const auto left_path = std::filesystem::u8path(left);
+  const auto right_path = std::filesystem::u8path(right);
   std::error_code error;
-  if (std::filesystem::equivalent(left, right, error))
+  if (std::filesystem::equivalent(left_path, right_path, error))
     return true;
   error.clear();
-  const auto normalized_left = std::filesystem::weakly_canonical(left, error);
+  const auto normalized_left =
+      std::filesystem::weakly_canonical(left_path, error);
   if (error)
     return false;
-  const auto normalized_right = std::filesystem::weakly_canonical(right, error);
+  const auto normalized_right =
+      std::filesystem::weakly_canonical(right_path, error);
   return !error && normalized_left == normalized_right;
 }
 
