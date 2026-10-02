@@ -2,7 +2,7 @@
 
 $DpdfnetDefaultObsVersion = "32.2.1"
 $DpdfnetDefaultOnnxRuntimeVersion = "1.27.0"
-$DpdfnetDefaultPluginVersion = "1.1.1"
+$DpdfnetDefaultPluginVersion = (Get-Content -Raw -LiteralPath (Join-Path (Split-Path $PSScriptRoot) "VERSION")).Trim()
 $DpdfnetDefaultModelName = "dpdfnet8_48khz_hr"
 $DpdfnetDefaultModelNames = @("dpdfnet8_48khz_hr", "dpdfnet2_48khz_hr")
 

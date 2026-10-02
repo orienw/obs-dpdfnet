@@ -3,6 +3,7 @@ name: Windows
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -85,7 +86,7 @@ jobs:
           path: build/processor-benchmark.txt
 
       - name: Package release candidate
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         shell: pwsh
         run: |
           . ./scripts/dependency-versions.ps1
@@ -95,7 +96,7 @@ jobs:
             -SkipBuild
 
       - name: Upload release candidate
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@v7
         with:
           name: windows-release
@@ -106,3 +107,51 @@ jobs:
             build/release-notes-v*.md
             build/release-commit-v*.txt
             build/msvc/Release/tests-passed.txt
+
+  # Releasing: set the version in VERSION, push that commit to main, then
+  #   git tag -a v<version> -m "obs-dpdfnet <version>" && git push origin v<version>
+  # build-and-test builds and tests the tag, and this job turns its zip into a
+  # draft release. Write the "What's Changed" section in the draft and publish
+  # it. If this job refuses the tag, delete the tag locally and on GitHub, fix
+  # the problem, and tag again.
+  release:
+    needs: build-and-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-release
+          path: build
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          zip="build/obs-dpdfnet-$version-windows-x64.zip"
+          if [ ! -f "$zip" ]; then
+            echo "::error::$GITHUB_REF_NAME does not match the version in VERSION"
+            exit 1
+          fi
+          if [ "$(tr -d '[:space:]' < "build/release-commit-v$version.txt")" != "$GITHUB_SHA" ]; then
+            echo "::error::The zip was not built from $GITHUB_SHA"
+            exit 1
+          fi
+          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .status)"
+          if [ "$status" != identical ] && [ "$status" != behind ]; then
+            echo "::error::$GITHUB_REF_NAME points at a commit that is not on main"
+            exit 1
+          fi
+          prerelease=()
+          if [[ "$version" == 0.* || "$version" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            --draft "${prerelease[@]}" \
+            --title "obs-dpdfnet $version" \
+            --notes-file "build/release-notes-v$version.md" \
+            "$zip" "$zip.sha256"

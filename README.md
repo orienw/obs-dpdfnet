@@ -212,28 +212,6 @@ rebuilding and installing:
 
 Pass `-OnnxRuntimeVersion latest` to try a newer ONNX Runtime.
 
-## Release Workflow
-
-Windows PowerShell builds, tests, and stages the artifact; WSL or Linux
-publishes the tag and GitHub release.
-
-```powershell
-.\scripts\release-windows.ps1 -Version <version> -Changelog @(
-  "First change."
-  "Second change."
-)
-```
-
-The script rebuilds unless `-SkipBuild` is passed, always runs the test gate,
-checks that the source tree is clean, and writes the zip, checksum, and notes
-under `build/`. Pass `-ObsInstallDir` for a portable OBS install. CI stages the
-same `windows-release` artifact for every push to `main`; download it into
-`build/` in a clean checkout of that commit to publish it.
-
-```bash
-./scripts/publish-release-wsl.sh <version> [--draft]
-```
-
 ## License
 
 GPL-2.0-or-later for the plugin source. The bundled models and downloaded

@@ -2,13 +2,12 @@
 #
 # Windows release artifact staging: build -> stage -> zip -> checksum -> notes.
 #
-# Run this from Windows PowerShell to produce the release zip and notes. Publish
-# from WSL with scripts/publish-release-wsl.sh so git/gh use the WSL GitHub auth
-# that is already configured for this checkout.
+# CI runs this for every push to main and every release tag; the release job in
+# .github/workflows/windows.yml publishes its output. Run it locally to check a
+# release build before tagging.
 #
-#   .\scripts\release-windows.ps1 -Version 1.1.1
-#   .\scripts\release-windows.ps1 -Version 1.1.1 -SkipBuild
-#   ./scripts/publish-release-wsl.sh 1.1.1
+#   .\scripts\release-windows.ps1 -Version <version>
+#   .\scripts\release-windows.ps1 -Version <version> -SkipBuild
 
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -17,12 +16,8 @@ param(
     [string]$ObsVersion = "",
     [string]$OnnxRuntimeVersion = "",
     [string]$Repo = "orienw/obs-dpdfnet",
-    [string[]]$Changelog = @(),
     [string]$SourceCommit = "",
-    [switch]$PreRelease,
-    [switch]$SkipBuild,
-    [switch]$Draft,
-    [switch]$Publish
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,7 +51,7 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
 # The build bakes this version into the plugin, so it must be the version the
 # source declares. CMake checks that CMakeLists.txt agrees with this one.
 if ($Version -cne $DpdfnetDefaultPluginVersion) {
-    throw "Version '$Version' does not match '$DpdfnetDefaultPluginVersion' in scripts/dependency-versions.ps1. Bump the version in the source first."
+    throw "Version '$Version' does not match '$DpdfnetDefaultPluginVersion' in VERSION. Bump VERSION first."
 }
 
 $PinnedObsArchiveHash = $DpdfnetKnownObsArchiveHashes[$ObsVersion]
@@ -64,13 +59,6 @@ $PinnedOrtArchiveHash = $DpdfnetKnownOnnxRuntimeHashes[$OnnxRuntimeVersion]
 if (!$PinnedObsArchiveHash -or !$PinnedOrtArchiveHash) {
     throw "Release staging requires pinned OBS and ONNX Runtime versions."
 }
-
-if ($Publish -or $Draft) {
-    throw "Publishing moved to WSL. First run this script without -Publish/-Draft, then run: ./scripts/publish-release-wsl.sh $Version"
-}
-
-# 0.x or a -suffix is a pre-release unless this is a clean 1.0.0+ tag.
-$IsPreRelease = $PreRelease -or ($Version -match '^0\.') -or ($Version -match '-')
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Configuration = "Release"
@@ -255,26 +243,10 @@ Compress-Archive -Path $PluginStage, (Join-Path $Staging "INSTALL.txt") -Destina
 $Sha = (Get-FileHash -Algorithm SHA256 -Path $ZipPath).Hash.ToLowerInvariant()
 "$Sha  $ZipName" | Set-Content -Encoding ASCII "$ZipPath.sha256"
 
-# 6. Release notes. Keep reusable install instructions in README.md.
-$CleanChangelog = @($Changelog | Where-Object { ![string]::IsNullOrWhiteSpace($_) })
-$ChangelogSection = ""
-if ($CleanChangelog.Count -gt 0) {
-    $ChangelogLines = ($CleanChangelog | ForEach-Object {
-        $Item = $_.Trim()
-        if ($Item.StartsWith("- ")) { $Item } else { "- $Item" }
-    }) -join "`n"
-
-    $ChangelogSection = @"
-## What's Changed
-
-$ChangelogLines
-
-"@
-}
-
+# 6. Release notes. Keep reusable install instructions in README.md. The
+# "What's Changed" section is written by hand in the draft release.
 $ReadmeInstallUrl = "https://github.com/$Repo#install-a-release-build"
 $Notes = @"
-$ChangelogSection
 ## Install
 
 Built against **OBS Studio $ObsVersion** and **ONNX Runtime $OnnxRuntimeVersion**.
@@ -302,7 +274,3 @@ Write-Host "  zip:    $ZipPath"
 Write-Host "  sha256: $Sha"
 Write-Host "  notes:  $NotesPath"
 Write-Host "  commit: $ReleaseCommit"
-Write-Host "  tag:    $Tag (prerelease=$IsPreRelease)"
-Write-Host ""
-Write-Host "Publish from WSL with:"
-Write-Host "  ./scripts/publish-release-wsl.sh $Version"

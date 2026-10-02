@@ -2,18 +2,18 @@
 
 cmake_minimum_required(VERSION 3.24)
 
-project(obs-dpdfnet VERSION 1.1.1 LANGUAGES C CXX)
-
-# The Windows release build takes its version from dependency-versions.ps1,
-# which may add a pre-release suffix. Fail early if the two drift apart.
-file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/dependency-versions.ps1"
-  windows_version_line REGEX "^[$]DpdfnetDefaultPluginVersion = ")
-string(REGEX REPLACE "^.*\"([0-9]+[.][0-9]+[.][0-9]+)(-[A-Za-z0-9.]+)?\".*$"
-  "\\1" windows_version "${windows_version_line}")
-if(NOT windows_version STREQUAL PROJECT_VERSION)
-  message(FATAL_ERROR "CMakeLists.txt is version ${PROJECT_VERSION}, but "
-    "scripts/dependency-versions.ps1 says '${windows_version_line}'. Bump both.")
+# VERSION is the one place the release version lives. It may carry a
+# pre-release suffix such as -rc1, which project() cannot, so project() gets
+# the bare number and the plugin reports the full version.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" dpdfnet_version)
+string(STRIP "${dpdfnet_version}" dpdfnet_version)
+if(NOT dpdfnet_version MATCHES "^([0-9]+[.][0-9]+[.][0-9]+)(-[A-Za-z0-9.]+)?$")
+  message(FATAL_ERROR "VERSION must hold a version such as 1.2.0 or "
+    "1.2.0-rc1, not '${dpdfnet_version}'.")
 endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS VERSION)
+
+project(obs-dpdfnet VERSION ${CMAKE_MATCH_1} LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,7 +31,7 @@ option(DPDFNET_COPY_RUNTIME_DEPENDENCIES "Copy ONNX Runtime shared libraries nex
 option(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES "Install ONNX Runtime shared libraries with the OBS plugin" ON)
 option(DPDFNET_WARNINGS_AS_ERRORS "Fail on compiler warnings in this project's own code" OFF)
 
-set(DPDFNET_PLUGIN_VERSION "${PROJECT_VERSION}")
+set(DPDFNET_PLUGIN_VERSION "${dpdfnet_version}")
 set(DPDFNET_PLUGIN_DESTINATION "obs-plugins/64bit" CACHE STRING "Install destination for the OBS plugin binary")
 set(DPDFNET_DATA_DESTINATION "data/obs-plugins/obs-dpdfnet" CACHE STRING "Install destination for OBS plugin data")
 
