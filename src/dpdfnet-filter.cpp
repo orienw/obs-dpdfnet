@@ -1086,14 +1086,21 @@ private:
       for (auto &diagnostic : callback_diagnostics_)
         diagnostic.pending = false;
       request_lock.unlock();
+      bool status_changed = refresh_resamplers || retry_overload;
       for (const auto &diagnostic : diagnostics) {
-        if (diagnostic.pending)
+        if (diagnostic.pending) {
           log_callback_diagnostic(diagnostic);
+          status_changed = true;
+        }
       }
       if (refresh_resamplers)
         rebuild_resamplers_after_discontinuity();
       if (retry_overload)
         retry_after_overload();
+      // An open properties window rebuilds, so the status line follows a
+      // pause, retry, or failure without pressing Refresh.
+      if (status_changed)
+        obs_source_update_properties(source_);
       request_lock.lock();
     }
   }
