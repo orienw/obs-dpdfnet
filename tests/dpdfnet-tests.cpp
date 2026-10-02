@@ -426,18 +426,21 @@ std::vector<float> process_signal(DpdfnetProcessor &processor,
   return output;
 }
 
-void compare_results(const DpdfnetProcessResult &left,
-                     const DpdfnetProcessResult &right) {
+// Returns the number of frames compared, so callers can require that the
+// streams got past startup and real audio was checked.
+size_t compare_results(const DpdfnetProcessResult &left,
+                       const DpdfnetProcessResult &right) {
   require(left.disposition == right.disposition,
           "reset stream disposition differs from fresh stream");
   if (left.disposition != DpdfnetDisposition::Processed)
-    return;
+    return 0;
   require(left.frames == right.frames && left.timestamp == right.timestamp,
           "reset stream packet metadata differs from fresh stream");
   for (uint32_t frame = 0; frame < left.frames; ++frame) {
     require(nearly_equal(left.data[0][frame], right.data[0][frame], 2e-6f),
             "reset stream audio differs from fresh stream");
   }
+  return left.frames;
 }
 
 void test_model_delay_alignment(const std::filesystem::path &fixtures) {
@@ -540,14 +543,25 @@ void test_channel_and_timestamp_resets(const std::string &model_path) {
   left.input_channel = 0;
   transitioned.set_controls(left);
 
-  std::vector<float> old_left(960, 0.08f);
-  std::vector<float> old_right(960, -0.08f);
+  // Noise, so leftover model state would show in the output.
+  std::mt19937 rng(7);
+  std::normal_distribution<float> noise(0.0f, 0.05f);
+  const auto noise_packet = [&] {
+    std::vector<float> data(960);
+    for (auto &value : data)
+      value = noise(rng);
+    return data;
+  };
+  std::vector<float> old_left = noise_packet();
+  std::vector<float> old_right = noise_packet();
   DpdfnetAudioPacket old_packet;
   old_packet.data[0] = old_left.data();
   old_packet.data[1] = old_right.data();
   old_packet.frames = 960;
-  old_packet.timestamp = 2 * NS_PER_SECOND;
-  transitioned.process(old_packet);
+  for (size_t index = 0; index < 4; ++index) {
+    old_packet.timestamp = 2 * NS_PER_SECOND + index * 20'000'000;
+    transitioned.process(old_packet);
+  }
 
   DpdfnetControls right = left;
   right.input_channel = 1;
@@ -555,32 +569,39 @@ void test_channel_and_timestamp_resets(const std::string &model_path) {
   DpdfnetProcessor fresh = make_processor(model_path, 48000, 2);
   fresh.set_controls(right);
 
-  std::vector<float> new_left(960, 0.02f);
-  std::vector<float> new_right(960, -0.03f);
-  for (size_t packet_index = 0; packet_index < 4; ++packet_index) {
+  std::vector<float> new_left = noise_packet();
+  std::vector<float> new_right = noise_packet();
+  size_t compared = 0;
+  for (size_t packet_index = 0; packet_index < 6; ++packet_index) {
     DpdfnetAudioPacket packet;
     packet.data[0] = new_left.data();
     packet.data[1] = new_right.data();
     packet.frames = 960;
     packet.timestamp = 3 * NS_PER_SECOND + packet_index * 20'000'000;
-    compare_results(transitioned.process(packet), fresh.process(packet));
+    compared += compare_results(transitioned.process(packet),
+                                fresh.process(packet));
   }
+  require(compared >= 2 * 960, "channel change comparison saw no audio");
 
-  std::vector<float> history(960, 0.04f);
+  std::vector<float> history = noise_packet();
   DpdfnetAudioPacket packet;
   packet.data[0] = history.data();
   packet.data[1] = history.data();
   packet.frames = 960;
-  packet.timestamp = 4 * NS_PER_SECOND;
-  transitioned.process(packet);
+  for (size_t index = 0; index < 4; ++index) {
+    packet.timestamp = 4 * NS_PER_SECOND + index * 20'000'000;
+    transitioned.process(packet);
+  }
 
   DpdfnetProcessor backward_fresh = make_processor(model_path, 48000, 2);
   backward_fresh.set_controls(right);
-  for (size_t index = 0; index < 4; ++index) {
+  compared = 0;
+  for (size_t index = 0; index < 6; ++index) {
     packet.timestamp = NS_PER_SECOND + index * 20'000'000;
-    compare_results(transitioned.process(packet),
-                    backward_fresh.process(packet));
+    compared += compare_results(transitioned.process(packet),
+                                backward_fresh.process(packet));
   }
+  require(compared >= 2 * 960, "backward jump comparison saw no audio");
 
   require(transitioned.state().timestamp_discontinuities == 2,
           "forward and backward timestamp jumps were not counted");
@@ -593,14 +614,16 @@ void test_channel_and_timestamp_resets(const std::string &model_path) {
   DpdfnetProcessor forward_fresh = make_processor(model_path, 48000, 2);
   forward_fresh.set_controls(right);
   constexpr uint64_t first_after_gap = NS_PER_SECOND + 20'000'000 + 70'000'000;
-  for (size_t index = 0; index < 4; ++index) {
+  compared = 0;
+  for (size_t index = 0; index < 6; ++index) {
     packet.timestamp = first_after_gap + index * 20'000'000;
     const auto result = forward_jump.process(packet);
     require((result.event == DpdfnetEvent::TimestampDiscontinuity) ==
                 (index == 0),
             "timestamp jump was not reported exactly once");
-    compare_results(result, forward_fresh.process(packet));
+    compared += compare_results(result, forward_fresh.process(packet));
   }
+  require(compared >= 2 * 960, "forward jump comparison saw no audio");
   packet.timestamp += 20'000'000 + 70'000'000;
   require(forward_jump.process(packet).event == DpdfnetEvent::None,
           "a later timestamp jump was reported again");
@@ -636,10 +659,17 @@ void test_empty_resampler_replacement_is_noop(const std::string &model_path) {
   packet.data[0] = data.data();
   packet.frames = 960;
   packet.timestamp = NS_PER_SECOND;
-  compare_results(control.process(packet), unchanged.process(packet));
-  unchanged.replace_resamplers({});
-  packet.timestamp += 20'000'000;
-  compare_results(control.process(packet), unchanged.process(packet));
+  size_t compared = 0;
+  for (size_t index = 0; index < 8; ++index) {
+    // Mid-stream, after output has started.
+    if (index == 4)
+      unchanged.replace_resamplers({});
+    compared += compare_results(control.process(packet),
+                                unchanged.process(packet));
+    packet.timestamp += 20'000'000;
+  }
+  require(compared >= 4 * 960,
+          "empty resampler replacement comparison saw no audio");
 }
 
 void test_extreme_contract_capacity_plan() {
@@ -661,11 +691,10 @@ void test_extreme_contract_capacity_plan() {
 }
 
 void test_extreme_contract_stream(const std::filesystem::path &fixtures) {
+  // An identity model at 8 kHz with an 8192-point frame: the largest
+  // window the capacity plan allows, resampled from 48 kHz.
   DpdfnetProcessor processor = make_processor(
       (fixtures / "valid_extreme_capacity.onnx").string(), 48000);
-  DpdfnetControls controls;
-  controls.bypass = true;
-  processor.set_controls(controls);
 
   std::vector<float> data(960, 0.025f);
   uint64_t timestamp = NS_PER_SECOND;
@@ -679,10 +708,11 @@ void test_extreme_contract_stream(const std::filesystem::path &fixtures) {
     require(result.disposition != DpdfnetDisposition::Passthrough,
             "extreme contract stream reset at its former fixed capacity");
     if (result.disposition == DpdfnetDisposition::Processed) {
-      processed += result.frames;
-      for (uint32_t frame = 0; frame < result.frames; ++frame) {
-        require(std::isfinite(result.data[0][frame]),
-                "extreme contract stream produced non-finite audio");
+      // The first output frame overlaps the zero history before the input.
+      for (uint32_t frame = 0; frame < result.frames; ++frame, ++processed) {
+        require(processed < 8192 * 6 ||
+                    nearly_equal(result.data[0][frame], 0.025f, 1e-4f),
+                "extreme contract stream changed the input level");
       }
     }
     timestamp += 20'000'000;
@@ -1480,24 +1510,34 @@ void test_resampled_stream(const std::filesystem::path &fixtures,
 
 void test_resampled_timestamp_refresh(const std::string &model_path,
                                       uint32_t sample_rate) {
+  // Bypass off, so the comparison sees the model and STFT lanes, not just
+  // the dry audio.
   DpdfnetProcessor transitioned = make_processor(model_path, sample_rate);
-  DpdfnetControls controls;
-  controls.bypass = true;
-  transitioned.set_controls(controls);
 
   const uint32_t frames = sample_rate / 50;
   const uint64_t packet_ns = static_cast<uint64_t>(static_cast<double>(frames) /
                                                    sample_rate * NS_PER_SECOND);
-  std::vector<float> old_data(frames, 0.08f);
-  std::vector<float> new_data(frames, -0.03f);
+  // Noise, because a constant level is suppressed to the limit with or
+  // without leftover model state and would hide it.
+  std::mt19937 rng(sample_rate);
+  std::normal_distribution<float> noise(0.0f, 0.05f);
+  std::vector<float> old_data(frames);
+  std::vector<float> new_data(frames);
+  for (auto &value : old_data)
+    value = noise(rng);
+  for (auto &value : new_data)
+    value = noise(rng);
   DpdfnetAudioPacket packet;
   packet.data[0] = old_data.data();
   packet.frames = frames;
-  packet.timestamp = NS_PER_SECOND;
-  transitioned.process(packet);
+  // Enough audio that the model and STFT carry state into the jump.
+  for (size_t index = 0; index < 10; ++index) {
+    packet.timestamp = NS_PER_SECOND + index * packet_ns;
+    transitioned.process(packet);
+  }
 
   packet.data[0] = new_data.data();
-  packet.timestamp = NS_PER_SECOND + packet_ns + 70'000'000;
+  packet.timestamp = NS_PER_SECOND + 10 * packet_ns + 70'000'000;
   const auto discontinuity = transitioned.process(packet);
   require(discontinuity.event == DpdfnetEvent::ResamplerRefreshNeeded,
           "resampled timestamp jump did not request fresh resamplers");
@@ -1511,13 +1551,16 @@ void test_resampled_timestamp_refresh(const std::string &model_path,
           "fresh resamplers did not clear the refresh request");
 
   DpdfnetProcessor fresh = make_processor(model_path, sample_rate);
-  fresh.set_controls(controls);
   uint64_t timestamp = packet.timestamp + packet_ns;
-  for (size_t index = 0; index < 8; ++index) {
+  size_t compared = 0;
+  for (size_t index = 0; index < 12; ++index) {
     packet.timestamp = timestamp;
-    compare_results(transitioned.process(packet), fresh.process(packet));
+    compared += compare_results(transitioned.process(packet),
+                                fresh.process(packet));
     timestamp += packet_ns;
   }
+  require(compared >= 4 * frames,
+          "resampled timestamp refresh comparison saw no audio");
 }
 
 void test_format_transition_invalidates_resamplers(
@@ -1562,12 +1605,16 @@ void test_resampled_model_replacement(const std::string &quality_model,
   DpdfnetProcessor fresh = make_processor(low_cpu_model, sample_rate);
 
   std::vector<float> post(441, -0.025f);
-  for (size_t index = 0; index < 8; ++index) {
+  size_t compared = 0;
+  for (size_t index = 0; index < 20; ++index) {
     packet.data[0] = post.data();
     packet.frames = static_cast<uint32_t>(post.size());
     packet.timestamp = 2 * NS_PER_SECOND + index * 10'000'000;
-    compare_results(transitioned.process(packet), fresh.process(packet));
+    compared += compare_results(transitioned.process(packet),
+                                fresh.process(packet));
   }
+  require(compared >= 8 * post.size(),
+          "resampled model replacement comparison saw no audio");
 }
 
 std::vector<float> make_signal(size_t frames, int kind) {
@@ -1601,6 +1648,46 @@ std::vector<float> make_signal(size_t frames, int kind) {
     }
   }
   return signal;
+}
+
+// Bypass changes only which lane reaches the output. The model keeps running
+// underneath, so turning Bypass off again continues exactly where a stream
+// that never bypassed would be, and Bypass itself matches a stream that
+// always did.
+void test_bypass_keeps_model_warm(const std::string &model_path) {
+  DpdfnetProcessor toggled = make_processor(model_path);
+  DpdfnetProcessor enhanced = make_processor(model_path);
+  DpdfnetProcessor bypassed = make_processor(model_path);
+  DpdfnetControls bypass;
+  bypass.bypass = true;
+  bypassed.set_controls(bypass);
+
+  const std::vector<float> signal = make_signal(48000, 2);
+  constexpr uint32_t frames = 480;
+  size_t compared_bypassed = 0;
+  size_t compared_after = 0;
+  for (size_t index = 0; index * frames < signal.size(); ++index) {
+    if (index == 30 || index == 60)
+      toggled.set_controls(index == 30 ? bypass : DpdfnetControls{});
+    DpdfnetAudioPacket packet;
+    packet.data[0] = signal.data() + index * frames;
+    packet.frames = frames;
+    packet.timestamp = NS_PER_SECOND + index * 10'000'000;
+    const auto result = toggled.process(packet);
+    const auto reference_enhanced = enhanced.process(packet);
+    const auto reference_bypassed = bypassed.process(packet);
+    if (index >= 30 && index < 60) {
+      compared_bypassed += compare_results(result, reference_bypassed);
+    } else {
+      const size_t compared = compare_results(result, reference_enhanced);
+      if (index >= 60)
+        compared_after += compared;
+    }
+  }
+  require(compared_bypassed >= 25 * frames,
+          "bypass comparison saw too little audio");
+  require(compared_after >= 35 * frames,
+          "comparison after bypass saw too little audio");
 }
 
 void test_signal_integrity(const std::string &model_path) {
@@ -1810,6 +1897,9 @@ int main(int argc, char **argv) {
                     [&] {
                       test_output_storage_survives_format_update(low_cpu_model);
                     }) &&
+           passed;
+  passed = run_test("bypass keeps the model warm",
+                    [&] { test_bypass_keeps_model_warm(low_cpu_model); }) &&
            passed;
   passed = run_test("variable packets and aligned bypass",
                     [&] { test_variable_packets_and_bypass(quality_model); }) &&
