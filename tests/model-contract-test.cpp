@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <iterator>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -51,6 +52,26 @@ constexpr ContractCase kCases[] = {
      "DPDFNet metadata key contains an invalid float: erb_norm_init"},
     {"oversized_initializer.onnx",
      "DPDFNet metadata key contains an invalid float: erb_norm_init"},
+    {"missing_metadata_key.onnx",
+     "DPDFNet ONNX model is missing metadata key: n_fft"},
+    {"non_integer_metadata.onnx",
+     "DPDFNet metadata key is not an integer: n_fft"},
+    {"inconsistent_fft_dimensions.onnx",
+     "DPDFNet model metadata has inconsistent FFT dimensions"},
+    {"sample_rate_out_of_range.onnx",
+     "DPDFNet model metadata sample_rate is out of supported range"},
+    {"n_fft_out_of_range.onnx",
+     "DPDFNet model metadata n_fft is out of supported range"},
+    {"hop_longer_than_frame.onnx",
+     "DPDFNet model metadata hop_length is larger than n_fft"},
+    {"state_size_out_of_range.onnx",
+     "DPDFNet model metadata state_size is out of supported range"},
+    {"initializer_count_mismatch.onnx",
+     "DPDFNet metadata key has unexpected value count: erb_norm_init"},
+    {"wrong_state_input_shape.onnx",
+     "DPDFNet state input has an incompatible shape"},
+    {"wrong_state_output_shape.onnx",
+     "DPDFNet state output has an incompatible shape"},
     {"nonfinite_spectrum_output.onnx",
      "DPDFNet model produced non-finite spectrum output"},
     {"nonfinite_state_output.onnx",
@@ -107,6 +128,21 @@ int main(int argc, char **argv) {
   const std::filesystem::path fixture_directory(argv[1]);
   for (const auto &test_case : kCases)
     passed = run_case(fixture_directory, test_case) && passed;
+
+  // A fixture without an expected result would never be checked.
+  for (const auto &entry :
+       std::filesystem::directory_iterator(fixture_directory)) {
+    if (entry.path().extension() != ".onnx")
+      continue;
+    const std::string name = entry.path().filename().string();
+    if (std::none_of(std::begin(kCases), std::end(kCases),
+                     [&](const ContractCase &test_case) {
+                       return name == test_case.file_name;
+                     })) {
+      std::cerr << "FAIL " << name << ": fixture has no expected result\n";
+      passed = false;
+    }
+  }
 
   for (int i = 2; i < argc; ++i) {
     try {

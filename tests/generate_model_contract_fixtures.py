@@ -107,6 +107,25 @@ CASES = (
         "oversized_initializer",
         {"metadata": {"erb_norm_init": "1000001"}},
     ),
+    Case("missing_metadata_key", {"omit_metadata": ("n_fft",)}),
+    Case("non_integer_metadata", {"metadata": {"n_fft": "960.0"}}),
+    Case("inconsistent_fft_dimensions", {"metadata": {"freq_bins": "480"}}),
+    Case("sample_rate_out_of_range", {"metadata": {"sample_rate": "7999"}}),
+    Case(
+        "n_fft_out_of_range",
+        {
+            "metadata": {
+                "n_fft": "16384",
+                "hop_length": "8192",
+                "freq_bins": "8193",
+            },
+        },
+    ),
+    Case("hop_longer_than_frame", {"metadata": {"hop_length": "961"}}),
+    Case("state_size_out_of_range", {"metadata": {"state_size": "8000001"}}),
+    Case("initializer_count_mismatch", {"metadata": {"erb_norm_init": "0,0"}}),
+    Case("wrong_state_input_shape", {"state_shape": (2,)}),
+    Case("wrong_state_output_shape", {"doubled_state": True}),
     Case(
         "nonfinite_spectrum_output",
         {"nonfinite_spectrum": True},
@@ -165,7 +184,10 @@ def make_fixture(path: Path, **options) -> None:
 
     outputs = [make_value(spec_out, element_type, spec_shape)]
     if output_count >= 2:
-        outputs.append(make_value(state_out, element_type, state_shape))
+        state_out_shape = (
+            (2 * state_shape[0],) if options.get("doubled_state") else state_shape
+        )
+        outputs.append(make_value(state_out, element_type, state_out_shape))
     if output_count >= 3:
         outputs.append(make_value("diagnostic", element_type, state_shape))
 
@@ -231,7 +253,11 @@ def make_fixture(path: Path, **options) -> None:
         nodes = [helper.make_node("Identity", [spec_in], [spec_out])]
 
     if output_count >= 2 and not delay_hops:
-        if options.get("nonfinite_state"):
+        if options.get("doubled_state"):
+            nodes.append(helper.make_node(
+                "Concat", [state_in, state_in], [state_out], axis=0
+            ))
+        elif options.get("nonfinite_state"):
             nodes.append(
                 constant_node(
                     "nonfinite_state", state_out, element_type, state_shape
@@ -263,6 +289,8 @@ def make_fixture(path: Path, **options) -> None:
         }
     if options.get("omit_delay"):
         del metadata["output_delay_hops"]
+    for key in options.get("omit_metadata", ()):
+        del metadata[key]
     for key, value in metadata.items():
         entry = model.metadata_props.add()
         entry.key = key
