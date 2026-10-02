@@ -11,8 +11,6 @@ permissions:
 jobs:
   build-and-test:
     runs-on: windows-2025
-    env:
-      OBS_VERSION: 32.2.1
 
     steps:
       - uses: actions/checkout@v7
@@ -22,14 +20,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          . ./scripts/dependency-versions.ps1
+          $version = $DpdfnetDefaultObsVersion
+          $expected = $DpdfnetKnownObsRuntimeHashes[$version]
+          if (!$expected) { throw "No pinned hash for the OBS $version runtime" }
+          $zip = "build/obs-runtime/OBS-Studio-$version-Windows-x64.zip"
           New-Item -ItemType Directory -Force build/obs-runtime | Out-Null
-          gh release download $env:OBS_VERSION `
+          gh release download $version `
             --repo obsproject/obs-studio `
-            --pattern "OBS-Studio-$env:OBS_VERSION-Windows-x64.zip" `
+            --pattern "OBS-Studio-$version-Windows-x64.zip" `
             --dir build/obs-runtime
-          Expand-Archive `
-            "build/obs-runtime/OBS-Studio-$env:OBS_VERSION-Windows-x64.zip" `
-            build/obs-runtime/extracted
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "OBS runtime hash mismatch: expected $expected, got $actual"
+          }
+          Expand-Archive $zip build/obs-runtime/extracted
           $obsDll = Get-ChildItem build/obs-runtime/extracted -Recurse `
             -Filter obs.dll | Where-Object { $_.FullName -match 'bin\\64bit\\obs\.dll$' } |
             Select-Object -First 1

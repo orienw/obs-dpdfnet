@@ -11,6 +11,11 @@ $DpdfnetKnownOnnxRuntimeHashes = @{
     "1.27.0" = "c5c81710938e68079ff1a192b04897faabe4b43830d48f39f27ecd4e16138bfc"
 }
 
+# OBS-Studio-<version>-Windows-x64.zip, the runtime Windows CI tests against.
+$DpdfnetKnownObsRuntimeHashes = @{
+    "32.2.1" = "db64a2934f8261f85b1410b84be011207a0afda5400d008289f1f1e211bcc7de"
+}
+
 $DpdfnetKnownObsArchiveHashes = @{
     "32.1.2" = "21cba22292985cf0da967d5c618999b40eaa32b73d2ab8b06154b5ea1b3d3798"
     "32.2.1" = "0cc1bd46a3d60c8f4317b38c27414fc0472e04609f4e67ad2142ed1598ef5462"

@@ -95,10 +95,12 @@ if(DPDFNET_FETCH_KISSFFT)
   set(KISSFFT_STATIC ON CACHE BOOL "" FORCE)
   set(KISSFFT_TEST OFF CACHE BOOL "" FORCE)
   set(KISSFFT_TOOLS OFF CACHE BOOL "" FORCE)
+  # The same archive and hash scripts/build-windows-msvc.ps1 pins.
   FetchContent_Declare(
     kissfft
-    GIT_REPOSITORY https://github.com/mborgerding/kissfft.git
-    GIT_TAG 131.1.0
+    URL https://github.com/mborgerding/kissfft/archive/refs/tags/131.1.0.zip
+    URL_HASH SHA256=9c2e19cc34ed910dcb509fd8ab561a523b923b6578703ace8c8f37f5a286bb25
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
   )
   FetchContent_MakeAvailable(kissfft)
   # KissFFT is linked statically, so keep its headers, archive, and package
