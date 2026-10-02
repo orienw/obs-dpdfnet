@@ -103,7 +103,6 @@ jobs:
           if-no-files-found: error
           path: |
             build/obs-dpdfnet-*-windows-x64.zip
-            build/obs-dpdfnet-*-windows-x64.zip.sha256
             build/release-notes-v*.md
             build/release-commit-v*.txt
             build/msvc/Release/tests-passed.txt
@@ -154,4 +153,4 @@ jobs:
             --draft "${prerelease[@]}" \
             --title "$version" \
             --notes-file "build/release-notes-v$version.md" \
-            "$zip" "$zip.sha256"
+            "$zip"

@@ -14,7 +14,7 @@ builds from source with CMake.
 
 Requirements: Windows 10/11 64-bit and OBS Studio 32.2.1 or later, x64.
 
-Download the zip and its `.sha256` file from
+Download the zip from
 [GitHub releases](https://github.com/orienw/obs-dpdfnet/releases). The binary
 is unsigned, so SmartScreen or Defender may warn on download or first load.
 
@@ -27,11 +27,11 @@ is unsigned, so SmartScreen or Defender may warn on download or first load.
 4. Start OBS and add the filter:
    `Audio Mixer -> mic gear -> Filters -> + -> DPDFNet Noise Suppression`
 
-To verify the download, the two hashes must match:
+To verify the download, compare this hash with the SHA-256 shown next to the
+zip on the release page:
 
 ```powershell
 Get-FileHash .\obs-dpdfnet-<version>-windows-x64.zip -Algorithm SHA256
-Get-Content .\obs-dpdfnet-<version>-windows-x64.zip.sha256
 ```
 
 ## Settings
