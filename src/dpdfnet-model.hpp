@@ -15,6 +15,10 @@ class DpdfnetModel {
 public:
   explicit DpdfnetModel(const std::filesystem::path &model_path);
 
+  // Sends ONNX Runtime's log messages to a callback instead of stderr. Takes
+  // effect only before the first model is created.
+  static void set_logger(OrtLoggingFunction logger);
+
   void reset() noexcept;
 
   // Run one hop. The caller fills input_spectrum() with the noisy spectrum
@@ -39,6 +43,11 @@ public:
   const std::filesystem::path &path() const { return model_path_; }
 
 private:
+  // Declared first so it runs before any member calls into ONNX Runtime.
+  struct RuntimeCheck {
+    RuntimeCheck();
+  };
+
   static Ort::Env &env();
 
   std::string metadata_value(Ort::ModelMetadata &metadata,
@@ -47,6 +56,7 @@ private:
   static std::vector<float> parse_float_list(const std::string &value,
                                              size_t expected, const char *key);
 
+  RuntimeCheck runtime_check_;
   std::filesystem::path model_path_;
   Ort::AllocatorWithDefaultOptions allocator_;
   Ort::SessionOptions session_options_;

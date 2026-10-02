@@ -52,10 +52,32 @@ bool all_finite(const std::vector<float> &values) {
                      [](float value) { return std::isfinite(value); });
 }
 
+OrtLoggingFunction onnxruntime_logger = nullptr;
+
 } // namespace
 
+// Another OBS plugin can load an older ONNX Runtime under the same name
+// first, and the loader then hands this plugin that copy. Its API table for
+// this version is null, and the C++ wrapper would dereference it.
+DpdfnetModel::RuntimeCheck::RuntimeCheck() {
+  const OrtApiBase *base = OrtGetApiBase();
+  if (!base->GetApi(ORT_API_VERSION))
+    throw std::runtime_error(
+        std::string("ONNX Runtime ") + base->GetVersionString() +
+        " is older than the version this plugin was built with. Another "
+        "plugin may have loaded its own copy.");
+}
+
+void DpdfnetModel::set_logger(OrtLoggingFunction logger) {
+  onnxruntime_logger = logger;
+}
+
 Ort::Env &DpdfnetModel::env() {
-  static Ort::Env instance(ORT_LOGGING_LEVEL_WARNING, "obs-dpdfnet");
+  static Ort::Env instance =
+      onnxruntime_logger
+          ? Ort::Env(ORT_LOGGING_LEVEL_WARNING, "obs-dpdfnet",
+                     onnxruntime_logger, nullptr)
+          : Ort::Env(ORT_LOGGING_LEVEL_WARNING, "obs-dpdfnet");
   return instance;
 }
 

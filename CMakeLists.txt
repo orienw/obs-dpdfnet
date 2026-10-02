@@ -44,17 +44,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
     set(private_onnxruntime_name "libonnxruntime_dpdfnet.so")
     set(private_onnxruntime
       "${CMAKE_BINARY_DIR}/onnxruntime-private/${private_onnxruntime_name}")
-    file(REAL_PATH "${ONNXRUNTIME_LIBRARY}" stock_onnxruntime)
-    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/onnxruntime-private")
-    file(COPY_FILE "${stock_onnxruntime}" "${private_onnxruntime}")
-    execute_process(
+    # Made at build time from the stock library, so replacing ONNX Runtime in
+    # place refreshes the private copy instead of linking a stale one.
+    add_custom_command(
+      OUTPUT "${private_onnxruntime}"
+      COMMAND "${CMAKE_COMMAND}" -E copy "${ONNXRUNTIME_LIBRARY}"
+        "${private_onnxruntime}"
       COMMAND "${DPDFNET_PATCHELF}" --set-soname "${private_onnxruntime_name}"
         "${private_onnxruntime}"
-      RESULT_VARIABLE patchelf_result
+      DEPENDS "${ONNXRUNTIME_LIBRARY}"
+      VERBATIM
     )
-    if(NOT patchelf_result EQUAL 0)
-      message(FATAL_ERROR "patchelf could not rename ${private_onnxruntime}")
-    endif()
+    add_custom_target(dpdfnet-private-onnxruntime
+      DEPENDS "${private_onnxruntime}")
     add_library(ONNXRuntime::Private SHARED IMPORTED)
     set_target_properties(ONNXRuntime::Private PROPERTIES
       IMPORTED_LOCATION "${private_onnxruntime}"
@@ -139,6 +141,9 @@ target_link_libraries(obs-dpdfnet PRIVATE
   Threads::Threads
   ${DPDFNET_KISSFFT_TARGET}
 )
+if(TARGET dpdfnet-private-onnxruntime)
+  add_dependencies(obs-dpdfnet dpdfnet-private-onnxruntime)
+endif()
 
 dpdfnet_copy_runtime_dependencies(obs-dpdfnet
   ${DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES})
@@ -390,6 +395,11 @@ install(DIRECTORY LICENSES
 # onnxruntime.dll in the shared obs-plugins/64bit directory. Fine for isolated
 # dev builds, not for shipping. Linux installs the private copy made above.
 if(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
+  if(WIN32)
+    message(WARNING "This install ships onnxruntime.dll under its stock name, "
+      "so it can clash with another ONNX-based OBS plugin. Build releases with "
+      "scripts/build-windows-msvc.ps1, which gives it a private name.")
+  endif()
   if(IS_ABSOLUTE "${DPDFNET_PLUGIN_DESTINATION}")
     set(runtime_destination "${DPDFNET_PLUGIN_DESTINATION}")
   else()
