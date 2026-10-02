@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -19,6 +20,13 @@
 #include <string>
 #include <thread>
 #include <utility>
+
+#ifdef DPDFNET_FILTER_TEST_HOOKS
+// Set by the filter tests to drive the realtime overload path without a slow
+// machine or minute-long waits. The plugin build does not have them.
+std::atomic<uint64_t> dpdfnet_test_extra_processing_ns{0};
+std::atomic<uint64_t> dpdfnet_test_retry_delay_divisor{1};
+#endif
 
 namespace {
 constexpr const char *SETTING_MODEL_SELECTION = "model_selection";
@@ -556,8 +564,11 @@ public:
     const uint64_t processor_started = os_gettime_ns();
     DpdfnetProcessResult result = processor_.process(packet);
     const uint64_t processor_finished = os_gettime_ns();
-    const uint64_t realtime_processing_ns =
-        processor_finished - processor_started;
+    uint64_t realtime_processing_ns = processor_finished - processor_started;
+#ifdef DPDFNET_FILTER_TEST_HOOKS
+    if (result.processed_hops)
+      realtime_processing_ns += dpdfnet_test_extra_processing_ns.load();
+#endif
     uint64_t realtime_budget_ns = 0;
     const bool active_processing_result =
         result.disposition != DpdfnetDisposition::Passthrough;
@@ -992,6 +1003,9 @@ private:
         }
       }
       if (result.event == DpdfnetEvent::RealtimeOverloadCircuitOpened) {
+#ifdef DPDFNET_FILTER_TEST_HOOKS
+        overload_retry_delay_ns /= dpdfnet_test_retry_delay_divisor.load();
+#endif
         overload_retry_deadline_ns_ =
             overload_retry_delay_ns ? os_gettime_ns() + overload_retry_delay_ns
                                     : 0;

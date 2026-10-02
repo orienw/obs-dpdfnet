@@ -172,6 +172,8 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-dpdfnet", "en-US")
 
 extern struct obs_source_info dpdfnet_filter_info;
+extern std::atomic<uint64_t> dpdfnet_test_extra_processing_ns;
+extern std::atomic<uint64_t> dpdfnet_test_retry_delay_divisor;
 
 namespace {
 constexpr const char *TEST_SOURCE_ID = "dpdfnet_filter_test_source";
@@ -900,6 +902,148 @@ void test_failed_inference_counts_toward_load(
           "failed inference was left out of processing load");
 }
 
+void count_property_update(void *data, calldata_t *) {
+  static_cast<std::atomic<uint64_t> *>(data)->fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+// Runs the filter's realtime overload handling end to end: the guard trips,
+// processing pauses, the worker retries on schedule in probe mode, a probe
+// that still overloads pauses again with the next delay, and a probe that
+// keeps up recovers and restarts the schedule. Extra measured processing
+// time stands in for a slow machine, and the retry deadlines are divided so
+// the test does not wait the real 10 and 30 seconds. The logs keep the real
+// delays.
+void test_overload_retry_chain(const std::filesystem::path &fixtures,
+                               const LogCapture &logs) {
+  struct HookReset {
+    ~HookReset() {
+      dpdfnet_test_extra_processing_ns = 0;
+      dpdfnet_test_retry_delay_divisor = 1;
+    }
+  } hook_reset;
+
+  ObsData settings;
+  configure_custom_model(settings,
+                         (fixtures / "valid_identity.onnx").string());
+  ObsSource source(obs_source_create_private(TEST_SOURCE_ID,
+                                             "overload owner", settings));
+  std::atomic<uint64_t> property_updates{0};
+  signal_handler_t *signals = obs_source_get_signal_handler(source);
+  signal_handler_connect(signals, "update_properties", count_property_update,
+                         &property_updates);
+  struct Disconnect {
+    signal_handler_t *signals;
+    std::atomic<uint64_t> *counter;
+    ~Disconnect() {
+      signal_handler_disconnect(signals, "update_properties",
+                                count_property_update, counter);
+    }
+  } disconnect{signals, &property_updates};
+  DirectFilter filter(settings, source);
+
+  PacketStorage storage;
+  uint64_t timestamp = 1000000000ULL;
+  const auto feed = [&](size_t packets) {
+    for (size_t packet = 0; packet < packets; ++packet) {
+      struct obs_audio_data input = storage.direct_packet(timestamp);
+      (void)dpdfnet_filter_info.filter_audio(filter.get(), &input);
+      timestamp += PACKET_DURATION_NS;
+    }
+  };
+  const auto summary = [&] {
+    ObsProperties properties(dpdfnet_filter_info.get_properties(filter.get()));
+    const char *text = obs_property_description(
+        obs_properties_get(properties, "status_summary"));
+    return std::string(text ? text : "");
+  };
+  const auto eventually = [](const auto &condition) {
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+      if (condition())
+        return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+  };
+  // Feeds audio until the status shows a pause, and returns the log index
+  // from before the trip.
+  const auto overload_until_paused = [&](const char *what) {
+    const size_t from = logs.size();
+    dpdfnet_test_extra_processing_ns = 30000000;
+    for (int batch = 0; batch < 40 && summary().rfind("Paused\n", 0) != 0;
+         ++batch)
+      feed(5);
+    require(summary().rfind("Paused\n", 0) == 0,
+            std::string(what) + ": overload did not pause processing");
+    dpdfnet_test_extra_processing_ns = 0;
+    return from;
+  };
+
+  feed(20);
+  require(summary().rfind("Active\n", 0) == 0,
+          "overload test did not start active");
+
+  // First trip, on the relaxed thresholds. A 1 s deadline leaves time to
+  // see the pause before the retry.
+  dpdfnet_test_retry_delay_divisor = 10;
+  const uint64_t updates_before = property_updates.load();
+  size_t from = overload_until_paused("first overload");
+  require(eventually([&] {
+            return logs.contains("sustained realtime overload", from) &&
+                   logs.contains("retrying in 10 s", from);
+          }),
+          "first overload was not logged with a 10 s retry");
+  require(eventually([&] { return property_updates.load() > updates_before; }),
+          "pause did not refresh an open properties window");
+  require(eventually([&] {
+            return logs.contains(
+                "retrying processing after realtime overload (attempt 1)",
+                from);
+          }),
+          "the first retry did not run");
+  require(summary().find("recovering after an overload") != std::string::npos,
+          "status did not show the retry probe");
+
+  // An overload during the probe pauses again with the next delay. Later
+  // deadlines stay at 100 ms or more, so a slow sanitizer build still sees
+  // each pause before its retry.
+  dpdfnet_test_retry_delay_divisor = 100;
+  from = overload_until_paused("probe overload");
+  require(eventually([&] {
+            return logs.contains("retrying in 30 s", from) &&
+                   logs.contains(
+                       "retrying processing after realtime overload "
+                       "(attempt 2)",
+                       from);
+          }),
+          "an overloaded probe did not pause and retry on the next delay");
+
+  // A probe that keeps up for 10 s of audio recovers.
+  from = logs.size();
+  feed(1100);
+  require(eventually([&] {
+            return logs.contains(
+                "processing recovered after realtime overload", from);
+          }),
+          "a probe that kept up did not recover");
+  const std::string recovered = summary();
+  require(recovered.rfind("Active\n", 0) == 0 &&
+              recovered.find("recovering after an overload") ==
+                  std::string::npos,
+          "status did not return to active after recovery");
+
+  // Recovery restarts the schedule at its first delay.
+  from = overload_until_paused("overload after recovery");
+  require(eventually([&] {
+            return logs.contains("retrying in 10 s", from) &&
+                   logs.contains(
+                       "retrying processing after realtime overload "
+                       "(attempt 1)",
+                       from);
+          }),
+          "recovery did not restart the retry schedule");
+}
+
 struct CaptureState {
   std::atomic<uint64_t> callbacks{0};
 };
@@ -1061,6 +1205,7 @@ int main(int argc, char **argv) {
     test_direct_callbacks(model.string(), log_probe);
     test_obs_lifecycle(model.string());
     test_failed_inference_counts_toward_load(argv[2], logs);
+    test_overload_retry_chain(argv[2], logs);
 
     obs_shutdown();
     std::cout << "[PASS] filter callback and OBS lifecycle integration\n";

@@ -258,6 +258,7 @@ if(DPDFNET_BUILD_TESTS)
   target_compile_definitions(obs-dpdfnet-filter-tests PRIVATE
     PLUGIN_NAME="obs-dpdfnet"
     PLUGIN_VERSION="${DPDFNET_PLUGIN_VERSION}"
+    DPDFNET_FILTER_TEST_HOOKS
     ${DPDFNET_PLATFORM_COMPILE_DEFINITIONS}
   )
   target_link_libraries(obs-dpdfnet-filter-tests PRIVATE

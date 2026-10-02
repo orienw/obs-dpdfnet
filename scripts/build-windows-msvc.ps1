@@ -505,7 +505,8 @@ Invoke-NativeExecutableBuild `
     ) + $DspSources) `
     -Libraries @($obsLib, $onnxRenamedLib) `
     -AdditionalCompileArguments @(
-        "/FI$(Join-Path $GeneratedObs 'plugin-version.h')"
+        "/FI$(Join-Path $GeneratedObs 'plugin-version.h')",
+        "/DDPDFNET_FILTER_TEST_HOOKS"
     )
 
 Invoke-NativeExecutableBuild `
