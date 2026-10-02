@@ -41,6 +41,27 @@ struct DenormalModeGuard {
 private:
   unsigned int mxcsr_;
 };
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+// FZ flushes denormal inputs and results to zero on AArch64. The memory
+// clobbers keep the audio buffers' loads and stores, and calls into the
+// model, between the two writes.
+constexpr uint64_t FPCR_FLUSH_ZERO = uint64_t{1} << 24;
+
+struct DenormalModeGuard {
+  DenormalModeGuard() {
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr_) : : "memory");
+    __asm__ __volatile__("msr fpcr, %0"
+                         :
+                         : "r"(fpcr_ | FPCR_FLUSH_ZERO)
+                         : "memory");
+  }
+  ~DenormalModeGuard() {
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr_) : "memory");
+  }
+
+private:
+  uint64_t fpcr_;
+};
 #else
 struct DenormalModeGuard {};
 #endif
