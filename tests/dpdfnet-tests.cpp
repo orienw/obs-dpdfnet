@@ -582,18 +582,33 @@ void test_channel_and_timestamp_resets(const std::string &model_path) {
                     backward_fresh.process(packet));
   }
 
+  require(transitioned.state().timestamp_discontinuities == 2,
+          "forward and backward timestamp jumps were not counted");
+
+  // OBS smooths deviations under 70 ms, so the processor resets at 70 ms.
   DpdfnetProcessor forward_jump = make_processor(model_path, 48000, 2);
   forward_jump.set_controls(right);
   packet.timestamp = NS_PER_SECOND;
   forward_jump.process(packet);
   DpdfnetProcessor forward_fresh = make_processor(model_path, 48000, 2);
   forward_fresh.set_controls(right);
-  constexpr uint64_t first_after_gap = NS_PER_SECOND + 20'000'000 + 51'000'000;
+  constexpr uint64_t first_after_gap = NS_PER_SECOND + 20'000'000 + 70'000'000;
   for (size_t index = 0; index < 4; ++index) {
     packet.timestamp = first_after_gap + index * 20'000'000;
-    compare_results(forward_jump.process(packet),
-                    forward_fresh.process(packet));
+    const auto result = forward_jump.process(packet);
+    require((result.event == DpdfnetEvent::TimestampDiscontinuity) ==
+                (index == 0),
+            "timestamp jump was not reported exactly once");
+    compare_results(result, forward_fresh.process(packet));
   }
+  packet.timestamp += 20'000'000 + 70'000'000;
+  require(forward_jump.process(packet).event == DpdfnetEvent::None,
+          "a later timestamp jump was reported again");
+  require(forward_jump.state().timestamp_discontinuities == 2,
+          "later timestamp jump was not counted");
+  forward_jump.reset_state();
+  require(forward_jump.state().timestamp_discontinuities == 0,
+          "reset did not clear the timestamp jump count");
 
   DpdfnetProcessor tolerated = make_processor(model_path, 48000, 2);
   tolerated.set_controls(right);
@@ -601,10 +616,16 @@ void test_channel_and_timestamp_resets(const std::string &model_path) {
     packet.timestamp = NS_PER_SECOND + index * 20'000'000;
     tolerated.process(packet);
   }
-  packet.timestamp = NS_PER_SECOND + 8 * 20'000'000 + 49'000'000;
+  packet.timestamp = NS_PER_SECOND + 8 * 20'000'000 + 69'000'000;
   require(tolerated.process(packet).disposition ==
               DpdfnetDisposition::Processed,
           "timestamp deviation below the tolerance reset the stream");
+  packet.timestamp = NS_PER_SECOND + 9 * 20'000'000;
+  require(tolerated.process(packet).disposition ==
+              DpdfnetDisposition::Processed,
+          "timestamp deviation below the tolerance reset the stream");
+  require(tolerated.state().timestamp_discontinuities == 0,
+          "tolerated timestamp deviation was counted as a jump");
 }
 
 void test_empty_resampler_replacement_is_noop(const std::string &model_path) {
@@ -1476,7 +1497,7 @@ void test_resampled_timestamp_refresh(const std::string &model_path,
   transitioned.process(packet);
 
   packet.data[0] = new_data.data();
-  packet.timestamp = NS_PER_SECOND + packet_ns + 51'000'000;
+  packet.timestamp = NS_PER_SECOND + packet_ns + 70'000'000;
   const auto discontinuity = transitioned.process(packet);
   require(discontinuity.event == DpdfnetEvent::ResamplerRefreshNeeded,
           "resampled timestamp jump did not request fresh resamplers");

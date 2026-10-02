@@ -374,11 +374,11 @@ DpdfnetModelBundle DpdfnetProcessor::replace_model(DpdfnetModelBundle bundle) {
   consecutive_failures_ = 0;
   oversized_packets_ = 0;
   capacity_failures_ = 0;
+  timestamp_discontinuities_ = 0;
   process_error_reported_ = false;
   last_error_.fill(0);
   recompute_path();
   recompute_latency();
-  last_timestamp_ = 0;
   expected_timestamp_ = 0;
   have_timestamp_ = false;
   output_packet_offset_ = 0;
@@ -463,6 +463,7 @@ void DpdfnetProcessor::reset_state() {
   consecutive_failures_ = 0;
   oversized_packets_ = 0;
   capacity_failures_ = 0;
+  timestamp_discontinuities_ = 0;
   process_error_reported_ = false;
   last_error_.fill(0);
   reset_audio_state();
@@ -487,7 +488,6 @@ void DpdfnetProcessor::reset_audio_state(bool reset_model) {
   realtime_.info_queue.clear();
   emitted_since_reset_ = false;
   output_packet_offset_ = 0;
-  last_timestamp_ = 0;
   expected_timestamp_ = 0;
   have_timestamp_ = false;
 
@@ -533,14 +533,10 @@ void DpdfnetProcessor::recompute_latency() {
 bool DpdfnetProcessor::timestamp_jump(uint64_t timestamp) const {
   if (!have_timestamp_)
     return false;
-  if (timestamp < last_timestamp_)
-    return true;
-  if (!expected_timestamp_)
-    return false;
   const uint64_t diff = timestamp > expected_timestamp_
                             ? timestamp - expected_timestamp_
                             : expected_timestamp_ - timestamp;
-  return diff > MAX_TIMESTAMP_DEVIATION_NS;
+  return diff >= MAX_TIMESTAMP_DEVIATION_NS;
 }
 
 size_t DpdfnetProcessor::to_model_frames(size_t native_frames) const {
@@ -948,7 +944,20 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
     return result;
   }
 
+  DpdfnetEvent discontinuity_event = DpdfnetEvent::None;
+  std::array<char, 256> discontinuity_message = {};
   if (timestamp_jump(audio.timestamp)) {
+    if (timestamp_discontinuities_ == 0) {
+      const uint64_t moved_ns = audio.timestamp > expected_timestamp_
+                                    ? audio.timestamp - expected_timestamp_
+                                    : expected_timestamp_ - audio.timestamp;
+      discontinuity_event = DpdfnetEvent::TimestampDiscontinuity;
+      std::snprintf(discontinuity_message.data(), discontinuity_message.size(),
+                    "audio timestamps moved %.1f ms from the expected time",
+                    moved_ns / 1e6);
+    }
+    if (timestamp_discontinuities_ != std::numeric_limits<uint64_t>::max())
+      ++timestamp_discontinuities_;
     const bool needs_fresh_resamplers = resample_path_;
     if (needs_fresh_resamplers)
       resamplers_valid_ = false;
@@ -963,7 +972,6 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
       return result;
     }
   }
-  last_timestamp_ = audio.timestamp;
   have_timestamp_ = true;
   expected_timestamp_ =
       audio.timestamp +
@@ -1000,6 +1008,11 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
 
   DpdfnetProcessResult output = pop_output_packet(processed_hops);
   output.inference_hops = inference_hops;
+  if (output.event == DpdfnetEvent::None &&
+      discontinuity_event != DpdfnetEvent::None) {
+    output.event = discontinuity_event;
+    output.message = discontinuity_message;
+  }
   return output;
 }
 
@@ -1017,6 +1030,7 @@ DpdfnetProcessorState DpdfnetProcessor::state() const {
   result.consecutive_failures = consecutive_failures_;
   result.oversized_packets = oversized_packets_;
   result.capacity_failures = capacity_failures_;
+  result.timestamp_discontinuities = timestamp_discontinuities_;
   result.last_error = last_error_;
   if (model_) {
     result.model_rate = model_->sample_rate();
@@ -1049,6 +1063,7 @@ make_dpdfnet_snapshot(const DpdfnetProcessorState &state,
   result.consecutive_failures = state.consecutive_failures;
   result.oversized_packets = state.oversized_packets;
   result.capacity_failures = state.capacity_failures;
+  result.timestamp_discontinuities = state.timestamp_discontinuities;
   result.last_error = state.last_error.data();
   if (model) {
     result.model_path = model->path().u8string();

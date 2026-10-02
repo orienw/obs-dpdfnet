@@ -128,6 +128,7 @@ enum class DpdfnetEvent {
   CapacityInvariantFailure,
   RealtimeOverloadCircuitOpened,
   RealtimeOverloadRecovered,
+  TimestampDiscontinuity,
   Count
 };
 
@@ -165,6 +166,7 @@ struct DpdfnetProcessorSnapshot {
   unsigned consecutive_failures = 0;
   uint64_t oversized_packets = 0;
   uint64_t capacity_failures = 0;
+  uint64_t timestamp_discontinuities = 0;
   std::string model_path;
   std::string model_name;
   std::string last_error;
@@ -186,6 +188,7 @@ struct DpdfnetProcessorState {
   unsigned consecutive_failures = 0;
   uint64_t oversized_packets = 0;
   uint64_t capacity_failures = 0;
+  uint64_t timestamp_discontinuities = 0;
   std::array<char, 256> last_error = {};
 };
 
@@ -222,7 +225,10 @@ private:
       DPDFNET_MAX_REALTIME_PACKET_FRAMES;
   static constexpr unsigned MAX_CONSECUTIVE_FAILURES = 3;
   static constexpr uint64_t NS_PER_SECOND = 1000000000ULL;
-  static constexpr uint64_t MAX_TIMESTAMP_DEVIATION_NS = 50000000ULL;
+  // OBS smooths audio timestamps that deviate by less than this
+  // (TS_SMOOTHING_THRESHOLD), but only after filters have run, so the filter
+  // treats the same deviations as continuous audio.
+  static constexpr uint64_t MAX_TIMESTAMP_DEVIATION_NS = 70000000ULL;
 
   void reset_audio_state(bool reset_model = true);
   void recompute_mix();
@@ -249,7 +255,6 @@ private:
   uint32_t sample_rate_ = 0;
   size_t channels_ = 0;
   size_t lfe_channel_ = DPDFNET_MAX_AUDIO_PLANES;
-  uint64_t last_timestamp_ = 0;
   uint64_t expected_timestamp_ = 0;
   bool have_timestamp_ = false;
   uint64_t output_latency_ns_ = 0;
@@ -272,6 +277,7 @@ private:
   unsigned consecutive_failures_ = 0;
   uint64_t oversized_packets_ = 0;
   uint64_t capacity_failures_ = 0;
+  uint64_t timestamp_discontinuities_ = 0;
   std::array<char, 256> last_error_ = {};
 
   DpdfnetControls controls_;

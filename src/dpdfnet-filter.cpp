@@ -889,6 +889,10 @@ public:
     }
     if (snapshot.capacity_recovery_pending)
       text << "\nRecovery: pending";
+    if (snapshot.timestamp_discontinuities) {
+      text << "\nAudio timestamp jumps: " << snapshot.timestamp_discontinuities
+           << " since the last reset, each one restarted processing";
+    }
     if (timing.callbacks) {
       text << "\nWorst callback: " << ms(timing.total_max_ns) << " ms, "
            << timing.missed_deadlines << " of " << timing.callbacks
@@ -1043,6 +1047,11 @@ private:
     } else if (diagnostic.event == DpdfnetEvent::RealtimeOverloadRecovered) {
       blog(LOG_INFO,
            "[obs-dpdfnet] processing recovered after realtime overload");
+    } else if (diagnostic.event == DpdfnetEvent::TimestampDiscontinuity) {
+      blog(LOG_INFO,
+           "[obs-dpdfnet] %s; buffered audio was dropped and processing "
+           "restarted. Later jumps are counted in the details",
+           diagnostic.message.data());
     }
   }
 

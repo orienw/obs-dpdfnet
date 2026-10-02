@@ -82,8 +82,11 @@ The `Status` line says what the filter is doing and what the listener hears.
 for the current run: the active model, native or resampled operation, frame
 and hop sizes, and callback timing. Timing restarts on model, format,
 resampler, and reset changes; passthrough callbacks are not counted.
-Oversized-packet and buffer-capacity counts persist until a reset or model
-change. These are processing measurements, not end-to-end microphone latency.
+Oversized-packet, buffer-capacity, and timestamp-jump counts persist until a
+reset or model change. A timestamp jump is audio arriving 70 ms or more away
+from where the previous packet ended, the point past which OBS stops smoothing
+timestamps; the filter drops its buffered audio and starts over. These are
+processing measurements, not end-to-end microphone latency.
 Press `Refresh` to update them.
 
 ## Build From Source On Windows
