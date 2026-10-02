@@ -20,46 +20,48 @@ $DataDir = Join-Path $PluginRoot "data"
 
 New-Item -ItemType Directory -Force -Path $BinDir, $DataDir | Out-Null
 
-$Dll = Get-ChildItem -Path $BuildPath -Recurse -Filter "obs-dpdfnet.dll" |
-    Where-Object { $_.FullName -match "\\$Configuration\\" -or $_.DirectoryName -match "\\$Configuration$" } |
-    Select-Object -First 1
-
-if (!$Dll) {
-    throw "Could not find obs-dpdfnet.dll under $BuildPath. Build the Release configuration first."
+# The MSVC script and CMake's Visual Studio generator put the plugin in
+# <BuildDir>\<Configuration>; single-config CMake generators put it in
+# <BuildDir>. Anything else must be unambiguous.
+$Candidates = @(
+    (Join-Path $BuildPath "$Configuration\obs-dpdfnet.dll"),
+    (Join-Path $BuildPath "obs-dpdfnet.dll")
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+if ($Candidates.Count -eq 0) {
+    $Candidates = @(Get-ChildItem -Path $BuildPath -Recurse -Filter "obs-dpdfnet.dll" |
+        Where-Object { $_.DirectoryName -match "\\$Configuration$" } |
+        ForEach-Object { $_.FullName })
+    if ($Candidates.Count -gt 1) {
+        throw "Found several $Configuration builds of obs-dpdfnet.dll under $BuildPath. Pass -BuildDir for the one to install:`n$($Candidates -join "`n")"
+    }
 }
+if ($Candidates.Count -eq 0) {
+    throw "Could not find obs-dpdfnet.dll under $BuildPath. Build the $Configuration configuration first."
+}
+$Dll = Get-Item -LiteralPath @($Candidates)[0]
+$PluginBuildDir = $Dll.DirectoryName
 
 Copy-Item $Dll.FullName -Destination $BinDir -Force
 
-function Get-BuildArtifact {
-    param([Parameter(Mandatory = $true)][string]$Filter)
-
-    Get-ChildItem -Path $BuildPath -Recurse -Filter $Filter |
-        Where-Object { $_.FullName -match "\\$Configuration\\" -or $_.DirectoryName -match "\\$Configuration$" } |
-        Select-Object -First 1
-}
-
-$RenamedOrtDll = Get-BuildArtifact -Filter "onnxruntime_dpdfnet.dll"
-$OrtDll = Get-BuildArtifact -Filter "onnxruntime.dll"
-$ThirdPartyOrtDll = Join-Path $Root "third_party\onnxruntime\lib\onnxruntime.dll"
-
-Remove-Item (Join-Path $BinDir "onnxruntime.dll") -Force -ErrorAction SilentlyContinue
-
-if ($RenamedOrtDll) {
-    Copy-Item $RenamedOrtDll.FullName -Destination $BinDir -Force
-} elseif ($OrtDll) {
-    Copy-Item $OrtDll.FullName -Destination $BinDir -Force
-} elseif (Test-Path $ThirdPartyOrtDll) {
-    Copy-Item $ThirdPartyOrtDll -Destination $BinDir -Force
+# ONNX Runtime comes from the plugin's own build directory, under the name
+# that build links: the MSVC script renames it onnxruntime_dpdfnet.dll, a
+# CMake build keeps onnxruntime.dll. The other name is removed, so an
+# earlier install cannot leave a mismatched copy behind.
+$RenamedOrtDll = Join-Path $PluginBuildDir "onnxruntime_dpdfnet.dll"
+$OrtDll = Join-Path $PluginBuildDir "onnxruntime.dll"
+if (Test-Path -LiteralPath $RenamedOrtDll -PathType Leaf) {
+    Remove-Item (Join-Path $BinDir "onnxruntime.dll") -Force -ErrorAction SilentlyContinue
+    Copy-Item $RenamedOrtDll -Destination $BinDir -Force
+} elseif (Test-Path -LiteralPath $OrtDll -PathType Leaf) {
+    Remove-Item (Join-Path $BinDir "onnxruntime_dpdfnet.dll") -Force -ErrorAction SilentlyContinue
+    Copy-Item $OrtDll -Destination $BinDir -Force
 } else {
-    Write-Warning "ONNX Runtime DLL was not found under $BuildPath or third_party\onnxruntime. The plugin will not load without it."
+    throw "ONNX Runtime was not found next to $($Dll.FullName). Rebuild; the plugin does not load without it."
 }
 
-$OrtProvidersDll = Get-BuildArtifact -Filter "onnxruntime_providers_shared.dll"
-$ThirdPartyOrtProvidersDll = Join-Path $Root "third_party\onnxruntime\lib\onnxruntime_providers_shared.dll"
-if ($OrtProvidersDll) {
-    Copy-Item $OrtProvidersDll.FullName -Destination $BinDir -Force
-} elseif (Test-Path $ThirdPartyOrtProvidersDll) {
-    Copy-Item $ThirdPartyOrtProvidersDll -Destination $BinDir -Force
+$OrtProvidersDll = Join-Path $PluginBuildDir "onnxruntime_providers_shared.dll"
+if (Test-Path -LiteralPath $OrtProvidersDll -PathType Leaf) {
+    Copy-Item $OrtProvidersDll -Destination $BinDir -Force
 }
 
 Copy-Item (Join-Path $Root "data\*") -Destination $DataDir -Recurse -Force
