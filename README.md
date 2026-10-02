@@ -12,7 +12,7 @@ builds from source with CMake.
 
 ## Install A Release Build
 
-Requirements: Windows 10/11 64-bit and OBS Studio 32.2.1 or later, x64.
+Requirements: Windows 10/11 64-bit and OBS Studio 32.0 or later, x64.
 
 Download the zip from
 [GitHub releases](https://github.com/orienw/obs-dpdfnet/releases). The binary

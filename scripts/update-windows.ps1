@@ -19,7 +19,7 @@ $ErrorActionPreference = "Stop"
 if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $DpdfnetDefaultOnnxRuntimeVersion }
 if ([string]::IsNullOrWhiteSpace($DefaultModelName)) { $DefaultModelName = $DpdfnetDefaultModelName }
 if ($ModelNames.Count -eq 0) { $ModelNames = $DpdfnetDefaultModelNames }
-if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetDefaultObsVersion }
+if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetMinimumObsVersion }
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ThirdParty = Join-Path $Root "third_party"

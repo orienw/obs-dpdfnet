@@ -121,7 +121,7 @@ foreach ($Property in @(
 if ($BuildProvenance.schemaVersion -ne 2 -or
     $BuildProvenance.sourceCommit -notmatch '^[0-9a-fA-F]{40,64}$' -or
     $BuildProvenance.sourceDirty -isnot [bool] -or
-    $BuildProvenance.obsRuntimeProductVersion -cne $BuildProvenance.obsVersion -or
+    $BuildProvenance.obsRuntimeProductVersion -notmatch '^\d+\.\d+' -or
     $BuildProvenance.onnxRuntimeReportedVersion -cne $BuildProvenance.onnxRuntimeVersion -or
     $BuildProvenance.obsRuntimeSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
     $BuildProvenance.obsSourceArchiveSha256 -notmatch '^[0-9a-fA-F]{64}$' -or

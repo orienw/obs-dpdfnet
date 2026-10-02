@@ -42,7 +42,7 @@ function Assert-NoReparsePoints {
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetDefaultObsVersion }
+if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetMinimumObsVersion }
 if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $DpdfnetDefaultOnnxRuntimeVersion }
 
 if ($Version -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
@@ -53,6 +53,9 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
 if ($Version -cne $DpdfnetDefaultPluginVersion) {
     throw "Version '$Version' does not match '$DpdfnetDefaultPluginVersion' in VERSION. Bump VERSION first."
 }
+
+# OBS compares only major.minor, so the zip runs on this OBS or any later one.
+$ObsMajorMinor = (($ObsVersion -split '\.')[0..1]) -join '.'
 
 $PinnedObsArchiveHash = $DpdfnetKnownObsArchiveHashes[$ObsVersion]
 $PinnedOrtArchiveHash = $DpdfnetKnownOnnxRuntimeHashes[$OnnxRuntimeVersion]
@@ -207,7 +210,7 @@ obs-dpdfnet $Version - Windows x64
 DPDFNet local speech-enhancement audio filter for OBS Studio.
 
 REQUIREMENTS
-- OBS Studio $ObsVersion (x64), Windows 10/11 64-bit
+- OBS Studio $ObsMajorMinor or later (x64), Windows 10/11 64-bit
 - OBS audio sample rate: 48 kHz preferred; 44.1 kHz is supported through internal resampling
 
 INSTALL
@@ -245,7 +248,7 @@ $ReadmeInstallUrl = "https://github.com/$Repo#install-a-release-build"
 $Notes = @"
 ## Install
 
-Built against **OBS Studio $ObsVersion** and **ONNX Runtime $OnnxRuntimeVersion**.
+Needs **OBS Studio $ObsMajorMinor or later**. Bundles ONNX Runtime $OnnxRuntimeVersion.
 
 Install instructions: $ReadmeInstallUrl
 "@

@@ -3,6 +3,8 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$ObsInstallDir = "C:\Program Files\obs-studio",
+    # The OBS the plugin was built against, to check that it loads there too.
+    [string]$MinimumObsInstallDir = "",
     [string]$Configuration = "Release",
     [switch]$RequireCleanProvenance
 )
@@ -55,7 +57,7 @@ function Read-BuildProvenance {
         $Provenance.onnxRuntimeVersion -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
         throw "Build provenance contains invalid version metadata."
     }
-    if ($Provenance.obsRuntimeProductVersion -cne $Provenance.obsVersion -or
+    if ($Provenance.obsRuntimeProductVersion -notmatch '^\d+\.\d+' -or
         $Provenance.onnxRuntimeReportedVersion -cne $Provenance.onnxRuntimeVersion -or
         $Provenance.obsRuntimeSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
         $Provenance.obsSourceArchiveSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
@@ -174,7 +176,8 @@ if ($ObsRuntimeProductVersion -cne $Provenance.obsRuntimeProductVersion -or
     $ObsRuntimeSha256 -cne $Provenance.obsRuntimeSha256.ToLowerInvariant()) {
     throw "Selected OBS runtime does not match the runtime recorded by the build. Rebuild against this OBS installation."
 }
-$env:PATH = "$OutputDir;$ObsBin;$env:PATH"
+$BasePath = $env:PATH
+$env:PATH = "$OutputDir;$ObsBin;$BasePath"
 
 $ManifestPath = Join-Path $Root "models\manifest.json"
 $Manifest = Get-Content -Raw $ManifestPath | ConvertFrom-Json
@@ -242,19 +245,45 @@ Write-Host "Running dpdfnet-module-test"
     (Join-Path $ModuleTestPlugin "data")
 if ($LASTEXITCODE -ne 0) { throw "dpdfnet-module-test failed with exit code $LASTEXITCODE" }
 
+# OBS refuses a plugin built against a newer OBS than itself, so loading the
+# plugin into the OBS it was built against proves the oldest one it supports.
+# That OBS's bin comes first on PATH, so the test and plugin load its DLLs.
+$MinimumObsRecord = @()
+if ($MinimumObsInstallDir) {
+    $MinimumObsBin = Join-Path $MinimumObsInstallDir "bin\64bit"
+    $MinimumObsDll = Join-Path $MinimumObsBin "obs.dll"
+    if (!(Test-Path $MinimumObsDll -PathType Leaf)) {
+        throw "Minimum OBS runtime not found under $MinimumObsBin"
+    }
+    $MinimumObsVersion = (Get-Item -LiteralPath $MinimumObsDll).VersionInfo.ProductVersion.Trim()
+    if ($MinimumObsVersion -cne $Provenance.obsVersion) {
+        throw "The minimum OBS runtime is $MinimumObsVersion, but the plugin was built against OBS $($Provenance.obsVersion)."
+    }
+    $env:PATH = "$OutputDir;$MinimumObsBin;$BasePath"
+    Write-Host "Running dpdfnet-module-test on OBS $MinimumObsVersion"
+    & $ModuleTestExecutable `
+        (Join-Path $ModuleTestPlugin "bin\64bit\obs-dpdfnet.dll") `
+        (Join-Path $ModuleTestPlugin "data")
+    if ($LASTEXITCODE -ne 0) {
+        throw "dpdfnet-module-test failed on OBS $MinimumObsVersion with exit code $LASTEXITCODE"
+    }
+    $env:PATH = "$OutputDir;$ObsBin;$BasePath"
+    $MinimumObsRecord = @("obs_minimum_runtime_version=$MinimumObsVersion")
+}
+
 @(
     "source_commit=$BuiltCommit",
     "source_dirty=$($Provenance.sourceDirty.ToString().ToLowerInvariant())",
     "plugin_version=$($Provenance.pluginVersion)",
     "obs_version=$($Provenance.obsVersion)",
     "obs_source_archive_sha256=$($Provenance.obsSourceArchiveSha256)",
+    "obs_runtime_version=$($Provenance.obsRuntimeProductVersion)",
     "obs_runtime_sha256=$($Provenance.obsRuntimeSha256)",
     "onnxruntime_version=$($Provenance.onnxRuntimeVersion)",
     "onnxruntime_reported_version=$($Provenance.onnxRuntimeReportedVersion)",
     "onnxruntime_archive_sha256=$($Provenance.onnxRuntimeArchiveSha256)",
     "configuration=$($Provenance.configuration)",
     "architecture=$($Provenance.architecture)",
-    "models=$($DpdfnetDefaultModelNames -join ',')",
-    "status=passed"
-) | Set-Content -Encoding ASCII $PassedFile
+    "models=$($DpdfnetDefaultModelNames -join ',')"
+) + $MinimumObsRecord + @("status=passed") | Set-Content -Encoding ASCII $PassedFile
 Write-Host "Windows test gate passed: $PassedFile"

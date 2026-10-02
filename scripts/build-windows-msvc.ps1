@@ -13,7 +13,7 @@ $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "dependency-versions.ps1")
 
-if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetDefaultObsVersion }
+if ([string]::IsNullOrWhiteSpace($ObsVersion)) { $ObsVersion = $DpdfnetMinimumObsVersion }
 if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $DpdfnetDefaultOnnxRuntimeVersion }
 if ([string]::IsNullOrWhiteSpace($ModelName)) { $ModelName = $DpdfnetDefaultModelName }
 if ([string]::IsNullOrWhiteSpace($PluginVersion)) { $PluginVersion = $DpdfnetDefaultPluginVersion }
@@ -345,9 +345,19 @@ $obsDll = Join-Path $ObsInstallDir "bin\64bit\obs.dll"
 if (!(Test-Path $obsDll)) {
     throw "Could not find installed OBS DLL at $obsDll"
 }
+# The headers come from $ObsVersion and the import library from the installed
+# OBS. OBS compares only major.minor, and refuses a plugin built against a
+# newer one than itself, so the installed OBS must be at least as new.
 $ObsRuntimeProductVersion = (Get-Item -LiteralPath $obsDll).VersionInfo.ProductVersion.Trim()
-if ($ObsRuntimeProductVersion -cne $ObsVersion) {
-    throw "Installed OBS runtime is version '$ObsRuntimeProductVersion', but this build requests OBS $ObsVersion."
+if ($ObsRuntimeProductVersion -notmatch '^(\d+)\.(\d+)') {
+    throw "Installed OBS runtime reports an unrecognised version '$ObsRuntimeProductVersion'."
+}
+$ObsRuntimeApi = [version]"$($Matches[1]).$($Matches[2])"
+if ($ObsVersion -notmatch '^(\d+)\.(\d+)') {
+    throw "OBS version '$ObsVersion' must start with major.minor, such as 32.0.0."
+}
+if ($ObsRuntimeApi -lt [version]"$($Matches[1]).$($Matches[2])") {
+    throw "Installed OBS $ObsRuntimeProductVersion is older than OBS $ObsVersion, which this build targets, and would refuse the plugin."
 }
 $ObsRuntimeSha256 = Get-Sha256 -Path $obsDll
 

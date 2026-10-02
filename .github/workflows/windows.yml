@@ -16,32 +16,41 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Download OBS runtime
+      # The tests run on the current OBS, and the module test also loads the
+      # plugin into the oldest OBS it supports, the one it is built against.
+      - name: Download OBS runtimes
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           . ./scripts/dependency-versions.ps1
-          $version = $DpdfnetDefaultObsVersion
-          $expected = $DpdfnetKnownObsRuntimeHashes[$version]
-          if (!$expected) { throw "No pinned hash for the OBS $version runtime" }
-          $zip = "build/obs-runtime/OBS-Studio-$version-Windows-x64.zip"
-          New-Item -ItemType Directory -Force build/obs-runtime | Out-Null
-          gh release download $version `
-            --repo obsproject/obs-studio `
-            --pattern "OBS-Studio-$version-Windows-x64.zip" `
-            --dir build/obs-runtime
-          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) {
-            throw "OBS runtime hash mismatch: expected $expected, got $actual"
+          $runtimes = [ordered]@{
+            OBS_INSTALL_DIR = $DpdfnetCurrentObsVersion
+            OBS_MINIMUM_INSTALL_DIR = $DpdfnetMinimumObsVersion
           }
-          Expand-Archive $zip build/obs-runtime/extracted
-          $obsDll = Get-ChildItem build/obs-runtime/extracted -Recurse `
-            -Filter obs.dll | Where-Object { $_.FullName -match 'bin\\64bit\\obs\.dll$' } |
-            Select-Object -First 1
-          if (!$obsDll) { throw "Downloaded OBS archive contains no x64 obs.dll" }
-          $obsRoot = Split-Path (Split-Path (Split-Path $obsDll.FullName))
-          "OBS_INSTALL_DIR=$obsRoot" | Out-File $env:GITHUB_ENV -Append
+          New-Item -ItemType Directory -Force build/obs-runtime | Out-Null
+          foreach ($variable in $runtimes.Keys) {
+            $version = $runtimes[$variable]
+            $expected = $DpdfnetKnownObsRuntimeHashes[$version]
+            if (!$expected) { throw "No pinned hash for the OBS $version runtime" }
+            $zip = "build/obs-runtime/OBS-Studio-$version-Windows-x64.zip"
+            gh release download $version `
+              --repo obsproject/obs-studio `
+              --pattern "OBS-Studio-$version-Windows-x64.zip" `
+              --dir build/obs-runtime
+            if ($LASTEXITCODE -ne 0) { throw "Could not download the OBS $version runtime" }
+            $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) {
+              throw "OBS $version runtime hash mismatch: expected $expected, got $actual"
+            }
+            Expand-Archive $zip "build/obs-runtime/$version"
+            $obsDll = Get-ChildItem "build/obs-runtime/$version" -Recurse `
+              -Filter obs.dll | Where-Object { $_.FullName -match 'bin\\64bit\\obs\.dll$' } |
+              Select-Object -First 1
+            if (!$obsDll) { throw "The OBS $version archive contains no x64 obs.dll" }
+            $obsRoot = Split-Path (Split-Path (Split-Path $obsDll.FullName))
+            "$variable=$obsRoot" | Out-File $env:GITHUB_ENV -Append
+          }
 
       - name: Verify generated model fixtures
         shell: pwsh
@@ -72,6 +81,7 @@ jobs:
         run: |
           ./scripts/test-windows.ps1 `
             -ObsInstallDir $env:OBS_INSTALL_DIR `
+            -MinimumObsInstallDir $env:OBS_MINIMUM_INSTALL_DIR `
             -RequireCleanProvenance
 
       - name: Benchmark
