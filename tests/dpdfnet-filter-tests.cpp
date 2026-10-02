@@ -1053,6 +1053,69 @@ void test_overload_retry_chain(const std::filesystem::path &fixtures,
           "recovery did not restart the retry schedule");
 }
 
+// Timestamp jumps on the resampled path rebuild the resamplers each time,
+// but the status stays the same, so an open properties window must not be
+// rebuilt under the user for each one.
+void test_jumps_do_not_rebuild_properties(const std::filesystem::path &fixtures,
+                                          const LogCapture &logs) {
+  constexpr uint32_t rate = 44100;
+  reset_audio(SPEAKERS_STEREO, rate);
+  struct RestoreAudio {
+    ~RestoreAudio() { reset_audio(SPEAKERS_STEREO); }
+  } restore_audio;
+
+  ObsData settings;
+  configure_custom_model(settings,
+                         (fixtures / "valid_identity.onnx").string());
+  ObsSource source(
+      obs_source_create_private(TEST_SOURCE_ID, "jump owner", settings));
+  std::atomic<uint64_t> property_updates{0};
+  signal_handler_t *signals = obs_source_get_signal_handler(source);
+  signal_handler_connect(signals, "update_properties", count_property_update,
+                         &property_updates);
+  struct Disconnect {
+    signal_handler_t *signals;
+    std::atomic<uint64_t> *counter;
+    ~Disconnect() {
+      signal_handler_disconnect(signals, "update_properties",
+                                count_property_update, counter);
+    }
+  } disconnect{signals, &property_updates};
+  DirectFilter filter(settings, source);
+
+  PacketStorage storage;
+  const uint64_t packet_ns = static_cast<uint64_t>(
+      static_cast<double>(PACKET_FRAMES) / rate * 1e9);
+  uint64_t timestamp = 1000000000ULL;
+  const auto feed = [&](size_t packets) {
+    for (size_t packet = 0; packet < packets; ++packet) {
+      struct obs_audio_data input = storage.direct_packet(timestamp);
+      (void)dpdfnet_filter_info.filter_audio(filter.get(), &input);
+      timestamp += packet_ns;
+    }
+  };
+
+  feed(20);
+  for (int jump = 0; jump < 3; ++jump) {
+    const size_t from = logs.size();
+    timestamp += 200000000ULL;
+    feed(1);
+    bool rebuilt = false;
+    for (int attempt = 0; attempt < 1000 && !rebuilt; ++attempt) {
+      rebuilt = logs.contains("activated fresh", from);
+      if (!rebuilt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    require(rebuilt, "a resampled timestamp jump did not rebuild the "
+                     "resamplers");
+    feed(20);
+  }
+  // The first event may refresh once: the worker has not seen a status yet.
+  require(property_updates.load() <= 1,
+          "timestamp jumps rebuilt the properties window although the "
+          "status did not change");
+}
+
 struct CaptureState {
   std::atomic<uint64_t> callbacks{0};
 };
@@ -1225,6 +1288,7 @@ int main(int argc, char **argv) {
     test_obs_lifecycle(model.string());
     test_failed_inference_counts_toward_load(argv[2], logs);
     test_overload_retry_chain(argv[2], logs);
+    test_jumps_do_not_rebuild_properties(argv[2], logs);
 
     obs_shutdown();
     std::cout << "[PASS] filter callback and OBS lifecycle integration\n";

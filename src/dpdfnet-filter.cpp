@@ -1124,12 +1124,31 @@ private:
         rebuild_resamplers_after_discontinuity();
       if (retry_overload)
         retry_after_overload();
-      // An open properties window rebuilds, so the status line follows a
-      // pause, retry, or failure without pressing Refresh.
       if (status_changed)
-        obs_source_update_properties(source_);
+        refresh_properties_if_status_changed();
       request_lock.lock();
     }
+  }
+
+  // Rebuilds an open properties window so the status line follows a pause,
+  // retry, or failure without pressing Refresh. Rebuilding drops a slider
+  // drag or a path being typed, so it happens only when the state shown
+  // changes; the load figure and the retry countdown do not count. Worker
+  // thread only.
+  void refresh_properties_if_status_changed() {
+    const FilterStatus now = status();
+    std::string key;
+    key.reserve(now.summary.size() + 2);
+    for (const char c : now.summary) {
+      if (c < '0' || c > '9')
+        key += c;
+    }
+    key += '\n';
+    key += static_cast<char>('0' + static_cast<int>(now.severity));
+    if (key == shown_status_key_)
+      return;
+    shown_status_key_ = std::move(key);
+    obs_source_update_properties(source_);
   }
 
   void rebuild_resamplers_after_discontinuity() {
@@ -1230,6 +1249,7 @@ private:
   std::array<CallbackDiagnostic, static_cast<size_t>(DpdfnetEvent::Count) - 1>
       callback_diagnostics_ = {};
   bool stop_resampler_worker_ = false;
+  std::string shown_status_key_;
   std::thread resampler_worker_;
 };
 
