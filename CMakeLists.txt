@@ -436,7 +436,7 @@ install(DIRECTORY LICENSES
   DESTINATION "${DPDFNET_DATA_DESTINATION}"
 )
 
-# On Windows and macOS this ships ONNX Runtime under its stock name. Unlike the
+# Outside Linux this ships ONNX Runtime under its stock name. Unlike the
 # PowerShell release path, it does not rename onnxruntime.dll, so a
 # CMake-installed plugin can collide with another ONNX-based OBS plugin's
 # onnxruntime.dll in the shared obs-plugins/64bit directory. Fine for isolated

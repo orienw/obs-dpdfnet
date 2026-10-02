@@ -12,7 +12,7 @@ builds from source with CMake.
 
 ## Install A Release Build
 
-Requirements: Windows 10/11 64-bit and OBS Studio x64.
+Requirements: Windows 10/11 64-bit and OBS Studio 32.2.1 or later, x64.
 
 Download the zip and its `.sha256` file from
 [GitHub releases](https://github.com/orienw/obs-dpdfnet/releases). The binary
@@ -106,10 +106,10 @@ afterwards.
 
 ## CMake Build
 
-CMake is the manual path for contributors, custom OBS builds, Linux, and
-macOS. It needs CMake 3.24+, a C++17 compiler, OBS Studio development
-files with `libobsConfig.cmake`, and an ONNX Runtime package. KissFFT is
-fetched at configure time unless `DPDFNET_FETCH_KISSFFT` is off.
+CMake is the manual path for contributors, custom OBS builds, and Linux. It
+needs CMake 3.24+, a C++17 compiler, OBS Studio 30 or later development files
+with `libobsConfig.cmake`, and an ONNX Runtime package. KissFFT is fetched at
+configure time unless `DPDFNET_FETCH_KISSFFT` is off.
 
 Windows:
 
@@ -122,7 +122,7 @@ cmake --build build --config Release
 .\scripts\install-windows.ps1 -BuildDir .\build
 ```
 
-Linux/macOS, installing into the OBS user plugin folder:
+Linux, installing into the OBS user plugin folder:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -143,12 +143,17 @@ are copied next to built targets and installed with the plugin unless
 `DPDFNET_COPY_RUNTIME_DEPENDENCIES` or `DPDFNET_INSTALL_RUNTIME_DEPENDENCIES`
 is off. On Linux, install `patchelf` before configuring: the build uses it to
 install ONNX Runtime as `libonnxruntime_dpdfnet.so`, so it cannot clash with
-another OBS plugin's copy.
+another OBS plugin's copy. On Windows, a CMake install keeps the stock
+`onnxruntime.dll` name, which can clash; share builds made with the PowerShell
+scripts, which rename it.
 
-`DPDFNET_BUILD_TESTS` registers the processor, model contract, and libobs
-filter lifecycle tests with CTest. `DPDFNET_BUILD_MODEL_SMOKE`,
-`DPDFNET_BUILD_STREAM_DUMP`, `DPDFNET_BUILD_PROCESSOR_BENCHMARK`, and
-`DPDFNET_BUILD_QUALITY_BENCHMARK` build the standalone tools.
+`DPDFNET_BUILD_TESTS` registers the processor, model contract, libobs filter
+lifecycle, and installed-plugin tests with CTest. The installed-plugin test
+installs into the build tree and loads that copy the way OBS does.
+`DPDFNET_BUILD_MODEL_SMOKE`, `DPDFNET_BUILD_STREAM_DUMP`,
+`DPDFNET_BUILD_PROCESSOR_BENCHMARK`, and `DPDFNET_BUILD_QUALITY_BENCHMARK` build
+the standalone tools. `DPDFNET_WARNINGS_AS_ERRORS` makes compiler warnings in
+this project's own code fatal, as Linux CI does.
 
 ## Tests And Benchmarks
 
@@ -160,8 +165,9 @@ The Windows gate builds the plugin and tools and runs every test:
 ```
 
 It covers both bundled models, malformed model contracts, variable packet
-sizes, resampling, bypass transitions, the failure circuit breakers, and the
-filter lifecycle against real libobs.
+sizes, resampling, bypass transitions, timestamp jumps, the failure circuit
+breakers, the realtime overload pause and retry, the filter lifecycle against
+real libobs, and loading the installed plugin the way OBS does.
 
 Processor timing for both models at 44.1, 48, and 96 kHz:
 
