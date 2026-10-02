@@ -86,6 +86,7 @@ zip_path="$root/build/$zip_name"
 sha_path="$zip_path.sha256"
 notes_path="$root/build/release-notes-v$version.md"
 commit_path="$root/build/release-commit-v$version.txt"
+tests_path="$root/build/msvc/Release/tests-passed.txt"
 
 command -v git >/dev/null || die "git is required"
 command -v gh >/dev/null || die "GitHub CLI is required"
@@ -94,6 +95,7 @@ command -v gh >/dev/null || die "GitHub CLI is required"
 [[ -f "$sha_path" ]] || die "missing checksum file: $sha_path"
 [[ -f "$notes_path" ]] || die "missing release notes: $notes_path"
 [[ -f "$commit_path" ]] || die "missing release commit file: $commit_path"
+[[ -f "$tests_path" ]] || die "missing test gate record: $tests_path"
 
 expected_sha="$(awk '{print $1; exit}' "$sha_path")"
 actual_sha="$(sha256sum "$zip_path" | awk '{print $1}')"
@@ -118,13 +120,16 @@ remote_sha="$(git -C "$root" rev-parse "origin/$branch")"
 [[ "$head_sha" == "$remote_sha" ]] ||
   die "HEAD ($head_sha) is not pushed to origin/$branch ($remote_sha)"
 
-if git -C "$root" rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-  die "local tag $tag already exists"
-fi
-
-if [[ -n "$(git -C "$root" ls-remote --tags origin "refs/tags/$tag")" ]]; then
-  die "remote tag $tag already exists"
-fi
+# The Windows test gate must have passed on this exact commit and version.
+tests_value() { sed -n "s/^$1=//p" "$tests_path" | tr -d '\r'; }
+[[ "$(tests_value status)" == "passed" ]] ||
+  die "the test gate record does not say passed: $tests_path"
+[[ "$(tests_value source_commit)" == "$head_sha" ]] ||
+  die "the test gate passed on $(tests_value source_commit), not HEAD ($head_sha); download the windows-release artifact for this commit"
+[[ "$(tests_value source_dirty)" == "false" ]] ||
+  die "the test gate ran on a dirty build"
+[[ "$(tests_value plugin_version)" == "$version" ]] ||
+  die "the test gate ran version $(tests_value plugin_version), not $version"
 
 gh auth status -h github.com >/dev/null
 
@@ -132,8 +137,25 @@ if gh release view "$tag" -R "$repo" >/dev/null 2>&1; then
   die "GitHub release $tag already exists in $repo"
 fi
 
-git -C "$root" tag -a "$tag" -m "obs-dpdfnet $version"
-git -C "$root" push origin "$tag"
+# A tag left by an earlier run that failed before the release was created is
+# reused if it points at HEAD, so the publish can be run again.
+if git -C "$root" rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  local_tag_sha="$(git -C "$root" rev-parse "$tag^{commit}")"
+  [[ "$local_tag_sha" == "$head_sha" ]] ||
+    die "local tag $tag points at $local_tag_sha, not HEAD ($head_sha)"
+else
+  git -C "$root" tag -a "$tag" -m "obs-dpdfnet $version"
+fi
+
+remote_tag="$(git -C "$root" ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}")"
+if [[ -n "$remote_tag" ]]; then
+  remote_tag_sha="$(awk -v ref="refs/tags/$tag^{}" '$2 == ref {print $1}' <<< "$remote_tag")"
+  [[ -n "$remote_tag_sha" ]] || remote_tag_sha="$(awk '{print $1; exit}' <<< "$remote_tag")"
+  [[ "$remote_tag_sha" == "$head_sha" ]] ||
+    die "remote tag $tag points at $remote_tag_sha, not HEAD ($head_sha)"
+else
+  git -C "$root" push origin "$tag"
+fi
 
 release_args=(
   release create "$tag"
