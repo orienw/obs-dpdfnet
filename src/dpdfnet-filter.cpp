@@ -574,6 +574,9 @@ public:
         result.disposition != DpdfnetDisposition::Passthrough;
     const bool guard_observed = timing_eligible && active_processing_result;
     uint64_t overload_retry_delay_ns = 0;
+    // A processor event replaced by an overload trip is still logged.
+    DpdfnetEvent displaced_event = DpdfnetEvent::None;
+    std::array<char, 256> displaced_message;
 
     if (guard_observed) {
       const DpdfnetRealtimeObservation observation =
@@ -581,13 +584,17 @@ public:
                                   active.hop_size, active.model_rate);
       realtime_budget_ns = observation.budget_ns;
       if (observation.tripped) {
-        std::snprintf(result.message.data(), result.message.size(),
+        std::array<char, 256> overload_message;
+        std::snprintf(overload_message.data(), overload_message.size(),
                       "processing took %.1f ms for %.1f ms of audio, debt "
                       "%.1f ms",
                       realtime_processing_ns / 1e6, observation.budget_ns / 1e6,
                       observation.debt_ns / 1e6);
-        if (processor_.disable_for_realtime_overload(result.message.data())) {
+        if (processor_.disable_for_realtime_overload(overload_message.data())) {
+          displaced_event = result.event;
+          displaced_message = result.message;
           result.event = DpdfnetEvent::RealtimeOverloadCircuitOpened;
+          result.message = overload_message;
           overload_retry_delay_ns = overload_retries_.next_delay_ns();
         }
       } else if (realtime_guard_.probe() &&
@@ -650,6 +657,12 @@ public:
     }
     lock.unlock();
 
+    if (displaced_event != DpdfnetEvent::None) {
+      DpdfnetProcessResult displaced;
+      displaced.event = displaced_event;
+      displaced.message = displaced_message;
+      request_worker(false, displaced, 0);
+    }
     request_worker(format_resampler_refresh || result.resampler_refresh_needed,
                    result, overload_retry_delay_ns);
     return output;

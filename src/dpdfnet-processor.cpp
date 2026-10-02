@@ -396,6 +396,7 @@ DpdfnetModelBundle DpdfnetProcessor::replace_model(DpdfnetModelBundle bundle) {
   oversized_packets_ = 0;
   capacity_failures_ = 0;
   timestamp_discontinuities_ = 0;
+  discontinuity_pending_ = false;
   process_error_reported_ = false;
   last_error_.fill(0);
   recompute_path();
@@ -485,6 +486,7 @@ void DpdfnetProcessor::reset_state() {
   oversized_packets_ = 0;
   capacity_failures_ = 0;
   timestamp_discontinuities_ = 0;
+  discontinuity_pending_ = false;
   process_error_reported_ = false;
   last_error_.fill(0);
   reset_audio_state();
@@ -945,6 +947,19 @@ bool DpdfnetProcessor::resume_after_overload() {
 DpdfnetProcessResult
 DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
   DenormalModeGuard denormal_guard;
+  DpdfnetProcessResult result = process_packet(audio);
+  // A failure in the same callback does not hide the jump: it is reported on
+  // the first result with no other event.
+  if (discontinuity_pending_ && result.event == DpdfnetEvent::None) {
+    result.event = DpdfnetEvent::TimestampDiscontinuity;
+    result.message = discontinuity_message_;
+    discontinuity_pending_ = false;
+  }
+  return result;
+}
+
+DpdfnetProcessResult
+DpdfnetProcessor::process_packet(const DpdfnetAudioPacket &audio) {
   DpdfnetProcessResult result;
   if (!audio.frames || !model_ || !stft_ ||
       disable_reason_ == DpdfnetDisableReason::RepeatedProcessingFailures)
@@ -965,17 +980,18 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
     return result;
   }
 
-  DpdfnetEvent discontinuity_event = DpdfnetEvent::None;
-  std::array<char, 256> discontinuity_message = {};
   if (timestamp_jump(audio.timestamp)) {
+    const double moved_ms =
+        (audio.timestamp > expected_timestamp_
+             ? audio.timestamp - expected_timestamp_
+             : expected_timestamp_ - audio.timestamp) /
+        1e6;
     if (timestamp_discontinuities_ == 0) {
-      const uint64_t moved_ns = audio.timestamp > expected_timestamp_
-                                    ? audio.timestamp - expected_timestamp_
-                                    : expected_timestamp_ - audio.timestamp;
-      discontinuity_event = DpdfnetEvent::TimestampDiscontinuity;
-      std::snprintf(discontinuity_message.data(), discontinuity_message.size(),
+      discontinuity_pending_ = true;
+      std::snprintf(discontinuity_message_.data(),
+                    discontinuity_message_.size(),
                     "audio timestamps moved %.1f ms from the expected time",
-                    moved_ns / 1e6);
+                    moved_ms);
     }
     if (timestamp_discontinuities_ != std::numeric_limits<uint64_t>::max())
       ++timestamp_discontinuities_;
@@ -987,9 +1003,12 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
       rate_warning_reported_ = true;
       result.event = DpdfnetEvent::ResamplerRefreshNeeded;
       std::snprintf(result.message.data(), result.message.size(),
-                    "audio timestamp discontinuity invalidated the stateful "
-                    "resamplers");
+                    "audio timestamps moved %.1f ms from the expected time, "
+                    "which invalidated the stateful resamplers",
+                    moved_ms);
       result.resampler_refresh_needed = true;
+      // This event is logged on every jump and already carries it.
+      discontinuity_pending_ = false;
       return result;
     }
   }
@@ -1029,11 +1048,6 @@ DpdfnetProcessor::process(const DpdfnetAudioPacket &audio) {
 
   DpdfnetProcessResult output = pop_output_packet(processed_hops);
   output.inference_hops = inference_hops;
-  if (output.event == DpdfnetEvent::None &&
-      discontinuity_event != DpdfnetEvent::None) {
-    output.event = discontinuity_event;
-    output.message = discontinuity_message;
-  }
   return output;
 }
 

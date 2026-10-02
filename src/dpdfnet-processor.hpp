@@ -239,6 +239,7 @@ private:
   bool dry_buffers_have_frames(uint32_t frames) const;
   size_t to_model_frames(size_t native_frames) const;
   size_t to_native_frames(size_t model_frames) const;
+  DpdfnetProcessResult process_packet(const DpdfnetAudioPacket &audio);
   bool push_input(const DpdfnetAudioPacket &audio);
   void process_available_hops(size_t &processed_hops, size_t &inference_hops);
   DpdfnetProcessResult pop_output_packet(size_t processed_hops);
@@ -278,6 +279,10 @@ private:
   uint64_t oversized_packets_ = 0;
   uint64_t capacity_failures_ = 0;
   uint64_t timestamp_discontinuities_ = 0;
+  // The first timestamp jump since a reset, waiting for a result with no
+  // other event to report it on.
+  bool discontinuity_pending_ = false;
+  std::array<char, 256> discontinuity_message_ = {};
   std::array<char, 256> last_error_ = {};
 
   DpdfnetControls controls_;

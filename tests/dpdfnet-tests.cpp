@@ -651,6 +651,35 @@ void test_channel_and_timestamp_resets(const std::string &model_path) {
           "tolerated timestamp deviation was counted as a jump");
 }
 
+// A jump whose callback reports a failure is reported on the next callback
+// instead of being lost.
+void test_discontinuity_survives_failure(const std::filesystem::path &fixtures) {
+  // Passes silence through and fails inference on anything else.
+  DpdfnetProcessor processor = make_processor(
+      (fixtures / "runtime_nonfinite_spectrum_output.onnx").string());
+  std::vector<float> silence(960, 0.0f);
+  std::vector<float> tone(960, 0.1f);
+  DpdfnetAudioPacket packet;
+  packet.data[0] = silence.data();
+  packet.frames = 960;
+  for (uint64_t index = 0; index < 3; ++index) {
+    packet.timestamp = NS_PER_SECOND + index * 20'000'000;
+    require(processor.process(packet).event == DpdfnetEvent::None,
+            "silence failed before the jump");
+  }
+  packet.data[0] = tone.data();
+  packet.timestamp = NS_PER_SECOND + 3 * 20'000'000 + 100'000'000;
+  require(processor.process(packet).event == DpdfnetEvent::ProcessingFailure,
+          "the jump's callback did not fail inference");
+  packet.data[0] = silence.data();
+  packet.timestamp += 20'000'000;
+  const auto next = processor.process(packet);
+  require(next.event == DpdfnetEvent::TimestampDiscontinuity &&
+              std::string(next.message.data()).find("moved 100.0 ms") !=
+                  std::string::npos,
+          "a jump in a failing callback was not reported afterwards");
+}
+
 void test_empty_resampler_replacement_is_noop(const std::string &model_path) {
   DpdfnetProcessor control = make_processor(model_path);
   DpdfnetProcessor unchanged = make_processor(model_path);
@@ -1541,6 +1570,9 @@ void test_resampled_timestamp_refresh(const std::string &model_path,
   const auto discontinuity = transitioned.process(packet);
   require(discontinuity.event == DpdfnetEvent::ResamplerRefreshNeeded,
           "resampled timestamp jump did not request fresh resamplers");
+  require(std::string(discontinuity.message.data()).find("moved 70.0 ms") !=
+              std::string::npos,
+          "resampled timestamp jump was logged without its size");
   require(transitioned.state().resampler_refresh_required,
           "resampled timestamp jump left stale resamplers active");
 
@@ -1555,8 +1587,10 @@ void test_resampled_timestamp_refresh(const std::string &model_path,
   size_t compared = 0;
   for (size_t index = 0; index < 12; ++index) {
     packet.timestamp = timestamp;
-    compared += compare_results(transitioned.process(packet),
-                                fresh.process(packet));
+    const auto result = transitioned.process(packet);
+    require(result.event != DpdfnetEvent::TimestampDiscontinuity,
+            "resampled timestamp jump was reported twice");
+    compared += compare_results(result, fresh.process(packet));
     timestamp += packet_ns;
   }
   require(compared >= 4 * frames,
@@ -1835,6 +1869,9 @@ int main(int argc, char **argv) {
            passed;
   passed = run_test("model activation probe",
                     [&] { test_model_activation_probe(fixtures); }) &&
+           passed;
+  passed = run_test("timestamp jump survives a failure",
+                    [&] { test_discontinuity_survives_failure(fixtures); }) &&
            passed;
   passed = run_test("empty resampler replacement is a no-op",
                     [&] {
