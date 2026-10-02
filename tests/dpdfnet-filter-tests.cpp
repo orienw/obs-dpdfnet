@@ -966,25 +966,27 @@ void test_overload_retry_chain(const std::filesystem::path &fixtures,
         obs_properties_get(properties, "status_summary"));
     return std::string(text ? text : "");
   };
-  const auto eventually = [](const auto &condition) {
-    for (int attempt = 0; attempt < 1000; ++attempt) {
+  const auto eventually = [](const auto &condition, int attempts = 1000) {
+    for (int attempt = 0; attempt < attempts; ++attempt) {
       if (condition())
         return true;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return false;
   };
-  // Feeds overloaded audio until the status shows a pause, and returns the
-  // log index from before the trip. The retry deadline starts at the trip,
-  // so the overload stops on the first callback that shows the pause; a
-  // slow runner must not still be overloaded when the retry runs.
+  // Feeds overloaded audio until the filter logs a pause, and returns the
+  // log index from before the trip. It watches the log, not the status:
+  // building the properties records the status as shown, which would hide
+  // the refresh this test checks. The retry deadline starts at the trip, so
+  // the overload stops as soon as the pause is logged; a slow runner must
+  // not still be overloaded when the retry runs.
   const auto overload_until_paused = [&](const char *what) {
     const size_t from = logs.size();
     dpdfnet_test_extra_processing_ns = 30000000;
     bool paused = false;
-    for (int packet = 0; packet < 200 && !paused; ++packet) {
+    for (int packet = 0; packet < 400 && !paused; ++packet) {
       feed(1);
-      paused = summary().rfind("Paused\n", 0) == 0;
+      paused = logs.contains("sustained realtime overload", from);
     }
     dpdfnet_test_extra_processing_ns = 0;
     require(paused, std::string(what) + ": overload did not pause processing");
@@ -1005,8 +1007,12 @@ void test_overload_retry_chain(const std::filesystem::path &fixtures,
                    logs.contains("retrying in 10 s", from);
           }),
           "first overload was not logged with a 10 s retry");
-  require(eventually([&] { return property_updates.load() > updates_before; }),
+  // Inside the 1 s retry, whose own refresh must not stand in.
+  require(eventually([&] { return property_updates.load() > updates_before; },
+                     50),
           "pause did not refresh an open properties window");
+  require(summary().rfind("Paused\n", 0) == 0,
+          "status did not show the pause");
   require(eventually([&] {
             return logs.contains(
                 "retrying processing after realtime overload (attempt 1)",
@@ -1054,6 +1060,29 @@ void test_overload_retry_chain(const std::filesystem::path &fixtures,
                        from);
           }),
           "recovery did not restart the retry schedule");
+
+  // Reset updates an open window itself. A pause after it must still rebuild
+  // the window, although the worker's last rebuild was for a pause too.
+  dpdfnet_test_retry_delay_divisor = 1;
+  uint64_t before = property_updates.load();
+  overload_until_paused("overload before reset");
+  require(eventually([&] { return property_updates.load() > before; }),
+          "pause before reset did not refresh the properties window");
+  {
+    ObsProperties properties(dpdfnet_filter_info.get_properties(filter.get()));
+    obs_property_t *reset = obs_properties_get(properties, "reset_state");
+    require(reset && obs_property_button_clicked(reset, nullptr),
+            "Reset processing failed");
+    const char *text = obs_property_description(
+        obs_properties_get(properties, "status_summary"));
+    require(text && std::string(text).rfind("Active\n", 0) == 0,
+            "Reset did not resume processing");
+  }
+  before = property_updates.load();
+  overload_until_paused("overload after reset");
+  // Well inside the 10 s retry, whose own refresh must not stand in.
+  require(eventually([&] { return property_updates.load() > before; }, 200),
+          "a pause after Reset did not refresh the properties window");
 }
 
 // Timestamp jumps on the resampled path rebuild the resamplers each time,

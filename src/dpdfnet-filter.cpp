@@ -209,6 +209,9 @@ struct FilterStatus {
   StatusSeverity severity = StatusSeverity::Normal;
   std::string summary;
   std::string text;
+  // The state the summary shows, without the load figure or the retry
+  // countdown, which change without the state changing.
+  std::string key;
 };
 
 class DpdfnetFilter {
@@ -576,7 +579,7 @@ public:
     uint64_t overload_retry_delay_ns = 0;
     // A processor event replaced by an overload trip is still logged.
     DpdfnetEvent displaced_event = DpdfnetEvent::None;
-    std::array<char, 256> displaced_message;
+    std::array<char, 256> displaced_message = {};
 
     if (guard_observed) {
       const DpdfnetRealtimeObservation observation =
@@ -807,6 +810,7 @@ public:
     // Two lines: a state word, then one plain sentence or a spec line.
     FilterStatus result;
     std::ostringstream summary;
+    std::string load_clause;
     // A retry that is starting clears its deadline first; count it as 1 s.
     const uint64_t retry_in_s =
         std::max<uint64_t>(1, (retry_in_ns + 999'999'999) / 1'000'000'000);
@@ -859,9 +863,16 @@ public:
         const uint64_t load_percent = static_cast<uint64_t>(
             std::llround(static_cast<double>(timing.window_processing_ns) *
                          100.0 / static_cast<double>(timing.window_budget_ns)));
-        summary << ", " << load_percent << "% processing load";
+        load_clause = ", " + std::to_string(load_percent) + "% processing load";
       }
     }
+    for (const char c : summary.str()) {
+      if (c < '0' || c > '9')
+        result.key += c;
+    }
+    result.key += '\n';
+    result.key += static_cast<char>('0' + static_cast<int>(result.severity));
+    summary << load_clause;
 
     // Details are a readout: key and value per line, no periods.
     std::ostringstream text;
@@ -941,6 +952,13 @@ public:
   bool show_details() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return show_details_;
+  }
+
+  // Remembers the state a properties window was last built or updated to
+  // show, wherever that happened.
+  void record_shown_status(const FilterStatus &shown) {
+    std::lock_guard<std::mutex> lock(shown_status_mutex_);
+    shown_status_key_ = shown.key;
   }
 
 private:
@@ -1132,22 +1150,17 @@ private:
 
   // Rebuilds an open properties window so the status line follows a pause,
   // retry, or failure without pressing Refresh. Rebuilding drops a slider
-  // drag or a path being typed, so it happens only when the state shown
-  // changes; the load figure and the retry countdown do not count. Worker
-  // thread only.
+  // drag or a path being typed, so it happens only when the state differs
+  // from the one last shown, including after Reset or a settings edit
+  // updated the window. Worker thread only.
   void refresh_properties_if_status_changed() {
     const FilterStatus now = status();
-    std::string key;
-    key.reserve(now.summary.size() + 2);
-    for (const char c : now.summary) {
-      if (c < '0' || c > '9')
-        key += c;
+    {
+      std::lock_guard<std::mutex> lock(shown_status_mutex_);
+      if (now.key == shown_status_key_)
+        return;
+      shown_status_key_ = now.key;
     }
-    key += '\n';
-    key += static_cast<char>('0' + static_cast<int>(now.severity));
-    if (key == shown_status_key_)
-      return;
-    shown_status_key_ = std::move(key);
     obs_source_update_properties(source_);
   }
 
@@ -1249,6 +1262,7 @@ private:
   std::array<CallbackDiagnostic, static_cast<size_t>(DpdfnetEvent::Count) - 1>
       callback_diagnostics_ = {};
   bool stop_resampler_worker_ = false;
+  std::mutex shown_status_mutex_;
   std::string shown_status_key_;
   std::thread resampler_worker_;
 };
@@ -1308,7 +1322,9 @@ bool set_info_text(obs_property_t *property, const std::string &text,
 bool update_status_properties(obs_properties_t *props, void *data) {
   if (!data)
     return false;
-  const FilterStatus status = static_cast<DpdfnetFilter *>(data)->status();
+  auto *filter = static_cast<DpdfnetFilter *>(data);
+  const FilterStatus status = filter->status();
+  filter->record_shown_status(status);
   bool changed =
       set_info_text(obs_properties_get(props, "status_summary"), status.summary,
                     status_info_type(status.severity));
@@ -1374,6 +1390,7 @@ obs_properties_t *filter_properties(void *data) {
   if (data) {
     auto *filter = static_cast<DpdfnetFilter *>(data);
     status = filter->status();
+    filter->record_shown_status(status);
     show_details = filter->show_details();
     custom_selected = filter->custom_model_selected();
   }
