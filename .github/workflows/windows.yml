@@ -152,6 +152,6 @@ jobs:
           fi
           gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
             --draft "${prerelease[@]}" \
-            --title "obs-dpdfnet $version" \
+            --title "$version" \
             --notes-file "build/release-notes-v$version.md" \
             "$zip" "$zip.sha256"
