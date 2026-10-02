@@ -974,17 +974,20 @@ void test_overload_retry_chain(const std::filesystem::path &fixtures,
     }
     return false;
   };
-  // Feeds audio until the status shows a pause, and returns the log index
-  // from before the trip.
+  // Feeds overloaded audio until the status shows a pause, and returns the
+  // log index from before the trip. The retry deadline starts at the trip,
+  // so the overload stops on the first callback that shows the pause; a
+  // slow runner must not still be overloaded when the retry runs.
   const auto overload_until_paused = [&](const char *what) {
     const size_t from = logs.size();
     dpdfnet_test_extra_processing_ns = 30000000;
-    for (int batch = 0; batch < 40 && summary().rfind("Paused\n", 0) != 0;
-         ++batch)
-      feed(5);
-    require(summary().rfind("Paused\n", 0) == 0,
-            std::string(what) + ": overload did not pause processing");
+    bool paused = false;
+    for (int packet = 0; packet < 200 && !paused; ++packet) {
+      feed(1);
+      paused = summary().rfind("Paused\n", 0) == 0;
+    }
     dpdfnet_test_extra_processing_ns = 0;
+    require(paused, std::string(what) + ": overload did not pause processing");
     return from;
   };
 
