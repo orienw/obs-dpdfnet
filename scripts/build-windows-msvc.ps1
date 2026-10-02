@@ -510,6 +510,11 @@ Invoke-NativeExecutableBuild `
     )
 
 Invoke-NativeExecutableBuild `
+    -Name "dpdfnet-module-test" `
+    -Sources @((Join-Path $Root "tests\module-test.cpp")) `
+    -Libraries @($obsLib)
+
+Invoke-NativeExecutableBuild `
     -Name "dpdfnet-stream-dump" `
     -Sources (@((Join-Path $Root "tools\stream-dump.cpp")) + $DspSources) `
     -Libraries @($obsLib, $onnxRenamedLib)
@@ -558,6 +563,7 @@ if ($Git) {
                 "dpdfnet-onnxruntime-version.exe",
                 "obs-dpdfnet-tests.exe",
                 "obs-dpdfnet-filter-tests.exe",
+                "dpdfnet-module-test.exe",
                 "dpdfnet-stream-dump.exe",
                 "dpdfnet-quality-benchmark.exe",
                 "dpdfnet-processor-benchmark.exe",

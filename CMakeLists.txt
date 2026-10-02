@@ -307,11 +307,48 @@ if(DPDFNET_BUILD_TESTS)
     "${CMAKE_CURRENT_SOURCE_DIR}/models/dpdfnet8_48khz_hr.onnx"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/model-contract"
   )
+  set(dpdfnet_test_names processor filter-integration)
+
+  # Installs into the build tree and loads that copy the way OBS does, so the
+  # install layout, runtime library lookup, bundled models, and locale are
+  # tested together. Needs relative destinations and the bundled runtime.
+  if(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES AND
+     NOT IS_ABSOLUTE "${DPDFNET_PLUGIN_DESTINATION}" AND
+     NOT IS_ABSOLUTE "${DPDFNET_DATA_DESTINATION}")
+    add_executable(dpdfnet-module-test tests/module-test.cpp)
+    target_link_libraries(dpdfnet-module-test PRIVATE OBS::libobs)
+    if(DPDFNET_PLATFORM_COMPILE_DEFINITIONS)
+      target_compile_definitions(dpdfnet-module-test PRIVATE
+        ${DPDFNET_PLATFORM_COMPILE_DEFINITIONS}
+      )
+    endif()
+
+    set(test_install "${CMAKE_CURRENT_BINARY_DIR}/test-install")
+    add_test(NAME install-stage COMMAND "${CMAKE_COMMAND}" -E rm -rf
+      "${test_install}")
+    add_test(NAME install-copy COMMAND "${CMAKE_COMMAND}"
+      --install "${CMAKE_CURRENT_BINARY_DIR}" --prefix "${test_install}"
+      --config $<CONFIG>
+    )
+    set_tests_properties(install-stage PROPERTIES
+      FIXTURES_SETUP dpdfnet-install-clean)
+    set_tests_properties(install-copy PROPERTIES
+      FIXTURES_REQUIRED dpdfnet-install-clean
+      FIXTURES_SETUP dpdfnet-install)
+    add_test(NAME installed-module COMMAND dpdfnet-module-test
+      "${test_install}/${DPDFNET_PLUGIN_DESTINATION}/$<TARGET_FILE_NAME:obs-dpdfnet>"
+      "${test_install}/${DPDFNET_DATA_DESTINATION}"
+    )
+    set_tests_properties(installed-module PROPERTIES
+      FIXTURES_REQUIRED dpdfnet-install)
+    list(APPEND dpdfnet_test_names installed-module)
+  endif()
+
   if(WIN32)
     # Use the runtime directory from the imported OBS target. This also makes
     # obs.dll's own adjacent dependencies available without relying on the
     # shell's ambient PATH or copying only part of the OBS runtime.
-    set_tests_properties(processor filter-integration PROPERTIES
+    set_tests_properties(${dpdfnet_test_names} PROPERTIES
       ENVIRONMENT_MODIFICATION
         "PATH=path_list_prepend:$<TARGET_FILE_DIR:OBS::libobs>"
     )
@@ -323,7 +360,7 @@ if(MSVC)
   foreach(target dpdfnet-model-smoke dpdfnet-stream-dump
                  dpdfnet-quality-benchmark dpdfnet-processor-benchmark
                  obs-dpdfnet-tests obs-dpdfnet-filter-tests
-                 dpdfnet-model-contract-test)
+                 dpdfnet-model-contract-test dpdfnet-module-test)
     if(TARGET ${target})
       target_compile_options(${target} PRIVATE /W4 /permissive-)
     endif()
@@ -333,7 +370,7 @@ else()
   foreach(target dpdfnet-model-smoke dpdfnet-stream-dump
                  dpdfnet-quality-benchmark dpdfnet-processor-benchmark
                  obs-dpdfnet-tests obs-dpdfnet-filter-tests
-                 dpdfnet-model-contract-test)
+                 dpdfnet-model-contract-test dpdfnet-module-test)
     if(TARGET ${target})
       target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
     endif()

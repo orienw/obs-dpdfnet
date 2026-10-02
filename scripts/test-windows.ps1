@@ -89,6 +89,7 @@ function Read-BuildProvenance {
         "dpdfnet-onnxruntime-version.exe",
         "obs-dpdfnet-tests.exe",
         "obs-dpdfnet-filter-tests.exe",
+        "dpdfnet-module-test.exe",
         "dpdfnet-stream-dump.exe",
         "dpdfnet-quality-benchmark.exe",
         "dpdfnet-processor-benchmark.exe",
@@ -217,6 +218,29 @@ Invoke-TestExecutable -Name "obs-dpdfnet-tests" -Arguments @(
 Invoke-TestExecutable -Name "obs-dpdfnet-filter-tests" -Arguments @(
     $QualityModel, $Fixtures
 )
+
+# Install a copy with the release installer and load it the way OBS does.
+# OBS searches a plugin's own folder and the application folder for its
+# DLLs, so the test runs from a folder of its own and the runtime can only
+# come from the installed bin directory.
+$ModuleTestRoot = Join-Path $Root "build\msvc\module-test"
+if (Test-Path -LiteralPath $ModuleTestRoot) {
+    Remove-Item -Recurse -Force -LiteralPath $ModuleTestRoot
+}
+$ModuleTestPlugin = Join-Path $ModuleTestRoot "obs-dpdfnet"
+$ModuleTestRunner = Join-Path $ModuleTestRoot "runner"
+New-Item -ItemType Directory -Force -Path $ModuleTestPlugin, $ModuleTestRunner | Out-Null
+& (Join-Path $PSScriptRoot "install-windows.ps1") `
+    -BuildDir (Join-Path $Root "build\msvc") `
+    -Configuration $Configuration `
+    -PluginRoot $ModuleTestPlugin
+$ModuleTestExecutable = Join-Path $ModuleTestRunner "dpdfnet-module-test.exe"
+Copy-Item (Join-Path $OutputDir "dpdfnet-module-test.exe") -Destination $ModuleTestExecutable
+Write-Host "Running dpdfnet-module-test"
+& $ModuleTestExecutable `
+    (Join-Path $ModuleTestPlugin "bin\64bit\obs-dpdfnet.dll") `
+    (Join-Path $ModuleTestPlugin "data")
+if ($LASTEXITCODE -ne 0) { throw "dpdfnet-module-test failed with exit code $LASTEXITCODE" }
 
 @(
     "source_commit=$BuiltCommit",
