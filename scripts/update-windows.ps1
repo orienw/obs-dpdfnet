@@ -76,11 +76,6 @@ function Update-OnnxRuntime {
         $currentVersion = (Get-Content -Raw $ortVersionFile).Trim()
     }
 
-    $expectedHash = $null
-    if ($asset.digest -and $asset.digest.StartsWith("sha256:")) {
-        $expectedHash = $asset.digest.Substring("sha256:".Length).ToLowerInvariant()
-    }
-
     $needsUpdate = $Force -or !(Test-Path $ortRoot) -or ($currentVersion -ne $version)
     if (!$needsUpdate) {
         Write-Host "ONNX Runtime $version is current."
@@ -88,13 +83,30 @@ function Update-OnnxRuntime {
     }
 
     Write-Host "Updating ONNX Runtime to $version"
+    # Every download is checked: against the pinned hash when this version is
+    # pinned, otherwise against the SHA-256 GitHub publishes for the asset.
+    $digestHash = $null
+    if ($asset.digest -and $asset.digest.StartsWith("sha256:")) {
+        $digestHash = $asset.digest.Substring("sha256:".Length).ToLowerInvariant()
+    }
+    $expectedHash = $DpdfnetKnownOnnxRuntimeHashes[$version]
+    if ($expectedHash -and $digestHash -and $expectedHash -ne $digestHash) {
+        throw "GitHub's digest for $assetName does not match the hash pinned in dependency-versions.ps1."
+    }
+    if (!$expectedHash) {
+        $expectedHash = $digestHash
+    }
+    if (!$expectedHash) {
+        throw "ONNX Runtime $version has no pinned hash and GitHub publishes no digest for $assetName. Add its SHA-256 to scripts/dependency-versions.ps1."
+    }
+
     $zipHash = Get-Sha256 -Path $zipPath
-    if ($Force -or !(Test-Path $zipPath) -or ($expectedHash -and $zipHash -ne $expectedHash)) {
+    if ($Force -or !(Test-Path $zipPath) -or $zipHash -ne $expectedHash) {
         Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
         $zipHash = Get-Sha256 -Path $zipPath
     }
 
-    if ($expectedHash -and $zipHash -ne $expectedHash) {
+    if ($zipHash -ne $expectedHash) {
         throw "ONNX Runtime hash mismatch for $assetName. Expected $expectedHash, got $zipHash"
     }
 
