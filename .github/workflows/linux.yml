@@ -40,14 +40,15 @@ jobs:
         env:
           OBS_SOURCE: ${{ matrix.obs }}
         run: |
-          obs_package=libobs-dev
+          obs_packages=(libobs-dev)
           if [ "$OBS_SOURCE" = ppa ]; then
             sudo add-apt-repository -y ppa:obsproject/obs-studio
-            obs_package=obs-studio
+            # The PPA's libobsConfig.cmake requires the SIMDe headers.
+            obs_packages=(obs-studio libsimde-dev)
           fi
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ "$obs_package" patchelf xvfb
+            cmake ninja-build g++ "${obs_packages[@]}" patchelf xvfb
 
       - name: Check pinned versions
         if: matrix.name == 'release'
