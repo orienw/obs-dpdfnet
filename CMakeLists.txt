@@ -4,6 +4,17 @@ cmake_minimum_required(VERSION 3.24)
 
 project(obs-dpdfnet VERSION 1.1.1 LANGUAGES C CXX)
 
+# The Windows release build takes its version from dependency-versions.ps1,
+# which may add a pre-release suffix. Fail early if the two drift apart.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/dependency-versions.ps1"
+  windows_version_line REGEX "^[$]DpdfnetDefaultPluginVersion = ")
+string(REGEX REPLACE "^.*\"([0-9]+[.][0-9]+[.][0-9]+)(-[A-Za-z0-9.]+)?\".*$"
+  "\\1" windows_version "${windows_version_line}")
+if(NOT windows_version STREQUAL PROJECT_VERSION)
+  message(FATAL_ERROR "CMakeLists.txt is version ${PROJECT_VERSION}, but "
+    "scripts/dependency-versions.ps1 says '${windows_version_line}'. Bump both.")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

@@ -53,6 +53,11 @@ if ([string]::IsNullOrWhiteSpace($OnnxRuntimeVersion)) { $OnnxRuntimeVersion = $
 if ($Version -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
     throw "Version '$Version' must use semantic version form, such as 1.0.0."
 }
+# The build bakes this version into the plugin, so it must be the version the
+# source declares. CMake checks that CMakeLists.txt agrees with this one.
+if ($Version -cne $DpdfnetDefaultPluginVersion) {
+    throw "Version '$Version' does not match '$DpdfnetDefaultPluginVersion' in scripts/dependency-versions.ps1. Bump the version in the source first."
+}
 
 $PinnedObsArchiveHash = $DpdfnetKnownObsArchiveHashes[$ObsVersion]
 $PinnedOrtArchiveHash = $DpdfnetKnownOnnxRuntimeHashes[$OnnxRuntimeVersion]
