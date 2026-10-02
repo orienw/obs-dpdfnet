@@ -29,6 +29,7 @@ option(DPDFNET_BUILD_PROCESSOR_BENCHMARK "Build the processor timing benchmark" 
 option(DPDFNET_BUILD_TESTS "Build processor, model contract, and filter lifecycle tests" OFF)
 option(DPDFNET_COPY_RUNTIME_DEPENDENCIES "Copy ONNX Runtime shared libraries next to CMake-built binaries" ON)
 option(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES "Install ONNX Runtime shared libraries with the OBS plugin" ON)
+option(DPDFNET_WARNINGS_AS_ERRORS "Fail on compiler warnings in this project's own code" OFF)
 
 set(DPDFNET_PLUGIN_VERSION "${PROJECT_VERSION}")
 set(DPDFNET_PLUGIN_DESTINATION "obs-plugins/64bit" CACHE STRING "Install destination for the OBS plugin binary")
@@ -369,26 +370,21 @@ if(DPDFNET_BUILD_TESTS)
 endif()
 
 if(MSVC)
-  target_compile_options(obs-dpdfnet PRIVATE /W4 /permissive-)
-  foreach(target dpdfnet-model-smoke dpdfnet-stream-dump
-                 dpdfnet-quality-benchmark dpdfnet-processor-benchmark
-                 obs-dpdfnet-tests obs-dpdfnet-filter-tests
-                 dpdfnet-model-contract-test dpdfnet-module-test)
-    if(TARGET ${target})
-      target_compile_options(${target} PRIVATE /W4 /permissive-)
-    endif()
-  endforeach()
+  set(dpdfnet_warning_options /W4 /permissive-)
 else()
-  target_compile_options(obs-dpdfnet PRIVATE -Wall -Wextra -Wpedantic)
-  foreach(target dpdfnet-model-smoke dpdfnet-stream-dump
-                 dpdfnet-quality-benchmark dpdfnet-processor-benchmark
-                 obs-dpdfnet-tests obs-dpdfnet-filter-tests
-                 dpdfnet-model-contract-test dpdfnet-module-test)
-    if(TARGET ${target})
-      target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
-  endforeach()
+  set(dpdfnet_warning_options -Wall -Wextra -Wpedantic)
 endif()
+# KissFFT and other dependencies keep their own warning settings.
+foreach(target obs-dpdfnet dpdfnet-model-smoke dpdfnet-stream-dump
+               dpdfnet-quality-benchmark dpdfnet-processor-benchmark
+               obs-dpdfnet-tests obs-dpdfnet-filter-tests
+               dpdfnet-model-contract-test dpdfnet-module-test)
+  if(TARGET ${target})
+    target_compile_options(${target} PRIVATE ${dpdfnet_warning_options})
+    set_property(TARGET ${target} PROPERTY
+      COMPILE_WARNING_AS_ERROR ${DPDFNET_WARNINGS_AS_ERRORS})
+  endif()
+endforeach()
 
 # Export only the OBS entry points, which obs-module.h marks explicitly. GCC
 # gives inline statics such as the ONNX Runtime C++ wrapper's cached API table

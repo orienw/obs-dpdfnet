@@ -1,0 +1,16 @@
+./bin/64bit/libonnxruntime_dpdfnet.so
+./bin/64bit/libonnxruntime_providers_shared.so
+./bin/64bit/obs-dpdfnet.so
+./data/LICENSE
+./data/LICENSES/Apache-2.0.txt
+./data/LICENSES/BSD-3-Clause-KissFFT.txt
+./data/LICENSES/BSD-3-Clause.txt
+./data/LICENSES/MIT-ONNXRuntime.txt
+./data/LICENSES/MIT-SIMDe.txt
+./data/ONNXRuntime-LICENSE.txt
+./data/THIRD_PARTY.md
+./data/ThirdPartyNotices.txt
+./data/locale/en-US.ini
+./data/models/dpdfnet2_48khz_hr.onnx
+./data/models/dpdfnet8_48khz_hr.onnx
+./data/models/manifest.json

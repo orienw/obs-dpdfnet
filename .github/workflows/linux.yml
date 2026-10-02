@@ -22,8 +22,14 @@ jobs:
             flags: >-
               -fsanitize=address,undefined -fno-sanitize-recover=undefined
               -fno-omit-frame-pointer
+          - name: thread-sanitizer
+            flags: -fsanitize=thread -fno-omit-frame-pointer
+          # Ubuntu's libobs-dev is OBS 30; the OBS PPA has the current release.
+          - name: current-obs
+            flags: ""
+            obs: ppa
     env:
-      # Keep the version in step with scripts/dependency-versions.ps1.
+      # Checked against scripts/dependency-versions.ps1 below.
       ONNXRUNTIME_VERSION: 1.27.0
       ONNXRUNTIME_SHA256: 547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f
 
@@ -31,10 +37,35 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install build dependencies
+        env:
+          OBS_SOURCE: ${{ matrix.obs }}
         run: |
+          obs_package=libobs-dev
+          if [ "$OBS_SOURCE" = ppa ]; then
+            sudo add-apt-repository -y ppa:obsproject/obs-studio
+            obs_package=obs-studio
+          fi
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ libobs-dev patchelf xvfb
+            cmake ninja-build g++ "$obs_package" patchelf xvfb
+
+      - name: Check pinned versions
+        if: matrix.name == 'release'
+        run: |
+          if ! grep -qxF "\$DpdfnetDefaultOnnxRuntimeVersion = \"$ONNXRUNTIME_VERSION\"" \
+              scripts/dependency-versions.ps1; then
+            echo "ONNXRUNTIME_VERSION differs from scripts/dependency-versions.ps1"
+            exit 1
+          fi
+
+      - name: Verify generated model fixtures
+        if: matrix.name == 'release'
+        run: |
+          python3 -m venv fixtures-venv
+          fixtures-venv/bin/pip install onnx==1.21.0
+          fixtures-venv/bin/python tests/generate_model_contract_fixtures.py \
+            generated-fixtures
+          diff -r tests/fixtures/model-contract generated-fixtures
 
       - name: Download ONNX Runtime
         run: |
@@ -56,7 +87,12 @@ jobs:
             -DCMAKE_CXX_FLAGS="$FLAGS" \
             -DCMAKE_EXE_LINKER_FLAGS="$FLAGS" \
             -DCMAKE_MODULE_LINKER_FLAGS="$FLAGS" \
+            -DDPDFNET_WARNINGS_AS_ERRORS=ON \
             -DDPDFNET_BUILD_TESTS=ON \
+            -DDPDFNET_BUILD_MODEL_SMOKE=ON \
+            -DDPDFNET_BUILD_STREAM_DUMP=ON \
+            -DDPDFNET_BUILD_PROCESSOR_BENCHMARK=ON \
+            -DDPDFNET_BUILD_QUALITY_BENCHMARK=ON \
             -DDPDFNET_PLUGIN_DESTINATION=bin/64bit \
             -DDPDFNET_DATA_DESTINATION=data
           cmake --build build
@@ -65,7 +101,7 @@ jobs:
       - name: Test
         run: xvfb-run -a ctest --test-dir build --output-on-failure
 
-      - name: Check the installed ONNX Runtime name
+      - name: Check the install
         if: matrix.name == 'release'
         run: |
           cmake --install build --prefix install
@@ -77,6 +113,9 @@ jobs:
             exit 1
           fi
           test -f install/bin/64bit/libonnxruntime_dpdfnet.so
+          # The bundled runtime is found next to the plugin.
+          readelf -d install/bin/64bit/obs-dpdfnet.so | grep -F RUNPATH |
+            grep -qF '[$ORIGIN]'
           # Only OBS entry points may be exported; anything else, especially
           # a GNU unique symbol, can be shared with another plugin.
           exports="$(nm -D --defined-only install/bin/64bit/obs-dpdfnet.so)"
@@ -85,3 +124,6 @@ jobs:
             echo "the plugin exports symbols other than OBS entry points"
             exit 1
           fi
+          # Nothing more and nothing less than the expected files.
+          (cd install && find . -type f -o -type l | LC_ALL=C sort) > installed-files.txt
+          diff tests/linux-install-files.txt installed-files.txt
