@@ -1129,6 +1129,7 @@ void test_obs_lifecycle(const std::string &model_path) {
   std::mutex remove_mutex;
   std::condition_variable remove_condition;
   bool remove_started = false;
+  std::atomic<bool> remove_returned{false};
   std::thread remover([&] {
     {
       std::lock_guard<std::mutex> lock(remove_mutex);
@@ -1136,12 +1137,19 @@ void test_obs_lifecycle(const std::string &model_path) {
     }
     remove_condition.notify_one();
     obs_source_filter_remove(source, filter);
+    remove_returned = true;
   });
 
   {
     std::unique_lock<std::mutex> lock(remove_mutex);
     remove_condition.wait(lock, [&] { return remove_started; });
   }
+  // Removal first takes libobs's filter mutex, which the barrier holds, and
+  // nothing observable happens before that. A started call reaches it in
+  // microseconds, so holding the barrier 50 ms makes the overlap all but
+  // certain, and removal must not finish while the packet is still held.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const bool removed_while_held = remove_returned;
   {
     std::lock_guard<std::mutex> lock(barrier.mutex);
     barrier.release = true;
@@ -1151,6 +1159,8 @@ void test_obs_lifecycle(const std::string &model_path) {
   producer.join();
   remover.join();
 
+  require(!removed_while_held,
+          "filter removal finished while a downstream filter held its packet");
   require(barrier.audio_valid,
           "update or enable overlap invalidated audio still held by libobs");
   require(capture.callbacks.load(std::memory_order_relaxed) > 0,
