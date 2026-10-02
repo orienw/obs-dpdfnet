@@ -69,9 +69,17 @@ Copy-Item (Join-Path $Root "LICENSE") -Destination $DataDir -Force
 Copy-Item (Join-Path $Root "THIRD_PARTY.md") -Destination $DataDir -Force
 Copy-Item (Join-Path $Root "LICENSES") -Destination $DataDir -Recurse -Force
 
-$OrtNotices = Join-Path $Root "third_party\onnxruntime\ThirdPartyNotices.txt"
-if (Test-Path $OrtNotices) {
-    Copy-Item $OrtNotices -Destination $DataDir -Force
+# ONNX Runtime's license and third-party notices go wherever its DLLs go.
+$OrtRoot = Join-Path $Root "third_party\onnxruntime"
+foreach ($Notice in @(
+    @{ Source = "LICENSE"; Name = "ONNXRuntime-LICENSE.txt" },
+    @{ Source = "ThirdPartyNotices.txt"; Name = "ThirdPartyNotices.txt" }
+)) {
+    $NoticePath = Join-Path $OrtRoot $Notice.Source
+    if (!(Test-Path -LiteralPath $NoticePath -PathType Leaf)) {
+        throw "ONNX Runtime's $($Notice.Source) is missing from $OrtRoot. Run scripts\bootstrap-windows.ps1."
+    }
+    Copy-Item -LiteralPath $NoticePath -Destination (Join-Path $DataDir $Notice.Name) -Force
 }
 
 $ModelDir = Join-Path $DataDir "models"

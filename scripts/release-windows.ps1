@@ -198,10 +198,11 @@ foreach ($Artifact in $StagedArtifacts) {
 Copy-Item -LiteralPath $BuildProvenancePath `
     -Destination (Join-Path $PluginStage "data\build-provenance.json") -Force
 
-# ONNX Runtime's own MIT LICENSE alongside its ThirdPartyNotices.
-$OrtLicense = Join-Path $Root "third_party\onnxruntime\LICENSE"
-if (Test-Path $OrtLicense) {
-    Copy-Item $OrtLicense -Destination (Join-Path $PluginStage "data\ONNXRuntime-LICENSE.txt") -Force
+# INSTALL.txt points at these. The installer copies them or fails.
+foreach ($Notice in @("ThirdPartyNotices.txt", "ONNXRuntime-LICENSE.txt")) {
+    if (!(Test-Path -LiteralPath (Join-Path $PluginStage "data\$Notice") -PathType Leaf)) {
+        throw "The staged release is missing data\$Notice."
+    }
 }
 
 # The commit stamp comes from the hash-bound build manifest, never from HEAD at

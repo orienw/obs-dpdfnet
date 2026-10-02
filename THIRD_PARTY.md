@@ -35,6 +35,7 @@ The direct MSVC build copies ONNX Runtime as `onnxruntime_dpdfnet.dll` to avoid
 colliding with older `onnxruntime.dll` copies that may be present elsewhere on a
 Windows system.
 
-If you publish binary release packages that include ONNX Runtime DLLs, include
-ONNX Runtime's `ThirdPartyNotices.txt` from the downloaded package alongside the
-binary bundle.
+Every install that bundles ONNX Runtime also carries its `LICENSE`, as
+`ONNXRuntime-LICENSE.txt`, and its `ThirdPartyNotices.txt` in the plugin's data
+folder: the Windows installer and release zip require both, and a CMake install
+copies them from the ONNX Runtime package and warns if they are missing.

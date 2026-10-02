@@ -458,4 +458,18 @@ if(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
     install(CODE "file(INSTALL \"${runtime_dependency}\"
       DESTINATION \"${runtime_destination}\" FOLLOW_SYMLINK_CHAIN)")
   endforeach()
+  # ONNX Runtime's license and third-party notices travel with its library.
+  if(ONNXRUNTIME_LICENSE_FILE AND ONNXRUNTIME_NOTICES_FILE)
+    install(FILES "${ONNXRUNTIME_LICENSE_FILE}"
+      DESTINATION "${DPDFNET_DATA_DESTINATION}"
+      RENAME ONNXRuntime-LICENSE.txt
+    )
+    install(FILES "${ONNXRUNTIME_NOTICES_FILE}"
+      DESTINATION "${DPDFNET_DATA_DESTINATION}"
+    )
+  else()
+    message(WARNING "ONNX Runtime's LICENSE and ThirdPartyNotices.txt were "
+      "not found under ONNXRUNTIME_ROOT, so the install ships its library "
+      "without them. Add them before distributing the install.")
+  endif()
 endif()
