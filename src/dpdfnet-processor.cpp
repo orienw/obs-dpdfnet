@@ -768,6 +768,8 @@ DpdfnetProcessor::pop_output_packet(size_t processed_hops) {
   DpdfnetPacketInfo info;
   info.timestamp = realtime_.info_queue.front().timestamp +
                    output_packet_offset_ * NS_PER_SECOND / sample_rate_;
+  const uint64_t sample_duration_ns =
+      (NS_PER_SECOND + sample_rate_ - 1) / sample_rate_;
   uint64_t next_timestamp = info.timestamp;
   while (info.frames < available && !realtime_.info_queue.empty()) {
     const auto &packet = realtime_.info_queue.front();
@@ -776,16 +778,15 @@ DpdfnetProcessor::pop_output_packet(size_t processed_hops) {
     const uint64_t gap = timestamp > next_timestamp
                              ? timestamp - next_timestamp
                              : next_timestamp - timestamp;
-    // Coalesce contiguous packets, allowing integer timestamp rounding, but
-    // retain real gaps in the source timeline as output packet boundaries.
-    if (info.frames && gap > 1)
+    // Sub-sample timestamp jitter must not strand queued packets when packet
+    // sizes change. Keep larger gaps as output packet boundaries.
+    if (info.frames && gap > sample_duration_ns)
       break;
     const uint32_t frames = std::min(available - info.frames,
                                     packet.frames - output_packet_offset_);
     info.frames += frames;
     output_packet_offset_ += frames;
-    next_timestamp = packet.timestamp +
-                     output_packet_offset_ * NS_PER_SECOND / sample_rate_;
+    next_timestamp = info.timestamp + info.frames * NS_PER_SECOND / sample_rate_;
     if (output_packet_offset_ == packet.frames) {
       realtime_.info_queue.pop(1);
       output_packet_offset_ = 0;

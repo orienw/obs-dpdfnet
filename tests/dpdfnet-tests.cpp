@@ -285,7 +285,8 @@ void test_utf8_model_path(const std::filesystem::path &fixtures) {
 }
 
 void check_packet_drain(const std::string &model_path, uint32_t rate,
-                        const std::vector<uint32_t> &sizes, bool gaps = false) {
+                        const std::vector<uint32_t> &sizes, uint64_t gap_ns = 0,
+                        uint64_t jitter_ns = 0) {
   auto processor = make_processor(model_path, rate, 2);
   DpdfnetControls controls;
   controls.bypass = true;
@@ -304,14 +305,16 @@ void check_packet_drain(const std::string &model_path, uint32_t rate,
     channel.resize(prefill, 0.0f);
   std::deque<uint64_t> timestamps;
   uint64_t sent = 0, received = 0, gap = 0;
+  uint64_t last_output_timestamp = 0;
   size_t outputs = 0;
   for (size_t index = 0; index < sizes.size(); ++index) {
     const uint32_t frames = sizes[index];
-    if (gaps && index && index % 9 == 0)
-      gap += 10'000'000;
+    if (gap_ns && index && index % 9 == 0)
+      gap += gap_ns;
     DpdfnetAudioPacket packet;
     packet.frames = frames;
-    packet.timestamp = NS_PER_SECOND + sent * NS_PER_SECOND / rate + gap;
+    packet.timestamp = NS_PER_SECOND + sent * NS_PER_SECOND / rate + gap +
+                       (index % 2 ? jitter_ns : 0);
     std::array<std::vector<float>, 2> input;
     for (size_t channel = 0; channel < 2; ++channel) {
       input[channel].resize(frames);
@@ -332,6 +335,9 @@ void check_packet_drain(const std::string &model_path, uint32_t rate,
     if (result.disposition == DpdfnetDisposition::Processed) {
       require(result.frames && result.frames <= DPDFNET_MAX_REALTIME_PACKET_FRAMES,
               "drained output exceeded its realtime buffer");
+      require(result.timestamp >= last_output_timestamp,
+              "drained output timestamps moved backwards");
+      last_output_timestamp = result.timestamp;
       require(result.frames <= timestamps.size(), "processor emitted excess audio");
       for (uint64_t i = 0; i < result.frames; ++i) {
         const uint64_t timestamp = result.timestamp + i * NS_PER_SECOND / rate;
@@ -339,7 +345,8 @@ void check_packet_drain(const std::string &model_path, uint32_t rate,
         const uint64_t deviation = timestamp > expected_timestamp
                                        ? timestamp - expected_timestamp
                                        : expected_timestamp - timestamp;
-        require(deviation <= 2, "drained output changed sample timestamps or crossed a gap");
+        require(deviation <= jitter_ns + 2,
+                "drained output changed sample timestamps or crossed a gap");
         timestamps.pop_front();
         for (size_t channel = 0; channel < 2; ++channel) {
           require(result.data[channel][i] == expected[channel].front(),
@@ -360,6 +367,8 @@ void check_packet_drain(const std::string &model_path, uint32_t rate,
   require(sent - received <= bound, "packet size changes stranded buffered audio");
   require(processor.state().capacity_failures == 0,
           "valid packet stream exceeded the capacity plan");
+  require(processor.state().timestamp_discontinuities == 0,
+          "valid packet stream reset its timestamp history");
 }
 
 void test_variable_packets_and_bypass(const std::string &model_path) {
@@ -368,7 +377,7 @@ void test_variable_packets_and_bypass(const std::string &model_path) {
   for (size_t i = 0; i < 80; ++i)
     stream.push_back(sizes[i % std::size(sizes)]);
   check_packet_drain(model_path, 48000, stream);
-  check_packet_drain(model_path, 48000, stream, true);
+  check_packet_drain(model_path, 48000, stream, 10'000'000);
 }
 
 void test_packet_size_transitions(const std::string &model_path) {
@@ -381,6 +390,21 @@ void test_packet_size_transitions(const std::string &model_path) {
       stream.insert(stream.end(), 80, 137);
       check_packet_drain(model_path, rate, stream);
     }
+  }
+}
+
+void test_jittered_packet_size_transitions(const std::string &model_path) {
+  std::vector<uint32_t> stream(16, 256);
+  stream.insert(stream.end(), 184, 1024);
+  stream.insert(stream.end(), 128, 256);
+  stream.insert(stream.end(), 184, 2048);
+  stream.insert(stream.end(), 80, 137);
+  for (uint32_t rate : {48000, 44100, 96000}) {
+    const uint64_t jitter_ns = NS_PER_SECOND / rate;
+    check_packet_drain(model_path, rate, stream, 0, jitter_ns);
+    check_packet_drain(model_path, rate, stream, 10'000'000, jitter_ns);
+    check_packet_drain(model_path, rate, stream, 3 * NS_PER_SECOND / rate,
+                       jitter_ns);
   }
 }
 
@@ -1943,6 +1967,11 @@ int main(int argc, char **argv) {
            passed;
   passed = run_test("packet size transitions",
                     [&] { test_packet_size_transitions(low_cpu_model); }) && passed;
+  passed = run_test("jittered packet size transitions",
+                    [&] {
+                      test_jittered_packet_size_transitions(low_cpu_model);
+                    }) &&
+           passed;
   passed = run_test("delayed model lane and timestamp alignment",
                     [&] { test_model_delay_alignment(fixtures); }) && passed;
   passed = run_test("DPDFNet8 output delay",
