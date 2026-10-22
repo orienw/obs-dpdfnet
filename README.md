@@ -78,16 +78,20 @@ that fail the contract or produce non-finite warm-up output are rejected and
 the active model stays loaded.
 
 The `Status` line says what the filter is doing and what the listener hears.
+`Refresh` beside the status updates the processing load and diagnostics;
+measurements show the values at the last refresh. State changes, including
+pauses and recovery, update automatically.
+
 `Show details` in the `Diagnostics` group reveals the processing measurements
 for the current run: the active model, native or resampled operation, frame
-and hop sizes, and callback timing. Timing restarts on model, format,
+and hop sizes, model and STFT delay, and callback timing. The displayed delay
+excludes resampling and OBS buffering. Timing restarts on model, format,
 resampler, and reset changes; passthrough callbacks are not counted.
 Oversized-packet, buffer-capacity, and timestamp-jump counts persist until a
 reset or model change. A timestamp jump is audio arriving 70 ms or more away
 from where the previous packet ended, the point past which OBS stops smoothing
 timestamps; the filter drops its buffered audio and starts over. These are
 processing measurements, not end-to-end microphone latency.
-Press `Refresh` to update them.
 
 ## Build From Source On Windows
 

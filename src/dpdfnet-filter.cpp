@@ -821,8 +821,7 @@ public:
     } else if (overload) {
       result.severity = StatusSeverity::Warning;
       summary << "Paused\nAudio is passing through without noise suppression. "
-                 "Processing will retry in "
-              << retry_in_s << (retry_in_s == 1 ? " second." : " seconds.");
+                 "Processing retries automatically.";
     } else if (snapshot.processing_disabled) {
       result.severity = StatusSeverity::Error;
       summary << "Off\nProcessing failed repeatedly. Press Reset processing to "
@@ -863,7 +862,8 @@ public:
         const uint64_t load_percent = static_cast<uint64_t>(
             std::llround(static_cast<double>(timing.window_processing_ns) *
                          100.0 / static_cast<double>(timing.window_budget_ns)));
-        load_clause = ", " + std::to_string(load_percent) + "% processing load";
+        load_clause = ", " + std::to_string(load_percent) +
+                      "% processing load at last refresh";
       }
     }
     if (!load_error.empty() && snapshot.has_model) {
@@ -897,6 +897,12 @@ public:
       else
         text << ", " << khz(snapshot.model_rate) << " kHz native";
       text << ", " << frame_ms << " ms frame, " << hop_ms << " ms hop";
+      const double delay_ms = (model->output_delay_hops() * snapshot.hop_size +
+                               snapshot.n_fft - snapshot.hop_size) *
+                              1000.0 / snapshot.model_rate;
+      text << "\nModel and STFT delay: " << delay_ms << " ms";
+      if (snapshot.resampling)
+        text << ", plus resampling";
     } else {
       text << "Model: none loaded";
     }
@@ -912,8 +918,8 @@ public:
       text << (overload ? "\nLast overload: " : "\nLast error: ")
            << snapshot.last_error;
     if (overload) {
-      text << "\nNext retry: in " << retry_in_s << " s, attempt "
-           << retry_attempts;
+      text << "\nNext retry at last refresh: in " << retry_in_s
+           << " s, attempt " << retry_attempts;
     }
     if (snapshot.bypass)
       text << "\nBypass: on";
@@ -1381,8 +1387,6 @@ bool show_details_modified(void *data, obs_properties_t *props,
   const bool show = obs_data_get_bool(settings, SETTING_SHOW_DETAILS);
   if (obs_property_t *details = obs_properties_get(props, "status_info"))
     obs_property_set_visible(details, show);
-  if (obs_property_t *refresh = obs_properties_get(props, "refresh_status"))
-    obs_property_set_visible(refresh, show);
   if (show)
     update_status_properties(props, data);
   return true;
@@ -1413,6 +1417,10 @@ obs_properties_t *filter_properties(void *data) {
       status_group, "status_summary", status.summary.c_str(), OBS_TEXT_INFO);
   obs_property_text_set_info_type(summary, status_info_type(status.severity));
   obs_property_text_set_info_word_wrap(summary, true);
+  obs_property_t *refresh = obs_properties_add_button2(
+      status_group, "refresh_status", obs_module_text("DPDFNet.RefreshStatus"),
+      refresh_clicked, data);
+  set_tooltip(refresh, "DPDFNet.RefreshStatus.Tooltip");
   obs_properties_add_group(props, "status_group",
                            obs_module_text("DPDFNet.Status"), OBS_GROUP_NORMAL,
                            status_group);
@@ -1496,12 +1504,6 @@ obs_properties_t *filter_properties(void *data) {
       diagnostics, "status_info", status.text.c_str(), OBS_TEXT_INFO);
   obs_property_text_set_info_word_wrap(details, true);
   obs_property_set_visible(details, show_details);
-
-  obs_property_t *refresh = obs_properties_add_button2(
-      diagnostics, "refresh_status", obs_module_text("DPDFNet.RefreshStatus"),
-      refresh_clicked, data);
-  set_tooltip(refresh, "DPDFNet.RefreshStatus.Tooltip");
-  obs_property_set_visible(refresh, show_details);
 
   obs_property_t *reset = obs_properties_add_button2(
       diagnostics, "reset_state", obs_module_text("DPDFNet.ResetState"),

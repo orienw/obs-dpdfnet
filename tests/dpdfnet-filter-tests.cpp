@@ -581,6 +581,10 @@ void verify_properties_layout(obs_properties_t *properties,
               obs_properties_get(obs_property_group_content(status_group),
                                  "status_summary") != nullptr,
           "status line is not in its own normal group");
+  obs_property_t *refresh = obs_properties_get(
+      obs_property_group_content(status_group), "refresh_status");
+  require(refresh && obs_property_visible(refresh),
+          "Refresh is not available beside the status");
   require(processing_group &&
               obs_property_get_type(processing_group) == OBS_PROPERTY_GROUP &&
               obs_property_group_type(processing_group) == OBS_GROUP_NORMAL,
@@ -598,16 +602,13 @@ void verify_properties_layout(obs_properties_t *properties,
     require(obs_properties_get(processing, name) != nullptr,
             "processing group is missing a control");
   }
-  for (const char *name :
-       {"show_details", "status_info", "refresh_status", "reset_state"}) {
+  for (const char *name : {"show_details", "status_info", "reset_state"}) {
     require(obs_properties_get(diagnostics, name) != nullptr,
             "diagnostics group is missing a control");
   }
   const bool show_details = obs_data_get_bool(settings, "show_details");
   require(obs_property_visible(
-              obs_properties_get(diagnostics, "status_info")) == show_details &&
-              obs_property_visible(obs_properties_get(
-                  diagnostics, "refresh_status")) == show_details,
+              obs_properties_get(diagnostics, "status_info")) == show_details,
           "diagnostics details visibility does not follow Show details");
 
   for (const char *name :
@@ -688,7 +689,9 @@ void test_direct_callbacks(const std::string &model_path,
             "Show details did not reveal the diagnostics details");
     obs_data_set_bool(settings, "show_details", false);
     require(obs_property_modified(details_toggle, settings) &&
-                !obs_property_visible(details),
+                !obs_property_visible(details) &&
+                obs_property_visible(
+                    obs_properties_get(properties, "refresh_status")),
             "Show details did not hide the diagnostics details again");
     obs_property_t *refresh = obs_properties_get(properties, "refresh_status");
     require(refresh && obs_property_button_clicked(refresh, nullptr),
@@ -1005,6 +1008,26 @@ void test_status_transitions(const std::filesystem::path &fixtures) {
                   text.find("selected model failed to load") != std::string::npos,
               "model-load error hid bypass or its own warning");
     }
+  }
+}
+
+void test_model_delay_readout(const std::filesystem::path &fixtures) {
+  for (bool delayed : {false, true}) {
+    ObsData settings;
+    configure_custom_model(settings,
+                           (fixtures / (delayed ? "valid_delayed_identity.onnx"
+                                                : "valid_identity.onnx"))
+                               .string());
+    ObsSource source(obs_source_create_private(TEST_SOURCE_ID,
+                                               "model delay owner", settings));
+    DirectFilter filter(settings, source);
+    ObsProperties properties(dpdfnet_filter_info.get_properties(filter.get()));
+    const std::string details =
+        obs_property_description(obs_properties_get(properties, "status_info"));
+    require(details.find(delayed ? "Model and STFT delay: 50 ms"
+                                 : "Model and STFT delay: 10 ms") !=
+                std::string::npos,
+            "diagnostics did not include the model's declared delay and STFT");
   }
 }
 
@@ -1404,6 +1427,7 @@ int main(int argc, char **argv) {
     test_obs_lifecycle(model.string());
     test_failed_inference_counts_toward_load(argv[2], logs);
     test_status_transitions(argv[2]);
+    test_model_delay_readout(argv[2]);
     test_overload_retry_chain(argv[2], logs);
     test_jumps_do_not_rebuild_properties(argv[2], logs);
 
