@@ -916,6 +916,98 @@ void count_property_update(void *data, calldata_t *) {
       1, std::memory_order_relaxed);
 }
 
+template <typename Condition>
+bool eventually(const Condition &condition, int attempts = 1000) {
+  for (int attempt = 0; attempt < attempts; ++attempt) {
+    if (condition())
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+
+void test_status_transitions(const std::filesystem::path &fixtures) {
+  for (bool failing_model : {false, true}) {
+    ObsData settings;
+    configure_custom_model(
+        settings, (fixtures / (failing_model
+                                   ? "runtime_nonfinite_spectrum_output.onnx"
+                                   : "valid_identity.onnx"))
+                      .string());
+    ObsSource source(obs_source_create_private(TEST_SOURCE_ID,
+                                               "status owner", settings));
+    std::atomic<uint64_t> property_updates{0};
+    signal_handler_t *signals = obs_source_get_signal_handler(source);
+    signal_handler_connect(signals, "update_properties", count_property_update,
+                           &property_updates);
+    struct Disconnect {
+      signal_handler_t *signals;
+      std::atomic<uint64_t> *counter;
+      ~Disconnect() {
+        signal_handler_disconnect(signals, "update_properties",
+                                  count_property_update, counter);
+      }
+    } disconnect{signals, &property_updates};
+    DirectFilter filter(settings, source);
+    const auto summary = [&] {
+      ObsProperties properties(dpdfnet_filter_info.get_properties(filter.get()));
+      return std::string(obs_property_description(
+          obs_properties_get(properties, "status_summary")));
+    };
+    require(summary().rfind("Active\n", 0) == 0,
+            "status test did not start active");
+
+    if (failing_model) {
+      PacketStorage storage;
+      for (uint64_t packet = 0; packet < 2; ++packet) {
+        auto input = storage.direct_packet(1000000000ULL +
+                                            packet * PACKET_DURATION_NS);
+        dpdfnet_filter_info.filter_audio(filter.get(), &input);
+      }
+      require(eventually([&] { return property_updates.load() > 0; }),
+              "processing failure did not refresh properties");
+      require(summary().find("processing error") != std::string::npos,
+              "status did not show the transient failure");
+      const auto before = property_updates.load();
+      storage.left.fill(0);
+      storage.right.fill(0);
+      for (uint64_t packet = 2; packet < 102; ++packet) {
+        auto input = storage.direct_packet(1000000000ULL +
+                                            packet * PACKET_DURATION_NS);
+        dpdfnet_filter_info.filter_audio(filter.get(), &input);
+      }
+      require(eventually([&] { return property_updates.load() > before; }),
+              "processing recovery did not refresh properties");
+      require(summary().find("processing error") == std::string::npos,
+              "status retained a recovered processing error");
+    } else {
+      obs_source_set_enabled(source, false);
+      require(eventually([&] { return property_updates.load() > 0; }),
+              "disabling the filter did not refresh properties");
+      require(summary().rfind("Disabled\n", 0) == 0,
+              "disabled filter still claimed to be active");
+      const auto before = property_updates.load();
+      obs_source_set_enabled(source, true);
+      require(eventually([&] { return property_updates.load() > before; }),
+              "enabling the filter did not refresh properties");
+      require(summary().rfind("Active\n", 0) == 0,
+              "enabled filter did not return to active");
+
+      ObsProperties properties(dpdfnet_filter_info.get_properties(filter.get()));
+      obs_data_set_string(settings, "model_path",
+                          (fixtures / "missing.onnx").string().c_str());
+      obs_data_set_bool(settings, "bypass", true);
+      dpdfnet_filter_info.update(filter.get(), settings);
+      obs_property_modified(obs_properties_get(properties, "bypass"), settings);
+      const std::string text = obs_property_description(
+          obs_properties_get(properties, "status_summary"));
+      require(text.rfind("Bypass\n", 0) == 0 &&
+                  text.find("selected model failed to load") != std::string::npos,
+              "model-load error hid bypass or its own warning");
+    }
+  }
+}
+
 // Runs the filter's realtime overload handling end to end: the guard trips,
 // processing pauses, the worker retries on schedule in probe mode, a probe
 // that still overloads pauses again with the next delay, and a probe that
@@ -965,14 +1057,6 @@ void test_overload_retry_chain(const std::filesystem::path &fixtures,
     const char *text = obs_property_description(
         obs_properties_get(properties, "status_summary"));
     return std::string(text ? text : "");
-  };
-  const auto eventually = [](const auto &condition, int attempts = 1000) {
-    for (int attempt = 0; attempt < attempts; ++attempt) {
-      if (condition())
-        return true;
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    return false;
   };
   // Feeds overloaded audio until the filter logs a pause, and returns the
   // log index from before the trip. It watches the log, not the status:
@@ -1319,6 +1403,7 @@ int main(int argc, char **argv) {
     test_direct_callbacks(model.string(), log_probe);
     test_obs_lifecycle(model.string());
     test_failed_inference_counts_toward_load(argv[2], logs);
+    test_status_transitions(argv[2]);
     test_overload_retry_chain(argv[2], logs);
     test_jumps_do_not_rebuild_properties(argv[2], logs);
 

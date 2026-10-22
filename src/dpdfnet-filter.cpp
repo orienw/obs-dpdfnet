@@ -567,6 +567,8 @@ public:
     const uint64_t processor_started = os_gettime_ns();
     DpdfnetProcessResult result = processor_.process(packet);
     const uint64_t processor_finished = os_gettime_ns();
+    const bool processing_recovered =
+        before.consecutive_failures && !processor_.state().consecutive_failures;
     uint64_t realtime_processing_ns = processor_finished - processor_started;
 #ifdef DPDFNET_FILTER_TEST_HOOKS
     if (result.processed_hops)
@@ -667,7 +669,7 @@ public:
       request_worker(false, displaced, 0);
     }
     request_worker(format_resampler_refresh || result.resampler_refresh_needed,
-                   result, overload_retry_delay_ns);
+                   result, overload_retry_delay_ns, processing_recovered);
     return output;
   }
 
@@ -807,14 +809,16 @@ public:
     else
       model_label = snapshot.model_name + " (custom)";
 
-    // Two lines: a state word, then one plain sentence or a spec line.
+    // Lead with the audible state; report a rejected model separately.
     FilterStatus result;
     std::ostringstream summary;
     std::string load_clause;
     // A retry that is starting clears its deadline first; count it as 1 s.
     const uint64_t retry_in_s =
         std::max<uint64_t>(1, (retry_in_ns + 999'999'999) / 1'000'000'000);
-    if (overload) {
+    if (!obs_source_enabled(source_)) {
+      summary << "Disabled\nThe filter is turned off in OBS.";
+    } else if (overload) {
       result.severity = StatusSeverity::Warning;
       summary << "Paused\nAudio is passing through without noise suppression. "
                  "Processing will retry in "
@@ -832,17 +836,13 @@ public:
       result.severity = StatusSeverity::Error;
       summary << "Off\nNo model is loaded, so audio is passing through "
                  "unprocessed.";
-    } else if (!load_error.empty()) {
-      result.severity = StatusSeverity::Error;
-      summary << "Active\nThe selected model failed to load, so " << model_label
-              << " is still in use.";
+    } else if (snapshot.bypass) {
+      result.severity = StatusSeverity::Warning;
+      summary << "Bypass\nThe original audio is passing through.";
     } else if (snapshot.capacity_failures) {
       result.severity = StatusSeverity::Error;
       summary << "Active\nA buffer error passed some audio through "
                  "unprocessed.";
-    } else if (snapshot.bypass) {
-      result.severity = StatusSeverity::Warning;
-      summary << "Bypass\nThe original audio is passing through.";
     } else if (snapshot.consecutive_failures) {
       result.severity = StatusSeverity::Warning;
       summary << "Active\nRetrying after a processing error.";
@@ -859,12 +859,17 @@ public:
         summary << ", resampling from " << khz(snapshot.sample_rate) << " kHz";
       if (probe)
         summary << ", recovering after an overload";
-      if (timing.window_budget_ns) {
+      if (timing.window_budget_ns && load_error.empty()) {
         const uint64_t load_percent = static_cast<uint64_t>(
             std::llround(static_cast<double>(timing.window_processing_ns) *
                          100.0 / static_cast<double>(timing.window_budget_ns)));
         load_clause = ", " + std::to_string(load_percent) + "% processing load";
       }
+    }
+    if (!load_error.empty() && snapshot.has_model) {
+      result.severity = StatusSeverity::Error;
+      summary << "\nThe selected model failed to load; " << model_label
+              << " remains loaded.";
     }
     for (const char c : summary.str()) {
       if (c < '0' || c > '9')
@@ -911,8 +916,7 @@ public:
            << retry_attempts;
     }
     if (snapshot.bypass)
-      text << "\nBypass: on, delay-matched original audio with the model kept "
-              "warm";
+      text << "\nBypass: on";
     if (snapshot.oversized_packets) {
       text << "\nOversized packets: " << snapshot.oversized_packets
            << " over the " << DPDFNET_MAX_REALTIME_PACKET_FRAMES
@@ -1017,13 +1021,16 @@ private:
 
   void request_worker(bool resampler_refresh,
                       const DpdfnetProcessResult &result,
-                      uint64_t overload_retry_delay_ns) {
-    if (!resampler_refresh && result.event == DpdfnetEvent::None)
+                      uint64_t overload_retry_delay_ns,
+                      bool refresh_status = false) {
+    if (!resampler_refresh && !refresh_status &&
+        result.event == DpdfnetEvent::None)
       return;
 
     {
       std::lock_guard<std::mutex> lock(resampler_request_mutex_);
       resampler_refresh_requested_ |= resampler_refresh;
+      status_refresh_requested_ |= refresh_status;
       if (result.event != DpdfnetEvent::None) {
         const size_t index = static_cast<size_t>(result.event) - 1;
         if (index < callback_diagnostics_.size()) {
@@ -1104,7 +1111,7 @@ private:
     std::unique_lock<std::mutex> request_lock(resampler_request_mutex_);
     const auto ready = [this] {
       return stop_resampler_worker_ || resampler_refresh_requested_ ||
-             callback_diagnostic_pending();
+             status_refresh_requested_ || callback_diagnostic_pending();
     };
     for (;;) {
       if (overload_retry_deadline_ns_) {
@@ -1127,11 +1134,14 @@ private:
         overload_retry_deadline_ns_ = 0;
       const bool refresh_resamplers = resampler_refresh_requested_;
       resampler_refresh_requested_ = false;
+      const bool refresh_status = status_refresh_requested_;
+      status_refresh_requested_ = false;
       auto diagnostics = callback_diagnostics_;
       for (auto &diagnostic : callback_diagnostics_)
         diagnostic.pending = false;
       request_lock.unlock();
-      bool status_changed = refresh_resamplers || retry_overload;
+      bool status_changed =
+          refresh_status || refresh_resamplers || retry_overload;
       for (const auto &diagnostic : diagnostics) {
         if (diagnostic.pending) {
           log_callback_diagnostic(diagnostic);
@@ -1224,8 +1234,10 @@ private:
   }
 
   static void enabled_changed(void *data, calldata_t *params) {
+    auto *filter = static_cast<DpdfnetFilter *>(data);
     if (!calldata_bool(params, "enabled"))
-      static_cast<DpdfnetFilter *>(data)->reset_stream_boundary();
+      filter->reset_stream_boundary();
+    filter->request_worker(false, {}, 0, true);
   }
 
   static bool paths_equivalent_for_status(const std::string &left,
@@ -1258,6 +1270,7 @@ private:
   mutable std::mutex resampler_request_mutex_;
   std::condition_variable resampler_request_cv_;
   bool resampler_refresh_requested_ = false;
+  bool status_refresh_requested_ = false;
   uint64_t overload_retry_deadline_ns_ = 0;
   std::array<CallbackDiagnostic, static_cast<size_t>(DpdfnetEvent::Count) - 1>
       callback_diagnostics_ = {};
