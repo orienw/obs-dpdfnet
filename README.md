@@ -157,7 +157,8 @@ this project's own code fatal, as Linux CI does.
 
 ## Tests And Benchmarks
 
-The Windows gate builds the plugin and tools and runs every test:
+The Windows gate requires Python 3 for WAV input validation. It builds the
+plugin and tools and runs every test:
 
 ```powershell
 .\scripts\build-windows-msvc.ps1

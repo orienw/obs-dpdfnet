@@ -13,21 +13,27 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 constexpr uint32_t kSampleRate = 48000;
 constexpr uint64_t kNanosecondsPerSecond = 1000000000ULL;
 
+void read_exact(std::istream &input, char *bytes, std::streamsize size) {
+  if (!input.read(bytes, size))
+    throw std::runtime_error("truncated WAV file");
+}
+
 uint16_t read_u16(std::istream &input) {
   uint8_t bytes[2] = {};
-  input.read(reinterpret_cast<char *>(bytes), sizeof(bytes));
+  read_exact(input, reinterpret_cast<char *>(bytes), sizeof(bytes));
   return static_cast<uint16_t>(bytes[0]) | static_cast<uint16_t>(bytes[1] << 8);
 }
 
 uint32_t read_u32(std::istream &input) {
   uint8_t bytes[4] = {};
-  input.read(reinterpret_cast<char *>(bytes), sizeof(bytes));
+  read_exact(input, reinterpret_cast<char *>(bytes), sizeof(bytes));
   return static_cast<uint32_t>(bytes[0]) |
          (static_cast<uint32_t>(bytes[1]) << 8) |
          (static_cast<uint32_t>(bytes[2]) << 16) |
@@ -52,12 +58,21 @@ std::vector<float> read_mono_wav(const std::filesystem::path &path) {
   if (!input)
     throw std::runtime_error("could not open WAV file: " + path.string());
 
+  input.seekg(0, std::ios::end);
+  const std::streamoff file_size = input.tellg();
+  input.seekg(0);
+  if (file_size < 12 || !input)
+    throw std::runtime_error("truncated WAV file: " + path.string());
+
   char id[4] = {};
-  input.read(id, 4);
+  read_exact(input, id, 4);
   if (std::string(id, 4) != "RIFF")
     throw std::runtime_error("WAV is not RIFF: " + path.string());
-  read_u32(input);
-  input.read(id, 4);
+  const uint32_t riff_size = read_u32(input);
+  if (riff_size < 4 ||
+      static_cast<uint64_t>(riff_size) + 8 > static_cast<uint64_t>(file_size))
+    throw std::runtime_error("invalid WAV RIFF size: " + path.string());
+  read_exact(input, id, 4);
   if (std::string(id, 4) != "WAVE")
     throw std::runtime_error("WAV is not WAVE: " + path.string());
 
@@ -66,12 +81,20 @@ std::vector<float> read_mono_wav(const std::filesystem::path &path) {
   uint32_t sample_rate = 0;
   uint16_t bits = 0;
   std::vector<uint8_t> data;
-  while (input && data.empty()) {
-    input.read(id, 4);
-    if (!input)
-      break;
+  uint64_t remaining = riff_size - 4;
+  bool have_data = false;
+  while (remaining && !have_data) {
+    if (remaining < 8)
+      throw std::runtime_error("truncated WAV chunk header");
+    read_exact(input, id, 4);
     const uint32_t size = read_u32(input);
+    remaining -= 8;
+    const uint64_t padded_size = static_cast<uint64_t>(size) + (size & 1);
+    if (padded_size > remaining)
+      throw std::runtime_error("WAV chunk exceeds RIFF size");
     if (std::string(id, 4) == "fmt ") {
+      if (size < 16)
+        throw std::runtime_error("WAV format chunk is too short");
       format = read_u16(input);
       channels = read_u16(input);
       sample_rate = read_u32(input);
@@ -82,12 +105,16 @@ std::vector<float> read_mono_wav(const std::filesystem::path &path) {
         input.seekg(size - 16, std::ios::cur);
     } else if (std::string(id, 4) == "data") {
       data.resize(size);
-      input.read(reinterpret_cast<char *>(data.data()), size);
+      read_exact(input, reinterpret_cast<char *>(data.data()), size);
+      have_data = true;
     } else {
       input.seekg(size, std::ios::cur);
     }
     if (size & 1)
       input.seekg(1, std::ios::cur);
+    if (!input)
+      throw std::runtime_error("could not read WAV chunk");
+    remaining -= padded_size;
   }
 
   if (channels != 1 || sample_rate != kSampleRate)
@@ -95,6 +122,8 @@ std::vector<float> read_mono_wav(const std::filesystem::path &path) {
 
   std::vector<float> samples;
   if (format == 1 && bits == 16) {
+    if (data.size() % 2)
+      throw std::runtime_error("WAV data contains a partial PCM16 sample");
     samples.resize(data.size() / 2);
     for (size_t i = 0; i < samples.size(); ++i) {
       const uint16_t raw = static_cast<uint16_t>(data[i * 2]) |
@@ -102,6 +131,8 @@ std::vector<float> read_mono_wav(const std::filesystem::path &path) {
       samples[i] = static_cast<int16_t>(raw) / 32768.0f;
     }
   } else if (format == 3 && bits == 32) {
+    if (data.size() % sizeof(float))
+      throw std::runtime_error("WAV data contains a partial float32 sample");
     samples.resize(data.size() / sizeof(float));
     std::memcpy(samples.data(), data.data(), samples.size() * sizeof(float));
   } else {
@@ -188,7 +219,14 @@ std::vector<float> process(const std::string &model_path,
                            const std::vector<float> &input) {
   DpdfnetProcessor processor;
   processor.set_format(kSampleRate, 1);
-  processor.replace_model(prepare_dpdfnet_model(model_path));
+  auto model = prepare_dpdfnet_model(model_path);
+  auto resamplers = prepare_dpdfnet_resamplers(
+      kSampleRate, model.model->sample_rate(), model.model->hop_size());
+  // Align the samples with the reference instead of using output timestamps.
+  size_t skip_output_frames = resamplers.prefill_frames();
+  prefill_dpdfnet_model_bundle(model, 1, resamplers.prefill_frames());
+  processor.replace_model(std::move(model));
+  processor.replace_resamplers(std::move(resamplers), false);
   DpdfnetControls controls;
   controls.attenuation_limit_db = 24.0;
   controls.wet_mix = 1.0;
@@ -219,9 +257,12 @@ std::vector<float> process(const std::string &model_path,
       throw std::runtime_error(result.message.data());
     if (result.disposition == DpdfnetDisposition::Passthrough)
       throw std::runtime_error("quality processor unexpectedly passed through");
-    if (result.disposition == DpdfnetDisposition::Processed)
-      output.insert(output.end(), result.data[0],
+    if (result.disposition == DpdfnetDisposition::Processed) {
+      const size_t skip = std::min<size_t>(skip_output_frames, result.frames);
+      skip_output_frames -= skip;
+      output.insert(output.end(), result.data[0] + skip,
                     result.data[0] + result.frames);
+    }
     if (input_offset < input.size())
       input_offset += frames;
     timestamp += static_cast<uint64_t>(static_cast<double>(frames) /

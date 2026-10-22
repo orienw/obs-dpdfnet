@@ -221,6 +221,9 @@ Invoke-TestExecutable -Name "obs-dpdfnet-tests" -Arguments @(
 Invoke-TestExecutable -Name "obs-dpdfnet-filter-tests" -Arguments @(
     $QualityModel, $Fixtures
 )
+python (Join-Path $Root "tests\quality-benchmark-tests.py") `
+    (Join-Path $OutputDir "dpdfnet-quality-benchmark.exe") $Fixtures
+if ($LASTEXITCODE -ne 0) { throw "Quality benchmark WAV validation failed" }
 
 # Install a copy with the release installer and load it the way OBS does.
 # OBS searches a plugin's own folder and the application folder for its

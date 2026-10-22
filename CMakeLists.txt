@@ -323,6 +323,16 @@ if(DPDFNET_BUILD_TESTS)
   )
   set(dpdfnet_test_names processor filter-integration)
 
+  if(DPDFNET_BUILD_QUALITY_BENCHMARK)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME quality-benchmark COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/quality-benchmark-tests.py"
+      $<TARGET_FILE:dpdfnet-quality-benchmark>
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/model-contract"
+    )
+    list(APPEND dpdfnet_test_names quality-benchmark)
+  endif()
+
   # Installs into the build tree and loads that copy the way OBS does, so the
   # install layout, runtime library lookup, bundled models, and locale are
   # tested together. Needs relative destinations and the bundled runtime.
