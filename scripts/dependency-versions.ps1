@@ -4,7 +4,7 @@
 # release builds against the oldest OBS it supports and CI also tests it on
 # the current one.
 $DpdfnetMinimumObsVersion = "32.0.0"
-$DpdfnetCurrentObsVersion = "32.2.2"
+$DpdfnetCurrentObsVersion = "33.0.0"
 $DpdfnetDefaultOnnxRuntimeVersion = "1.27.0"
 $DpdfnetDefaultPluginVersion = (Get-Content -Raw -LiteralPath (Join-Path (Split-Path $PSScriptRoot) "VERSION")).Trim()
 $DpdfnetDefaultModelName = "dpdfnet8_48khz_hr"
@@ -20,6 +20,7 @@ $DpdfnetKnownObsRuntimeHashes = @{
     "32.0.0" = "96ebdcc3e5709825303803e5368b5d7ef04dfbd40c2ce6308fe06a6043066fa0"
     "32.2.1" = "db64a2934f8261f85b1410b84be011207a0afda5400d008289f1f1e211bcc7de"
     "32.2.2" = "4d6e40e3ab155f56b30de517380566a206d74b63cdf5ad49aa596924768f97e1"
+    "33.0.0" = "3369a3ecd67b5669a8a08d77357f87cc786d1fba42fbbd1054d841a69f6271a7"
 }
 
 # The OBS source archives whose headers the plugin builds against.
