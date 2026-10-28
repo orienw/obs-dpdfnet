@@ -339,14 +339,9 @@ void check_packet_drain(const std::string &model_path, uint32_t rate,
               "drained output timestamps moved backwards");
       last_output_timestamp = result.timestamp;
       require(result.frames <= timestamps.size(), "processor emitted excess audio");
+      require(result.timestamp == timestamps.front(),
+              "drained output changed its first sample timestamp");
       for (uint64_t i = 0; i < result.frames; ++i) {
-        const uint64_t timestamp = result.timestamp + i * NS_PER_SECOND / rate;
-        const uint64_t expected_timestamp = timestamps.front();
-        const uint64_t deviation = timestamp > expected_timestamp
-                                       ? timestamp - expected_timestamp
-                                       : expected_timestamp - timestamp;
-        require(deviation <= jitter_ns + 2,
-                "drained output changed sample timestamps or crossed a gap");
         timestamps.pop_front();
         for (size_t channel = 0; channel < 2; ++channel) {
           require(result.data[channel][i] == expected[channel].front(),
@@ -405,6 +400,20 @@ void test_jittered_packet_size_transitions(const std::string &model_path) {
     check_packet_drain(model_path, rate, stream, 10'000'000, jitter_ns);
     check_packet_drain(model_path, rate, stream, 3 * NS_PER_SECOND / rate,
                        jitter_ns);
+  }
+}
+
+void test_packet_size_transitions_with_clock_jitter(
+    const std::filesystem::path &fixtures) {
+  const std::string model = (fixtures / "valid_delayed_identity.onnx").string();
+  for (uint32_t rate : {48000, 44100, 96000}) {
+    for (uint64_t jitter_ns : {2 * NS_PER_SECOND / rate, uint64_t{100'000}}) {
+      for (uint32_t small : {64u, 256u}) {
+        std::vector<uint32_t> stream(100, small);
+        stream.insert(stream.end(), 100, small == 64 ? 2048u : 1024u);
+        check_packet_drain(model, rate, stream, 0, jitter_ns);
+      }
+    }
   }
 }
 
@@ -1970,6 +1979,11 @@ int main(int argc, char **argv) {
   passed = run_test("jittered packet size transitions",
                     [&] {
                       test_jittered_packet_size_transitions(low_cpu_model);
+                    }) &&
+           passed;
+  passed = run_test("packet size transitions with clock jitter",
+                    [&] {
+                      test_packet_size_transitions_with_clock_jitter(fixtures);
                     }) &&
            passed;
   passed = run_test("delayed model lane and timestamp alignment",

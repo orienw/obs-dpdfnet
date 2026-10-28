@@ -91,7 +91,9 @@ Oversized-packet, buffer-capacity, and timestamp-jump counts persist until a
 reset or model change. A timestamp jump is audio arriving 70 ms or more away
 from where the previous packet ended, the point past which OBS stops smoothing
 timestamps; the filter drops its buffered audio and starts over. These are
-processing measurements, not end-to-end microphone latency.
+processing measurements, not end-to-end microphone latency. Smaller timestamp
+deviations are treated as continuous audio when draining queued packets, as
+OBS does when buffering the filter's output.
 
 ## Build From Source On Windows
 

@@ -768,25 +768,15 @@ DpdfnetProcessor::pop_output_packet(size_t processed_hops) {
   DpdfnetPacketInfo info;
   info.timestamp = realtime_.info_queue.front().timestamp +
                    output_packet_offset_ * NS_PER_SECOND / sample_rate_;
-  const uint64_t sample_duration_ns =
-      (NS_PER_SECOND + sample_rate_ - 1) / sample_rate_;
-  uint64_t next_timestamp = info.timestamp;
+  // timestamp_jump() already separates discontinuous streams. OBS smooths
+  // smaller deviations, so drain their samples together instead of leaving
+  // one queued packet behind for every jittered packet boundary.
   while (info.frames < available && !realtime_.info_queue.empty()) {
     const auto &packet = realtime_.info_queue.front();
-    const uint64_t timestamp =
-        packet.timestamp + output_packet_offset_ * NS_PER_SECOND / sample_rate_;
-    const uint64_t gap = timestamp > next_timestamp
-                             ? timestamp - next_timestamp
-                             : next_timestamp - timestamp;
-    // Sub-sample timestamp jitter must not strand queued packets when packet
-    // sizes change. Keep larger gaps as output packet boundaries.
-    if (info.frames && gap > sample_duration_ns)
-      break;
     const uint32_t frames = std::min(available - info.frames,
                                     packet.frames - output_packet_offset_);
     info.frames += frames;
     output_packet_offset_ += frames;
-    next_timestamp = info.timestamp + info.frames * NS_PER_SECOND / sample_rate_;
     if (output_packet_offset_ == packet.frames) {
       realtime_.info_queue.pop(1);
       output_packet_offset_ = 0;
