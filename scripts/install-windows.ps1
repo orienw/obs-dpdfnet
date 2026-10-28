@@ -18,6 +18,67 @@ $BuildPath = Resolve-Path $BuildDir
 $BinDir = Join-Path $PluginRoot "bin\64bit"
 $DataDir = Join-Path $PluginRoot "data"
 
+function Get-OnnxRuntimeImport {
+    param([string]$Path)
+
+    $Reader = [System.IO.BinaryReader]::new([System.IO.File]::OpenRead($Path))
+    try {
+        if ($Reader.ReadUInt16() -ne 0x5a4d) { throw "Not a Windows DLL: $Path" }
+        $Reader.BaseStream.Position = 0x3c
+        $PeOffset = $Reader.ReadUInt32()
+        $Reader.BaseStream.Position = $PeOffset
+        if ($Reader.ReadUInt32() -ne 0x4550) { throw "Invalid PE signature: $Path" }
+        $Reader.BaseStream.Position = $PeOffset + 6
+        $SectionCount = $Reader.ReadUInt16()
+        $Reader.BaseStream.Position = $PeOffset + 20
+        $OptionalHeaderSize = $Reader.ReadUInt16()
+        $OptionalHeader = $PeOffset + 24
+        $Reader.BaseStream.Position = $OptionalHeader
+        if ($Reader.ReadUInt16() -ne 0x20b) { throw "Expected a 64-bit Windows DLL: $Path" }
+
+        # PE32+ data directory entry 1 describes the DLL import table.
+        $Reader.BaseStream.Position = $OptionalHeader + 120
+        $ImportRva = $Reader.ReadUInt32()
+        $ImportSize = $Reader.ReadUInt32()
+        $Sections = @(for ($Index = 0; $Index -lt $SectionCount; ++$Index) {
+            $Reader.BaseStream.Position = $OptionalHeader + $OptionalHeaderSize + $Index * 40 + 12
+            [PSCustomObject]@{
+                Rva = $Reader.ReadUInt32()
+                Size = $Reader.ReadUInt32()
+                Offset = $Reader.ReadUInt32()
+            }
+        })
+
+        function Get-FileOffset([uint32]$Rva) {
+            foreach ($Section in $Sections) {
+                if ($Rva -ge $Section.Rva -and [long]$Rva -lt [long]$Section.Rva + $Section.Size) {
+                    return [long]$Section.Offset + $Rva - $Section.Rva
+                }
+            }
+            throw "DLL import address is outside the PE sections: $Path"
+        }
+
+        $ImportOffset = Get-FileOffset $ImportRva
+        for ($Offset = 0; $Offset -lt $ImportSize; $Offset += 20) {
+            $Reader.BaseStream.Position = $ImportOffset + $Offset + 12
+            $NameRva = $Reader.ReadUInt32()
+            if (!$NameRva) { break }
+            $Reader.BaseStream.Position = Get-FileOffset $NameRva
+            $Name = [System.Text.StringBuilder]::new()
+            while (($Byte = $Reader.ReadByte()) -ne 0) {
+                [void]$Name.Append([char]$Byte)
+            }
+            $Name = $Name.ToString().ToLowerInvariant()
+            if ($Name -in @("onnxruntime.dll", "onnxruntime_dpdfnet.dll")) {
+                return $Name
+            }
+        }
+        throw "No supported ONNX Runtime DLL import was found in $Path."
+    } finally {
+        $Reader.Dispose()
+    }
+}
+
 # The MSVC script and CMake's Visual Studio generator put the plugin in
 # <BuildDir>\<Configuration>; single-config CMake generators put it in
 # <BuildDir>. Anything else must be unambiguous.
@@ -39,20 +100,17 @@ if ($Candidates.Count -eq 0) {
 $Dll = Get-Item -LiteralPath @($Candidates)[0]
 $PluginBuildDir = $Dll.DirectoryName
 
-# ONNX Runtime comes from the plugin's own build directory, under the name
-# that build links: the MSVC script renames it onnxruntime_dpdfnet.dll, a
-# CMake build keeps onnxruntime.dll. The other name is removed, so an
-# earlier install cannot leave a mismatched copy behind.
-$RenamedOrtDll = Join-Path $PluginBuildDir "onnxruntime_dpdfnet.dll"
-$OrtDll = Join-Path $PluginBuildDir "onnxruntime.dll"
-if (Test-Path -LiteralPath $RenamedOrtDll -PathType Leaf) {
-    $SelectedOrtDll = $RenamedOrtDll
+# Select the DLL the plugin imports, even when another build left its runtime
+# in the same directory. Remove the other name from the installation.
+$RuntimeName = Get-OnnxRuntimeImport $Dll.FullName
+$SelectedOrtDll = Join-Path $PluginBuildDir $RuntimeName
+if (!(Test-Path -LiteralPath $SelectedOrtDll -PathType Leaf)) {
+    throw "ONNX Runtime was not found at $SelectedOrtDll, as imported by $($Dll.FullName). Rebuild; the plugin does not load without it."
+}
+if ($RuntimeName -eq "onnxruntime_dpdfnet.dll") {
     $ObsoleteOrtName = "onnxruntime.dll"
-} elseif (Test-Path -LiteralPath $OrtDll -PathType Leaf) {
-    $SelectedOrtDll = $OrtDll
-    $ObsoleteOrtName = "onnxruntime_dpdfnet.dll"
 } else {
-    throw "ONNX Runtime was not found next to $($Dll.FullName). Rebuild; the plugin does not load without it."
+    $ObsoleteOrtName = "onnxruntime_dpdfnet.dll"
 }
 
 # ONNX Runtime's license and third-party notices go wherever its DLLs go.
