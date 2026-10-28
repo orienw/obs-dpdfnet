@@ -16,9 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Test installer preflight
+      - name: Test Windows scripts
         shell: pwsh
-        run: ./tests/install-windows-tests.ps1
+        run: |
+          ./tests/install-windows-tests.ps1
+          ./tests/update-windows-tests.ps1
 
       # The tests run on the current OBS, and the module test also loads the
       # plugin into the oldest OBS it supports, the one it is built against.

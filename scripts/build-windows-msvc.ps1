@@ -6,7 +6,8 @@ param(
     [string]$ModelName = "",
     [string]$ObsInstallDir = "C:\Program Files\obs-studio",
     [string]$Configuration = "Release",
-    [string]$PluginVersion = ""
+    [string]$PluginVersion = "",
+    [string]$BuildDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -244,7 +245,10 @@ function New-ImportLibrary {
 }
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$BuildDir = Join-Path $Root "build\msvc"
+if ([string]::IsNullOrWhiteSpace($BuildDir)) {
+    $BuildDir = Join-Path $Root "build\msvc"
+}
+$BuildDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BuildDir)
 $OutputDir = Join-Path $BuildDir $Configuration
 $ThirdParty = Join-Path $Root "third_party"
 $GeneratedObs = Join-Path $BuildDir "generated-obs"

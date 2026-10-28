@@ -202,7 +202,8 @@ if ($Build) {
     & (Join-Path $PSScriptRoot "build-windows-msvc.ps1") `
         -ObsVersion $ObsVersion `
         -OnnxRuntimeVersion $resolvedOnnxRuntimeVersion `
-        -ModelName $DefaultModelName
+        -ModelName $DefaultModelName `
+        -BuildDir $BuildDir
 }
 
 if ($Install) {
