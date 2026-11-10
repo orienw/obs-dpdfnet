@@ -7,16 +7,20 @@ enhances the selected mono channel in 10 ms hops, and returns the result as a
 regular OBS audio filter. It is tuned for a close dynamic microphone at 48 kHz.
 Everything runs locally; the plugin makes no network requests.
 
-Tested on Windows x64 and Linux. Release builds are Windows only; Linux
-builds from source with CMake.
+Tested on Windows x64, Linux, and macOS on Apple silicon. Release builds are
+for Windows and macOS; Linux builds from source with CMake.
 
 ## Install A Release Build
 
+Download the zip for your system from
+[GitHub releases](https://github.com/orienw/obs-dpdfnet/releases).
+
+### Windows
+
 Requirements: Windows 10/11 64-bit and OBS Studio 32.0 or later, x64.
 
-Download the zip from
-[GitHub releases](https://github.com/orienw/obs-dpdfnet/releases). The binary
-is unsigned, so SmartScreen or Defender may warn on download or first load.
+The binary is unsigned, so SmartScreen or Defender may warn on download or
+first load.
 
 1. Close OBS.
 2. Extract the zip and copy the `obs-dpdfnet` folder into
@@ -32,6 +36,34 @@ zip on the release page:
 
 ```powershell
 Get-FileHash .\obs-dpdfnet-<version>-windows-x64.zip -Algorithm SHA256
+```
+
+### macOS
+
+Requirements: a Mac with Apple silicon, macOS 14 or later, and OBS Studio 32.0
+or later.
+
+The plugin is not notarized, so macOS blocks it until you clear the download
+flag in step 3.
+
+1. Quit OBS.
+2. Extract the zip and copy `obs-dpdfnet.plugin` into
+   `~/Library/Application Support/obs-studio/plugins/`. Create the `plugins`
+   folder if it does not exist.
+3. In Terminal, run:
+
+   ```bash
+   xattr -dr com.apple.quarantine ~/Library/Application\ Support/obs-studio/plugins/obs-dpdfnet.plugin
+   ```
+
+4. Start OBS and add the filter:
+   `Audio Mixer -> mic gear -> Filters -> + -> DPDFNet Noise Suppression`
+
+To verify the download, compare this hash with the SHA-256 shown next to the
+zip on the release page:
+
+```bash
+shasum -a 256 obs-dpdfnet-<version>-macos-arm64.zip
 ```
 
 ## Settings
@@ -112,8 +144,8 @@ afterwards.
 
 ## CMake Build
 
-CMake is the manual path for contributors, custom OBS builds, and Linux. It
-needs CMake 3.24+, a C++17 compiler, OBS Studio 30 or later development files
+CMake is the manual path for contributors, custom OBS builds, Linux, and
+macOS. It needs CMake 3.24+, a C++17 compiler, OBS Studio 30 or later development files
 with `libobsConfig.cmake`, and an ONNX Runtime package. KissFFT is fetched at
 configure time unless `DPDFNET_FETCH_KISSFFT` is off.
 
@@ -142,14 +174,35 @@ cmake --install build --prefix ~/.config/obs-studio/plugins/obs-dpdfnet
 Point `libobs_DIR` at an OBS build tree instead if your OBS package ships no
 CMake files. Restart OBS after installing.
 
+macOS on Apple silicon, installing into the OBS user plugin folder:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+  -Dlibobs_DIR="$PWD/cmake/macos" \
+  -DOBS_SOURCE_DIR="/path/to/obs-studio" \
+  -DOBS_APP=/Applications/OBS.app \
+  -DONNXRUNTIME_ROOT="/path/to/onnxruntime"
+cmake --build build
+cmake --install build --prefix ~/Library/Application\ Support/obs-studio/plugins
+```
+
+OBS publishes no development files for macOS, so `cmake/macos` stands in for
+its CMake package: it takes the headers from an OBS source tree and libobs
+from an OBS.app. Check out the source at the version of that app. The build
+loads into that OBS version and later ones. It also needs the SIMDe headers
+(`brew install simde`) and the ONNX Runtime `osx-arm64` package.
+
 The install layout defaults to `obs-plugins/64bit` and
-`data/obs-plugins/obs-dpdfnet`; override `DPDFNET_PLUGIN_DESTINATION` and
-`DPDFNET_DATA_DESTINATION` for other packages. ONNX Runtime shared libraries
-are copied next to built targets and installed with the plugin unless
+`data/obs-plugins/obs-dpdfnet`, and on macOS to an `obs-dpdfnet.plugin`
+bundle; override `DPDFNET_PLUGIN_DESTINATION` and `DPDFNET_DATA_DESTINATION`
+for other packages. ONNX Runtime shared libraries are copied next to built
+targets and installed with the plugin unless
 `DPDFNET_COPY_RUNTIME_DEPENDENCIES` or `DPDFNET_INSTALL_RUNTIME_DEPENDENCIES`
 is off. On Linux, install `patchelf` before configuring: the build uses it to
 install ONNX Runtime as `libonnxruntime_dpdfnet.so`, so it cannot clash with
-another OBS plugin's copy. On Windows, a CMake install keeps the stock
+another OBS plugin's copy. On macOS the build renames it the same way with
+the system tools. On Windows, a CMake install keeps the stock
 `onnxruntime.dll` name, which can clash; share builds made with the PowerShell
 scripts, which rename it.
 
