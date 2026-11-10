@@ -178,9 +178,11 @@ jobs:
         if: github.event_name == 'push'
         run: |
           ./scripts/release-macos.sh build
-          # The plugin in the zip is intact and loads.
+          # The notes name the versions this job pins, and the plugin in the
+          # zip is intact and loads.
           unzip -q build/obs-dpdfnet-*-macos-arm64.zip -d unpacked
-          test -f unpacked/INSTALL.txt
+          grep -F "Built against OBS Studio $OBS_MINIMUM_VERSION and ONNX Runtime $ONNXRUNTIME_VERSION." \
+            unpacked/INSTALL.txt
           bundle=unpacked/obs-dpdfnet.plugin
           codesign --verify --deep --strict "$bundle"
           build/dpdfnet-module-test "$bundle/Contents/MacOS/obs-dpdfnet" \
