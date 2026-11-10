@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Export only the OBS module entry points. The pattern also matches
+# obs_module_load_locale, which the plugin imports from libobs, so the linker
+# re-exports that one.
+_obs_module_*

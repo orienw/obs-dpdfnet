@@ -32,8 +32,16 @@ option(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES "Install ONNX Runtime shared librari
 option(DPDFNET_WARNINGS_AS_ERRORS "Fail on compiler warnings in this project's own code" OFF)
 
 set(DPDFNET_PLUGIN_VERSION "${dpdfnet_version}")
-set(DPDFNET_PLUGIN_DESTINATION "obs-plugins/64bit" CACHE STRING "Install destination for the OBS plugin binary")
-set(DPDFNET_DATA_DESTINATION "data/obs-plugins/obs-dpdfnet" CACHE STRING "Install destination for OBS plugin data")
+if(APPLE)
+  # OBS loads a macOS plugin as a bundle.
+  set(default_plugin_destination "obs-dpdfnet.plugin/Contents/MacOS")
+  set(default_data_destination "obs-dpdfnet.plugin/Contents/Resources")
+else()
+  set(default_plugin_destination "obs-plugins/64bit")
+  set(default_data_destination "data/obs-plugins/obs-dpdfnet")
+endif()
+set(DPDFNET_PLUGIN_DESTINATION "${default_plugin_destination}" CACHE STRING "Install destination for the OBS plugin binary")
+set(DPDFNET_DATA_DESTINATION "${default_data_destination}" CACHE STRING "Install destination for OBS plugin data")
 
 set(DPDFNET_PLATFORM_COMPILE_DEFINITIONS)
 if(WIN32)
@@ -44,47 +52,64 @@ find_package(libobs CONFIG REQUIRED)
 find_package(ONNXRuntime REQUIRED)
 find_package(Threads REQUIRED)
 
-# The plugin links and ships these. On Linux the bundled ONNX Runtime gets a
-# private soname: the dynamic loader shares libraries by soname across all
-# plugins, so another ONNX-based plugin's libonnxruntime.so.1 would otherwise
-# replace ours, or ours theirs, whichever loads first.
+# The plugin links and ships these. On Linux and macOS the bundled ONNX Runtime
+# gets a private name: the dynamic loader shares libraries by soname, or on
+# macOS by install name, across all plugins, so another ONNX-based plugin's
+# ONNX Runtime would otherwise replace ours, or ours theirs, whichever loads
+# first.
 set(DPDFNET_ONNXRUNTIME_TARGET ONNXRuntime::ONNXRuntime)
 set(DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES ${ONNXRUNTIME_RUNTIME_DEPENDENCIES})
+set(private_onnxruntime)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
   find_program(DPDFNET_PATCHELF patchelf)
   if(DPDFNET_PATCHELF)
-    set(private_onnxruntime_name "libonnxruntime_dpdfnet.so")
+    set(private_onnxruntime_soname "libonnxruntime_dpdfnet.so")
     set(private_onnxruntime
-      "${CMAKE_BINARY_DIR}/onnxruntime-private/${private_onnxruntime_name}")
-    # Made at build time from the stock library, so replacing ONNX Runtime in
-    # place refreshes the private copy instead of linking a stale one.
-    add_custom_command(
-      OUTPUT "${private_onnxruntime}"
-      COMMAND "${CMAKE_COMMAND}" -E copy "${ONNXRUNTIME_LIBRARY}"
-        "${private_onnxruntime}"
-      COMMAND "${DPDFNET_PATCHELF}" --set-soname "${private_onnxruntime_name}"
-        "${private_onnxruntime}"
-      DEPENDS "${ONNXRUNTIME_LIBRARY}"
-      VERBATIM
-    )
-    add_custom_target(dpdfnet-private-onnxruntime
-      DEPENDS "${private_onnxruntime}")
-    add_library(ONNXRuntime::Private SHARED IMPORTED)
-    set_target_properties(ONNXRuntime::Private PROPERTIES
-      IMPORTED_LOCATION "${private_onnxruntime}"
-      IMPORTED_SONAME "${private_onnxruntime_name}"
-      INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}"
-    )
-    set(DPDFNET_ONNXRUNTIME_TARGET ONNXRuntime::Private)
-    set(DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES "${private_onnxruntime}")
-    if(ONNXRUNTIME_PROVIDERS_SHARED_LIBRARY)
-      list(APPEND DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES
-        "${ONNXRUNTIME_PROVIDERS_SHARED_LIBRARY}")
-    endif()
+      "${CMAKE_BINARY_DIR}/onnxruntime-private/${private_onnxruntime_soname}")
+    set(rename_private_onnxruntime
+      COMMAND "${DPDFNET_PATCHELF}" --set-soname "${private_onnxruntime_soname}"
+        "${private_onnxruntime}")
   else()
     message(WARNING "patchelf was not found, so the bundled ONNX Runtime keeps "
       "its stock soname and can clash with another ONNX-based OBS plugin. "
       "Install patchelf and reconfigure to give it a private name.")
+  endif()
+elseif(APPLE AND DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
+  find_program(DPDFNET_CODESIGN codesign REQUIRED)
+  set(private_onnxruntime_soname "@rpath/libonnxruntime_dpdfnet.dylib")
+  set(private_onnxruntime
+    "${CMAKE_BINARY_DIR}/onnxruntime-private/libonnxruntime_dpdfnet.dylib")
+  # Renaming invalidates the signature, and Apple silicon loads only signed
+  # code, so sign the copy again.
+  set(rename_private_onnxruntime
+    COMMAND "${CMAKE_INSTALL_NAME_TOOL}" -id "${private_onnxruntime_soname}"
+      "${private_onnxruntime}"
+    COMMAND "${DPDFNET_CODESIGN}" --force --sign - "${private_onnxruntime}")
+endif()
+if(private_onnxruntime)
+  # Made at build time from the stock library, so replacing ONNX Runtime in
+  # place refreshes the private copy instead of linking a stale one.
+  add_custom_command(
+    OUTPUT "${private_onnxruntime}"
+    COMMAND "${CMAKE_COMMAND}" -E copy "${ONNXRUNTIME_LIBRARY}"
+      "${private_onnxruntime}"
+    ${rename_private_onnxruntime}
+    DEPENDS "${ONNXRUNTIME_LIBRARY}"
+    VERBATIM
+  )
+  add_custom_target(dpdfnet-private-onnxruntime
+    DEPENDS "${private_onnxruntime}")
+  add_library(ONNXRuntime::Private SHARED IMPORTED)
+  set_target_properties(ONNXRuntime::Private PROPERTIES
+    IMPORTED_LOCATION "${private_onnxruntime}"
+    IMPORTED_SONAME "${private_onnxruntime_soname}"
+    INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}"
+  )
+  set(DPDFNET_ONNXRUNTIME_TARGET ONNXRuntime::Private)
+  set(DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES "${private_onnxruntime}")
+  if(ONNXRUNTIME_PROVIDERS_SHARED_LIBRARY)
+    list(APPEND DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES
+      "${ONNXRUNTIME_PROVIDERS_SHARED_LIBRARY}")
   endif()
 endif()
 
@@ -290,6 +315,15 @@ if(DPDFNET_BUILD_TESTS)
     set_property(TARGET obs-dpdfnet-filter-tests APPEND PROPERTY LINK_DEPENDS
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/filter-allocations.ld"
     )
+  elseif(APPLE)
+    # The same on macOS, where every library would otherwise bind to the
+    # allocation operators the executable exports.
+    target_link_options(obs-dpdfnet-filter-tests PRIVATE
+      "LINKER:-unexported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/tests/filter-allocations-macos.txt"
+    )
+    set_property(TARGET obs-dpdfnet-filter-tests APPEND PROPERTY LINK_DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/filter-allocations-macos.txt"
+    )
   endif()
   dpdfnet_copy_runtime_dependencies(obs-dpdfnet-filter-tests)
 
@@ -416,16 +450,36 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set_property(TARGET obs-dpdfnet APPEND PROPERTY LINK_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exports.ld"
   )
+elseif(APPLE)
+  target_link_options(obs-dpdfnet PRIVATE
+    "LINKER:-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/src/exports-macos.txt"
+  )
+  set_property(TARGET obs-dpdfnet APPEND PROPERTY LINK_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/exports-macos.txt"
+  )
+  # A bundle's binary carries the bundle's name and no extension.
+  set_target_properties(obs-dpdfnet PROPERTIES SUFFIX "")
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
   set_property(TARGET obs-dpdfnet APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+elseif(APPLE AND DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
+  set_property(TARGET obs-dpdfnet APPEND PROPERTY INSTALL_RPATH
+    "@loader_path/../Frameworks")
 endif()
 
 install(TARGETS obs-dpdfnet
   RUNTIME DESTINATION "${DPDFNET_PLUGIN_DESTINATION}"
   LIBRARY DESTINATION "${DPDFNET_PLUGIN_DESTINATION}"
 )
+
+if(APPLE)
+  cmake_path(GET DPDFNET_PLUGIN_DESTINATION PARENT_PATH bundle_contents)
+  configure_file(cmake/macos/Info.plist.in Info.plist @ONLY)
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+    DESTINATION "${bundle_contents}"
+  )
+endif()
 
 install(DIRECTORY data/
   DESTINATION "${DPDFNET_DATA_DESTINATION}"
@@ -446,21 +500,25 @@ install(DIRECTORY LICENSES
   DESTINATION "${DPDFNET_DATA_DESTINATION}"
 )
 
-# Outside Linux this ships ONNX Runtime under its stock name. Unlike the
+# On Windows this ships ONNX Runtime under its stock name. Unlike the
 # PowerShell release path, it does not rename onnxruntime.dll, so a
 # CMake-installed plugin can collide with another ONNX-based OBS plugin's
 # onnxruntime.dll in the shared obs-plugins/64bit directory. Fine for isolated
-# dev builds, not for shipping. Linux installs the private copy made above.
+# dev builds, not for shipping. Linux and macOS install the private copy made
+# above.
 if(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
   if(WIN32)
     message(WARNING "This install ships onnxruntime.dll under its stock name, "
       "so it can clash with another ONNX-based OBS plugin. Build releases with "
       "scripts/build-windows-msvc.ps1, which gives it a private name.")
   endif()
-  if(IS_ABSOLUTE "${DPDFNET_PLUGIN_DESTINATION}")
-    set(runtime_destination "${DPDFNET_PLUGIN_DESTINATION}")
-  else()
-    set(runtime_destination "\${CMAKE_INSTALL_PREFIX}/${DPDFNET_PLUGIN_DESTINATION}")
+  set(runtime_destination "${DPDFNET_PLUGIN_DESTINATION}")
+  if(APPLE)
+    # A bundle keeps its libraries in Contents/Frameworks.
+    set(runtime_destination "${bundle_contents}/Frameworks")
+  endif()
+  if(NOT IS_ABSOLUTE "${runtime_destination}")
+    set(runtime_destination "\${CMAKE_INSTALL_PREFIX}/${runtime_destination}")
   endif()
   foreach(runtime_dependency IN LISTS DPDFNET_PLUGIN_RUNTIME_DEPENDENCIES)
     install(CODE "file(INSTALL \"${runtime_dependency}\"
@@ -480,4 +538,18 @@ if(DPDFNET_INSTALL_RUNTIME_DEPENDENCIES)
       "not found under ONNXRUNTIME_ROOT, so the install ships its library "
       "without them. Add them before distributing the install.")
   endif()
+endif()
+
+if(APPLE)
+  # The linker signs the binary alone, and a bundle whose signature does not
+  # cover its resources fails verification. Sign the installed bundle as a
+  # whole, ad hoc.
+  find_program(DPDFNET_CODESIGN codesign REQUIRED)
+  cmake_path(GET bundle_contents PARENT_PATH bundle)
+  if(NOT IS_ABSOLUTE "${bundle}")
+    set(bundle "\${CMAKE_INSTALL_PREFIX}/${bundle}")
+  endif()
+  install(CODE "execute_process(
+    COMMAND \"${DPDFNET_CODESIGN}\" --force --sign - \"\$ENV{DESTDIR}${bundle}\"
+    COMMAND_ERROR_IS_FATAL ANY)")
 endif()
