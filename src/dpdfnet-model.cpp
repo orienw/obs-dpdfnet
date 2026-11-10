@@ -9,9 +9,40 @@
 #include <string_view>
 #include <system_error>
 
+#ifdef __APPLE__
+#include <cerrno>
+#include <cstdlib>
+#include <xlocale.h>
+#endif
+
 namespace {
 
 constexpr float kMaxMetadataFloatMagnitude = 1'000'000.0f;
+
+// Parses all of token as a float the way std::from_chars does: no leading
+// whitespace or plus sign, no hexadecimal, and no locale.
+bool parse_float(std::string_view token, float &number) {
+#ifdef __APPLE__
+  // Apple's standard library has no floating-point std::from_chars on the
+  // macOS versions the plugin supports. strtof_l with a null locale parses
+  // in the C locale; the checks reject what it accepts beyond from_chars.
+  if (token.empty() ||
+      std::string_view(" \t\n\v\f\r+").find(token.front()) !=
+          std::string_view::npos ||
+      token.find_first_of("xX") != std::string_view::npos)
+    return false;
+  const std::string text(token);
+  char *end = nullptr;
+  errno = 0;
+  number = strtof_l(text.c_str(), &end, nullptr);
+  return end == text.c_str() + text.size() &&
+         !(errno == ERANGE && number == 0.0f);
+#else
+  const char *end = token.data() + token.size();
+  const auto result = std::from_chars(token.data(), end, number);
+  return result.ec == std::errc() && result.ptr == end;
+#endif
+}
 
 void validate_tensor_contract(const Ort::TypeInfo &type_info,
                               const char *tensor_description,
@@ -320,11 +351,7 @@ std::vector<float> DpdfnetModel::parse_float_list(const std::string &value,
           std::string("DPDFNet metadata key contains an empty float: ") + key);
 
     float number = 0.0f;
-    const auto *begin = token.data();
-    const auto *end = token.data() + token.size();
-    const auto result = std::from_chars(begin, end, number);
-    if (result.ec != std::errc() || result.ptr != end ||
-        !std::isfinite(number) ||
+    if (!parse_float(token, number) || !std::isfinite(number) ||
         std::abs(number) > kMaxMetadataFloatMagnitude) {
       throw std::runtime_error(
           std::string("DPDFNet metadata key contains an invalid float: ") +
