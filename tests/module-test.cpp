@@ -159,7 +159,8 @@ int main(int argc, char **argv) {
   int result = 0;
   try {
     run(argv[1], argv[2]);
-    std::cout << "[PASS] installed plugin loads and processes audio\n";
+    std::cout << "[PASS] installed plugin loads and processes audio on libobs "
+              << obs_get_version_string() << '\n';
   } catch (const std::exception &ex) {
     std::cerr << "[FAIL] " << ex.what() << '\n';
     result = 1;

@@ -1,0 +1,195 @@
+name: macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The Windows workflow calls this for a release tag and publishes the zip.
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Checked against scripts/dependency-versions.ps1 below. OBS refuses a
+      # plugin built against a newer OBS than itself, so the build uses the
+      # oldest OBS it supports and the tests also run on the current one.
+      OBS_MINIMUM_VERSION: 32.0.0
+      OBS_MINIMUM_SHA256: 2107f7dae0649afa9190400ae193f57eaec96fab4f8c216ee08138ed2803c680
+      OBS_SOURCE_SHA256: 8b91b13f966d018ef2de20d74b85857374bac263f30e13ec1e9acb0212413b94
+      OBS_VERSION: 33.0.0
+      OBS_SHA256: b36f4e9da5f2f17c733ba711c8fe0656d6b0cd573cfe96eeb3e68325cffef739
+      ONNXRUNTIME_VERSION: 1.27.0
+      ONNXRUNTIME_SHA256: 545e81c58152353acb0d1e8bd6ce4b62f830c0961f5b3acfedc790ffd76e477a
+      # The same archive scripts/build-windows-msvc.ps1 pins.
+      SIMDE_COMMIT: f3e8262173b7089db9a9d57a9ecef8dd07ad9c97
+      SIMDE_SHA256: 3d95ef8de11ed9aea4e75fc5c1f7b60f1d01b9dfd67b48c42fbffbb3baa64589
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check pinned versions
+        run: |
+          check() {
+            if ! grep -qxF "\$$1 = \"$2\"" scripts/dependency-versions.ps1; then
+              echo "$1 in scripts/dependency-versions.ps1 is not $2"
+              exit 1
+            fi
+          }
+          check DpdfnetMinimumObsVersion "$OBS_MINIMUM_VERSION"
+          check DpdfnetCurrentObsVersion "$OBS_VERSION"
+          check DpdfnetDefaultOnnxRuntimeVersion "$ONNXRUNTIME_VERSION"
+
+      # OBS publishes no development files for macOS. The headers come from
+      # its source archive and libobs from the app; see cmake/macos.
+      - name: Download dependencies
+        run: |
+          mkdir third_party
+          cd third_party
+          fetch() {
+            curl -fsSL -o "$2" "$1"
+            echo "$3  $2" | shasum -a 256 -c -
+          }
+          obs=https://github.com/obsproject/obs-studio
+          fetch "$obs/releases/download/$OBS_MINIMUM_VERSION/OBS-Studio-$OBS_MINIMUM_VERSION-macOS-Apple.dmg" \
+            "obs-$OBS_MINIMUM_VERSION.dmg" "$OBS_MINIMUM_SHA256"
+          fetch "$obs/releases/download/$OBS_VERSION/OBS-Studio-$OBS_VERSION-macOS-Apple.dmg" \
+            "obs-$OBS_VERSION.dmg" "$OBS_SHA256"
+          fetch "$obs/archive/refs/tags/$OBS_MINIMUM_VERSION.zip" \
+            obs-source.zip "$OBS_SOURCE_SHA256"
+          fetch "https://github.com/simd-everywhere/simde/archive/$SIMDE_COMMIT.zip" \
+            simde.zip "$SIMDE_SHA256"
+          fetch "https://github.com/microsoft/onnxruntime/releases/download/v$ONNXRUNTIME_VERSION/onnxruntime-osx-arm64-$ONNXRUNTIME_VERSION.tgz" \
+            onnxruntime.tgz "$ONNXRUNTIME_SHA256"
+
+          mkdir mount
+          for version in "$OBS_MINIMUM_VERSION" "$OBS_VERSION"; do
+            hdiutil attach -quiet -nobrowse -readonly -mountpoint mount \
+              "obs-$version.dmg"
+            ditto mount/OBS.app "obs-$version/OBS.app"
+            hdiutil detach -quiet mount
+          done
+          unzip -q obs-source.zip "obs-studio-$OBS_MINIMUM_VERSION/libobs/*"
+          unzip -q simde.zip
+          tar -xzf onnxruntime.tgz
+
+          {
+            echo "OBS_MINIMUM_APP=$PWD/obs-$OBS_MINIMUM_VERSION/OBS.app"
+            echo "OBS_CURRENT_APP=$PWD/obs-$OBS_VERSION/OBS.app"
+            echo "OBS_SOURCE_DIR=$PWD/obs-studio-$OBS_MINIMUM_VERSION"
+            echo "SIMDE_INCLUDE_DIR=$PWD/simde-$SIMDE_COMMIT"
+            echo "ONNXRUNTIME_ROOT=$PWD/onnxruntime-osx-arm64-$ONNXRUNTIME_VERSION"
+          } >> "$GITHUB_ENV"
+
+      # The deployment target is the oldest macOS ONNX Runtime runs on.
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -Dlibobs_DIR="$PWD/cmake/macos" \
+            -DOBS_SOURCE_DIR="$OBS_SOURCE_DIR" \
+            -DOBS_APP="$OBS_MINIMUM_APP" \
+            -DSIMDE_INCLUDE_DIR="$SIMDE_INCLUDE_DIR" \
+            -DONNXRUNTIME_ROOT="$ONNXRUNTIME_ROOT" \
+            -DDPDFNET_WARNINGS_AS_ERRORS=ON \
+            -DDPDFNET_BUILD_TESTS=ON \
+            -DDPDFNET_BUILD_MODEL_SMOKE=ON \
+            -DDPDFNET_BUILD_STREAM_DUMP=ON \
+            -DDPDFNET_BUILD_PROCESSOR_BENCHMARK=ON \
+            -DDPDFNET_BUILD_QUALITY_BENCHMARK=ON
+          cmake --build build
+
+      # The binaries find the OBS they were linked against, the minimum one.
+      # The module test names the libobs it loaded the plugin into.
+      - name: Test
+        run: |
+          ctest --test-dir build --output-on-failure
+          ctest --test-dir build -R '^installed-module$' --verbose |
+            grep -F "libobs $OBS_MINIMUM_VERSION"
+
+      # The tests that use libobs run again on the current OBS: the same
+      # binaries, with the loader pointed at its frameworks.
+      - name: Test on the current OBS
+        run: |
+          ctest --test-dir build --show-only=json-v1 |
+            jq -r '.tests[]
+              | select(.name | IN("processor", "filter-integration", "installed-module"))
+              | .command | @sh' > test-commands.txt
+          test "$(wc -l < test-commands.txt)" -eq 3
+          export DYLD_FRAMEWORK_PATH="$OBS_CURRENT_APP/Contents/Frameworks"
+          export DYLD_LIBRARY_PATH="$DYLD_FRAMEWORK_PATH"
+          while read -r command; do
+            eval "$command" | tee test-output.txt
+          done < test-commands.txt
+          # The module test ran last.
+          grep -qF "libobs $OBS_VERSION" test-output.txt
+
+      - name: Check the install
+        run: |
+          cmake --install build --prefix install
+          plugin=install/obs-dpdfnet.plugin/Contents/MacOS/obs-dpdfnet
+          runtime=install/obs-dpdfnet.plugin/Contents/Frameworks/libonnxruntime_dpdfnet.dylib
+
+          libraries="$(otool -L "$plugin")"
+          echo "$libraries"
+          grep -qF '@rpath/libonnxruntime_dpdfnet.dylib' <<< "$libraries"
+          if grep -qF 'libonnxruntime.' <<< "$libraries"; then
+            echo "the plugin still needs the stock ONNX Runtime install name"
+            exit 1
+          fi
+          # The bundled runtime is found in the bundle and nowhere else.
+          rpaths="$(otool -l "$plugin" |
+            awk '/LC_RPATH/ { getline; getline; print $2 }')"
+          echo "$rpaths"
+          test "$rpaths" = '@loader_path/../Frameworks'
+          # Only OBS entry points may be exported.
+          exports="$(nm -gU "$plugin")"
+          echo "$exports"
+          if grep -v ' _obs_module_' <<< "$exports"; then
+            echo "the plugin exports symbols other than OBS entry points"
+            exit 1
+          fi
+          # Apple silicon loads only code with a valid signature.
+          codesign --verify --deep --strict install/obs-dpdfnet.plugin
+          for binary in "$plugin" "$runtime"; do
+            test "$(lipo -archs "$binary")" = arm64
+            otool -l "$binary" | grep -A4 LC_BUILD_VERSION |
+              grep -qE 'minos 14\.0$'
+          done
+          # Nothing more and nothing less than the expected files.
+          (cd install && find . -type f -o -type l | LC_ALL=C sort) > installed-files.txt
+          diff tests/macos-install-files.txt installed-files.txt
+
+      - name: Benchmark
+        run: |
+          for model in dpdfnet8_48khz_hr dpdfnet2_48khz_hr; do
+            build/dpdfnet-processor-benchmark "models/$model.onnx" 48000
+          done
+
+      - name: Package release candidate
+        if: github.event_name == 'push'
+        run: |
+          ./scripts/release-macos.sh build
+          # The plugin in the zip is intact and loads.
+          unzip -q build/obs-dpdfnet-*-macos-arm64.zip -d unpacked
+          test -f unpacked/INSTALL.txt
+          bundle=unpacked/obs-dpdfnet.plugin
+          codesign --verify --deep --strict "$bundle"
+          build/dpdfnet-module-test "$bundle/Contents/MacOS/obs-dpdfnet" \
+            "$bundle/Contents/Resources"
+
+      - name: Upload release candidate
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-release
+          if-no-files-found: error
+          path: build/obs-dpdfnet-*-macos-arm64.zip

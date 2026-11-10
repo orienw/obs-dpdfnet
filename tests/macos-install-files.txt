@@ -1,0 +1,17 @@
+./obs-dpdfnet.plugin/Contents/Frameworks/libonnxruntime_dpdfnet.dylib
+./obs-dpdfnet.plugin/Contents/Info.plist
+./obs-dpdfnet.plugin/Contents/MacOS/obs-dpdfnet
+./obs-dpdfnet.plugin/Contents/Resources/LICENSE
+./obs-dpdfnet.plugin/Contents/Resources/LICENSES/Apache-2.0.txt
+./obs-dpdfnet.plugin/Contents/Resources/LICENSES/BSD-3-Clause-KissFFT.txt
+./obs-dpdfnet.plugin/Contents/Resources/LICENSES/BSD-3-Clause.txt
+./obs-dpdfnet.plugin/Contents/Resources/LICENSES/MIT-ONNXRuntime.txt
+./obs-dpdfnet.plugin/Contents/Resources/LICENSES/MIT-SIMDe.txt
+./obs-dpdfnet.plugin/Contents/Resources/ONNXRuntime-LICENSE.txt
+./obs-dpdfnet.plugin/Contents/Resources/THIRD_PARTY.md
+./obs-dpdfnet.plugin/Contents/Resources/ThirdPartyNotices.txt
+./obs-dpdfnet.plugin/Contents/Resources/locale/en-US.ini
+./obs-dpdfnet.plugin/Contents/Resources/models/dpdfnet2_48khz_hr.onnx
+./obs-dpdfnet.plugin/Contents/Resources/models/dpdfnet8_48khz_hr.onnx
+./obs-dpdfnet.plugin/Contents/Resources/models/manifest.json
+./obs-dpdfnet.plugin/Contents/_CodeSignature/CodeResources

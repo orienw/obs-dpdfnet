@@ -123,14 +123,19 @@ jobs:
             build/release-commit-v*.txt
             build/msvc/Release/tests-passed.txt
 
+  # The macOS zip for a release tag, built and tested by the macOS workflow.
+  macos:
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/macos.yml
+
   # Releasing: set the version in VERSION, push that commit to main, then
   #   git tag -a v<version> -m "obs-dpdfnet <version>" && git push origin v<version>
-  # build-and-test builds and tests the tag, and this job turns its zip into a
-  # draft release. Write the "What's Changed" section in the draft and publish
-  # it. If this job refuses the tag, delete the tag locally and on GitHub, fix
-  # the problem, and tag again.
+  # build-and-test and macos build and test the tag, and this job turns their
+  # zips into a draft release. Write the "What's Changed" section in the draft
+  # and publish it. If this job refuses the tag, delete the tag locally and on
+  # GitHub, fix the problem, and tag again.
   release:
-    needs: build-and-test
+    needs: [build-and-test, macos]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -139,7 +144,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: windows-release
+          pattern: '*-release'
+          merge-multiple: true
           path: build
 
       - name: Create draft release
@@ -148,7 +154,8 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           zip="build/obs-dpdfnet-$version-windows-x64.zip"
-          if [ ! -f "$zip" ]; then
+          mac_zip="build/obs-dpdfnet-$version-macos-arm64.zip"
+          if [ ! -f "$zip" ] || [ ! -f "$mac_zip" ]; then
             echo "::error::$GITHUB_REF_NAME does not match the version in VERSION"
             exit 1
           fi
@@ -169,4 +176,4 @@ jobs:
             --draft "${prerelease[@]}" \
             --title "$version" \
             --notes-file "build/release-notes-v$version.md" \
-            "$zip"
+            "$zip" "$mac_zip"
