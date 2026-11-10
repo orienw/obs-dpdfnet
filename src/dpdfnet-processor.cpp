@@ -294,33 +294,6 @@ void prefill_dpdfnet_model_bundle(DpdfnetModelBundle &bundle, size_t channels,
   }
 }
 
-uint64_t DpdfnetTimestampFloor::apply(uint64_t timestamp, uint32_t frames,
-                                      uint32_t sample_rate) {
-  timestamp = std::max(timestamp, next_timestamp_);
-  const uint64_t duration =
-      sample_rate ? static_cast<uint64_t>(static_cast<double>(frames) /
-                                          static_cast<double>(sample_rate) *
-                                          1000000000.0)
-                  : 0;
-  next_timestamp_ = timestamp > std::numeric_limits<uint64_t>::max() - duration
-                        ? std::numeric_limits<uint64_t>::max()
-                        : timestamp + duration;
-  return timestamp;
-}
-
-void DpdfnetTimestampFloor::observe_input(uint64_t timestamp) {
-  if (have_input_timestamp_ && timestamp < last_input_timestamp_)
-    next_timestamp_ = 0;
-  last_input_timestamp_ = timestamp;
-  have_input_timestamp_ = true;
-}
-
-void DpdfnetTimestampFloor::reset() {
-  next_timestamp_ = 0;
-  last_input_timestamp_ = 0;
-  have_input_timestamp_ = false;
-}
-
 DpdfnetResamplers::~DpdfnetResamplers() { clear(); }
 
 DpdfnetResamplers::DpdfnetResamplers(DpdfnetResamplers &&other) noexcept {

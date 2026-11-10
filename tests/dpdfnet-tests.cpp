@@ -197,27 +197,6 @@ void test_overload_retry_schedule() {
           "retry schedule did not restart after reset");
 }
 
-void test_timestamp_floor() {
-  DpdfnetTimestampFloor floor;
-  floor.observe_input(NS_PER_SECOND);
-  require(floor.apply(NS_PER_SECOND, 480, 48000) == NS_PER_SECOND,
-          "timestamp floor changed the first packet");
-  floor.observe_input(NS_PER_SECOND + 10'000'000);
-  require(floor.apply(NS_PER_SECOND + 10'000'000, 480, 48000) ==
-              NS_PER_SECOND + 10'000'000,
-          "timestamp floor changed a continuous packet");
-  require(floor.apply(NS_PER_SECOND + 15'000'000, 480, 48000) ==
-              NS_PER_SECOND + 20'000'000,
-          "timestamp floor allowed recovery output to move backwards");
-  floor.observe_input(500'000'000);
-  require(floor.apply(500'000'000, 480, 48000) == 500'000'000,
-          "backward input epoch retained the previous output timeline");
-  floor.reset();
-  floor.observe_input(100'000'000);
-  require(floor.apply(100'000'000, 480, 48000) == 100'000'000,
-          "timestamp floor reset retained input history");
-}
-
 void test_model_selection_migration(const std::string &quality_path,
                                     const std::string &low_cpu_path,
                                     const std::filesystem::path &fixtures) {
@@ -1890,7 +1869,6 @@ int main(int argc, char **argv) {
       run_test("realtime budget guard", test_realtime_budget_guard) && passed;
   passed = run_test("overload retry schedule", test_overload_retry_schedule) &&
            passed;
-  passed = run_test("timestamp floor", test_timestamp_floor) && passed;
   passed = run_test("model selection migration",
                     [&] {
                       test_model_selection_migration(quality_model,

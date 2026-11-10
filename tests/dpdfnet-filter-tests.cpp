@@ -1031,6 +1031,40 @@ void test_model_delay_readout(const std::filesystem::path &fixtures) {
   }
 }
 
+// OBS resyncs a source once its timestamps drift 70 ms from its sample count,
+// and it can only see that drift if the filter passes capture timestamps
+// through. A capture clock that runs fast stamps each packet a little less
+// than one packet after the last.
+void test_output_keeps_capture_timestamps(
+    const std::filesystem::path &fixtures) {
+  constexpr uint64_t FIRST_TIMESTAMP_NS = 1000000000ULL;
+  constexpr uint64_t FAST_CLOCK_STEP_NS = PACKET_DURATION_NS - 100000;
+  ObsData settings;
+  configure_custom_model(settings,
+                         (fixtures / "valid_delayed_identity.onnx").string());
+  ObsSource source(obs_source_create_private(TEST_SOURCE_ID,
+                                             "timestamp owner", settings));
+  DirectFilter filter(settings, source);
+  PacketStorage storage;
+  // Each output carries one whole input packet, in order.
+  uint64_t outputs = 0;
+  for (uint64_t packet = 0; packet < 64; ++packet) {
+    struct obs_audio_data input = storage.direct_packet(
+        FIRST_TIMESTAMP_NS + packet * FAST_CLOCK_STEP_NS);
+    const struct obs_audio_data *output =
+        dpdfnet_filter_info.filter_audio(filter.get(), &input);
+    if (!output)
+      continue;
+    require(output != &input && output->frames == PACKET_FRAMES,
+            "fast capture clock test did not get whole processed packets");
+    require(output->timestamp ==
+                FIRST_TIMESTAMP_NS + outputs * FAST_CLOCK_STEP_NS,
+            "filter moved an output away from its capture timestamp");
+    ++outputs;
+  }
+  require(outputs > 32, "fast capture clock test saw too little audio");
+}
+
 // Runs the filter's realtime overload handling end to end: the guard trips,
 // processing pauses, the worker retries on schedule in probe mode, a probe
 // that still overloads pauses again with the next delay, and a probe that
@@ -1428,6 +1462,7 @@ int main(int argc, char **argv) {
     test_failed_inference_counts_toward_load(argv[2], logs);
     test_status_transitions(argv[2]);
     test_model_delay_readout(argv[2]);
+    test_output_keeps_capture_timestamps(argv[2]);
     test_overload_retry_chain(argv[2], logs);
     test_jumps_do_not_rebuild_properties(argv[2], logs);
 

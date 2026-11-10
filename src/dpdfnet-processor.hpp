@@ -105,18 +105,6 @@ struct DpdfnetAudioPacket {
   uint64_t timestamp = 0;
 };
 
-class DpdfnetTimestampFloor {
-public:
-  void observe_input(uint64_t timestamp);
-  uint64_t apply(uint64_t timestamp, uint32_t frames, uint32_t sample_rate);
-  void reset();
-
-private:
-  uint64_t next_timestamp_ = 0;
-  uint64_t last_input_timestamp_ = 0;
-  bool have_input_timestamp_ = false;
-};
-
 enum class DpdfnetDisposition { Passthrough, Pending, Processed };
 enum class DpdfnetEvent {
   None,

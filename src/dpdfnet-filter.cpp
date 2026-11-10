@@ -559,7 +559,6 @@ public:
     const DpdfnetProcessorState active = processor_.state();
     const bool format_resampler_refresh =
         format_changed && active.resampler_refresh_required;
-    timestamp_floor_.observe_input(audio->timestamp);
     const bool timing_eligible =
         active.has_model && !active.processing_disabled &&
         (active.sample_rate == static_cast<uint32_t>(active.model_rate) ||
@@ -636,18 +635,6 @@ public:
             reinterpret_cast<uint8_t *>(result.data[channel]);
       }
       output = &output_audio_;
-    }
-
-    if (output) {
-      const uint64_t adjusted_timestamp =
-          timestamp_floor_.apply(output->timestamp, output->frames, obs_rate);
-      if (adjusted_timestamp != output->timestamp) {
-        if (output == audio) {
-          output_audio_ = *audio;
-          output = &output_audio_;
-        }
-        output->timestamp = adjusted_timestamp;
-      }
     }
 
     const uint64_t processing_finished = os_gettime_ns();
@@ -753,7 +740,6 @@ public:
     old = install_fresh_resamplers(fresh, state.resampler_refresh_required);
     processor_.reset_stream();
     reset_timing_epoch();
-    timestamp_floor_.reset();
   }
 
   FilterStatus status() const {
@@ -1259,7 +1245,6 @@ private:
   mutable std::mutex mutex_;
   mutable std::mutex update_mutex_;
   DpdfnetProcessor processor_;
-  DpdfnetTimestampFloor timestamp_floor_;
   DpdfnetControls controls_;
   CallbackTimings timings_;
   DpdfnetRealtimeBudgetGuard realtime_guard_;
