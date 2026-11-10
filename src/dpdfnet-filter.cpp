@@ -523,7 +523,15 @@ public:
       }
     }
 
-    blog(LOG_INFO,
+    // A slider drag updates the settings at every step, so the line is
+    // logged at the default level only when a value no slider sets differs
+    // from the one last logged there, and for verbose runs otherwise.
+    std::string discrete_settings = selection + '\n' + requested_path + '\n' +
+                                    std::to_string(input_channel) +
+                                    (controls.bypass ? "\nbypass" : "\n");
+    const bool beyond_sliders = discrete_settings != logged_settings_;
+    logged_settings_.swap(discrete_settings);
+    blog(beyond_sliders ? LOG_INFO : LOG_DEBUG,
          "[obs-dpdfnet] settings: model=%s input=%d max_suppression=%.1f dB "
          "wet=%.0f%% gain=%.2f bypass=%s",
          selection.c_str(), input_channel, controls.attenuation_limit_db,
@@ -1257,6 +1265,8 @@ private:
   std::string failed_model_path_;
   std::string last_load_error_;
   std::string last_resampler_error_;
+  // The settings no slider sets, as last logged. Requires update_mutex_.
+  std::string logged_settings_;
   struct obs_audio_data output_audio_ = {};
   mutable std::mutex resampler_request_mutex_;
   std::condition_variable resampler_request_cv_;
