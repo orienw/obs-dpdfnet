@@ -1,14 +1,11 @@
 # obs-dpdfnet
 
-Native OBS audio filter for local DPDFNet speech enhancement.
+An OBS Studio audio filter that removes background noise from your microphone
+with DPDFNet, a neural speech-enhancement model. It runs on your CPU and makes
+no network requests. It is tuned for a close dynamic microphone at 48 kHz.
 
-The plugin runs a streaming DPDFNet ONNX model with ONNX Runtime on the CPU,
-enhances the selected mono channel in 10 ms hops, and returns the result as a
-regular OBS audio filter. It is tuned for a close dynamic microphone at 48 kHz.
-Everything runs locally; the plugin makes no network requests.
-
-Tested on Windows x64, Linux, and macOS on Apple silicon. Release builds are
-for Windows and macOS; Linux builds from source with CMake.
+Release builds are for Windows x64 and macOS on Apple silicon. Linux builds
+from source.
 
 ## Install A Release Build
 
@@ -65,6 +62,9 @@ flag in step 4.
 5. Start OBS and add the filter:
    `Audio Mixer -> mic gear -> Filters -> + -> DPDFNet Noise Suppression`
 
+If OBS reports that obs-dpdfnet failed to load, run the step 4 command again
+and restart OBS.
+
 To verify the download, compare this hash with the SHA-256 shown next to the
 zip on the release page:
 
@@ -74,66 +74,87 @@ shasum -a 256 obs-dpdfnet-<version>-macos-arm64.zip
 
 ## Settings
 
-Start with:
+Use the filter on a microphone, not on desktop audio or music. Set OBS to
+48 kHz in `Settings -> Audio`: the bundled models run natively at 48 kHz, and
+other rates are resampled.
 
-- `Model`: `DPDFNet8 (best quality, more CPU)`
-- `Input channel`: `Input 1 / left`
-- `Suppression limit`: `24-30 dB`
-- `Mix`: `100%`
-- `Output gain`: `0 dB`
-- OBS sample rate: `48 kHz` (the bundled models run natively, no resampling)
+- `Model`: `DPDFNet8` sounds best. `DPDFNet2` uses less CPU. `Custom ONNX
+  model` loads your own file; see [Custom models](#custom-models).
+- `Input channel`: the channel your microphone is on, usually
+  `Input 1 / left`. `Mix all channels` averages them. The enhanced voice goes
+  to every output channel except LFE.
+- `Suppression limit`: the most noise the filter removes. Start at 24 to 30 dB
+  and raise it only if room noise is still obvious while you speak. 40 dB is
+  aggressive, and 60 dB is a diagnostic extreme.
+- `Mix`: the blend of enhanced and original audio. 100% is enhanced only.
+- `Output gain`: gain after the blend. Start at 0 dB; positive values can
+  clip.
+- `Bypass`: passes the original audio at the same delay and keeps the model
+  running, for A/B comparison. To stop the filter's CPU use, disable it in OBS
+  instead.
+- `Reset processing`: restarts processing if it was paused or turned off, and
+  clears the model state, fault counters, and timing.
 
-Raise the suppression limit only if room noise is still obvious while you
-speak. `40 dB` is aggressive; `60 dB` is a diagnostic extreme.
+### Delay
 
-Use the filter on a microphone, not on desktop audio or music. It enhances one
-channel: on stereo sources pick the mic channel, or `Mix all channels` if you
-really want the average. The enhanced voice goes to every output channel
-except LFE. Other OBS sample rates work; the voice lane is
-resampled to and from the model's 48 kHz.
+With the bundled models, the filter delays audio by 50 ms: 40 ms in the model
+and 10 ms of STFT overlap. The original audio in the mix, bypass, and
+timestamps are aligned to the same delay, so OBS keeps the audio in sync with
+video. Audio monitoring hears the delay.
 
-`DPDFNet8` sounds best but costs more CPU. If the machine cannot keep up, the
-filter pauses noise suppression, keeps passing audio at the same delay, says
-so in the status line, and retries after 10 and 30 seconds, then every 60
-seconds until it keeps up. Noise suppression fades out over 100 ms and back
-in over 200 ms rather than switching off and on. If pauses keep coming back,
-switch to `DPDFNet2` or lower system load. If processing fails repeatedly, it
-stays off until you press `Reset processing`.
+### If The CPU Cannot Keep Up
 
-`Bypass` passes the original audio, delay-matched to the processed path, and
-keeps the model warm for A/B comparison. Disable the filter in OBS to stop its
-CPU use.
+When the computer cannot run the model in real time, the filter pauses noise
+suppression and keeps passing audio at the same delay. The status line says
+so, and the filter retries after 10 and 30 seconds, then every 60 seconds
+until it keeps up. Suppression fades out over 100 ms and back in over 200 ms
+instead of switching abruptly.
 
-With the bundled models, the filter delays audio by 50 ms: 40 ms inside the
-model and 10 ms of STFT overlap. The dry mix, bypass, and timestamps are
-aligned to that delay so every output describes the same input audio, and OBS
-keeps it in sync with video. Audio monitoring hears the delay.
+If pauses keep coming back, switch to `DPDFNet2` or reduce system load. If
+processing fails repeatedly, it stays off until you press `Reset processing`.
 
-Custom ONNX models must expose the DPDFNet two-input, two-output float32 tensor
-contract and declare integer `output_delay_hops` metadata from 0 to 16: the
-model's spectral output delay, excluding STFT buffering and resampling. Models
-that fail the contract or produce non-finite warm-up output are rejected and
-the active model stays loaded.
+### Status And Diagnostics
 
 The `Status` line says what the filter is doing and what the listener hears.
-`Refresh` beside the status updates the processing load and diagnostics;
-measurements show the values at the last refresh. State changes, including
-pauses and recovery, update automatically.
+Pauses and recovery show up on their own; press `Refresh` to update the
+processing load and diagnostics.
 
-`Show details` in the `Diagnostics` group reveals the processing measurements
-for the current run: the active model, native or resampled operation, frame
-and hop sizes, model and STFT delay, and callback timing. The displayed delay
-excludes resampling and OBS buffering. Timing restarts on model, format,
-resampler, and reset changes; passthrough callbacks are not counted.
-Oversized-packet, buffer-capacity, and timestamp-jump counts persist until a
-reset or model change. A timestamp jump is audio arriving 70 ms or more away
-from where the previous packet ended, the point past which OBS stops smoothing
-timestamps; the filter drops its buffered audio and starts over. These are
-processing measurements, not end-to-end microphone latency. Smaller timestamp
-deviations are treated as continuous audio when draining queued packets, as
-OBS does when buffering the filter's output.
+`Show details` in the `Diagnostics` group shows measurements for the current
+run:
 
-## Build From Source On Windows
+- The active model, whether it runs natively or resampled, and its frame and
+  hop sizes.
+- The model and STFT delay, which excludes resampling and OBS buffering.
+- Callback timing: the slowest callback and how many missed their deadline.
+  Timing restarts on model, format, resampler, and reset changes, and does not
+  count passthrough.
+- Oversized packets, buffer-capacity hits, and timestamp jumps, kept until a
+  reset or model change. A timestamp jump is audio arriving 70 ms or more away
+  from where the previous packet ended, the point past which OBS stops
+  smoothing timestamps. The filter then drops its buffered audio and starts
+  over.
+
+These are processing measurements, not end-to-end microphone latency.
+
+## Models
+
+`models/` holds the DPDFNet ONNX files from `Ceva-IP/DPDFNet`;
+`models/manifest.json` records the source revision and SHA-256 hashes.
+
+- `dpdfnet8_48khz_hr.onnx`: default, best quality, more CPU.
+- `dpdfnet2_48khz_hr.onnx`: lighter alternative.
+
+### Custom Models
+
+A custom ONNX model must expose the DPDFNet two-input, two-output float32
+tensor contract and declare integer `output_delay_hops` metadata from 0 to 16:
+the model's spectral output delay, excluding STFT buffering and resampling.
+Models that fail the contract or produce non-finite warm-up output are
+rejected, and the active model stays loaded.
+
+## Build From Source
+
+### Windows
 
 From PowerShell in this directory:
 
@@ -148,12 +169,23 @@ The scripts download build inputs into `third_party/`, build into `build/`,
 and install into `%ProgramData%\obs-studio\plugins\obs-dpdfnet`. Restart OBS
 afterwards.
 
-## CMake Build
+To refresh the pinned ONNX Runtime and model files with hash checks,
+optionally rebuilding and installing:
+
+```powershell
+.\scripts\update-windows.ps1
+.\scripts\update-windows.ps1 -Build -Install
+```
+
+Pass `-OnnxRuntimeVersion latest` to try a newer ONNX Runtime.
+
+### CMake
 
 CMake is the manual path for contributors, custom OBS builds, Linux, and
-macOS. It needs CMake 3.24+, a C++17 compiler, OBS Studio 30 or later development files
-with `libobsConfig.cmake`, and an ONNX Runtime package. KissFFT is fetched at
-configure time unless `DPDFNET_FETCH_KISSFFT` is off.
+macOS. It needs CMake 3.24+, a C++17 compiler, OBS Studio 30 or later
+development files with `libobsConfig.cmake`, and an ONNX Runtime package.
+KissFFT is fetched at configure time unless `DPDFNET_FETCH_KISSFFT` is off.
+Restart OBS after installing.
 
 Windows:
 
@@ -166,7 +198,9 @@ cmake --build build --config Release
 .\scripts\install-windows.ps1 -BuildDir .\build
 ```
 
-Linux, installing into the OBS user plugin folder:
+Linux, installing into the OBS user plugin folder. Install `patchelf` first.
+Point `libobs_DIR` at an OBS build tree instead if your OBS package ships no
+CMake files.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -177,10 +211,9 @@ cmake --build build
 cmake --install build --prefix ~/.config/obs-studio/plugins/obs-dpdfnet
 ```
 
-Point `libobs_DIR` at an OBS build tree instead if your OBS package ships no
-CMake files. Restart OBS after installing.
-
-macOS on Apple silicon, installing into the OBS user plugin folder:
+macOS on Apple silicon, installing into the OBS user plugin folder. It also
+needs the SIMDe headers (`brew install simde`) and the ONNX Runtime
+`osx-arm64` package.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -196,21 +229,20 @@ cmake --install build --prefix ~/Library/Application\ Support/obs-studio/plugins
 OBS publishes no development files for macOS, so `cmake/macos` stands in for
 its CMake package: it takes the headers from an OBS source tree and libobs
 from an OBS.app. Check out the source at the version of that app. The build
-loads into that OBS version and later ones. It also needs the SIMDe headers
-(`brew install simde`) and the ONNX Runtime `osx-arm64` package.
+loads into that OBS version and later ones.
 
 The install layout defaults to `obs-plugins/64bit` and
 `data/obs-plugins/obs-dpdfnet`, and on macOS to an `obs-dpdfnet.plugin`
-bundle; override `DPDFNET_PLUGIN_DESTINATION` and `DPDFNET_DATA_DESTINATION`
-for other packages. ONNX Runtime shared libraries are copied next to built
-targets and installed with the plugin unless
-`DPDFNET_COPY_RUNTIME_DEPENDENCIES` or `DPDFNET_INSTALL_RUNTIME_DEPENDENCIES`
-is off. On Linux, install `patchelf` before configuring: the build uses it to
-install ONNX Runtime as `libonnxruntime_dpdfnet.so`, so it cannot clash with
-another OBS plugin's copy. On macOS the build renames it the same way with
-the system tools. On Windows, a CMake install keeps the stock
-`onnxruntime.dll` name, which can clash; share builds made with the PowerShell
-scripts, which rename it.
+bundle. Override `DPDFNET_PLUGIN_DESTINATION` and `DPDFNET_DATA_DESTINATION`
+for other layouts.
+
+ONNX Runtime is copied next to built targets and installed with the plugin
+unless `DPDFNET_COPY_RUNTIME_DEPENDENCIES` or
+`DPDFNET_INSTALL_RUNTIME_DEPENDENCIES` is off. On Linux and macOS the build
+installs it as `libonnxruntime_dpdfnet`, so it cannot clash with another OBS
+plugin's copy; on Linux it uses `patchelf` for this. On Windows, a CMake
+install keeps the stock `onnxruntime.dll` name, which can clash; share builds
+made with the PowerShell scripts, which rename it.
 
 `DPDFNET_BUILD_TESTS` registers the processor, model contract, libobs filter
 lifecycle, and installed-plugin tests with CTest. The installed-plugin test
@@ -218,22 +250,25 @@ installs into the build tree and loads that copy the way OBS does.
 `DPDFNET_BUILD_MODEL_SMOKE`, `DPDFNET_BUILD_STREAM_DUMP`,
 `DPDFNET_BUILD_PROCESSOR_BENCHMARK`, and `DPDFNET_BUILD_QUALITY_BENCHMARK` build
 the standalone tools. `DPDFNET_WARNINGS_AS_ERRORS` makes compiler warnings in
-this project's own code fatal, as Linux CI does.
+this project's own code fatal, as CI does.
 
 ## Tests And Benchmarks
 
-The Windows gate requires Python 3 for WAV input validation. It builds the
-plugin and tools and runs every test:
+On Linux and macOS, configure with `-DDPDFNET_BUILD_TESTS=ON` and run
+`ctest --test-dir build`.
+
+On Windows, the test script needs Python 3 for WAV input validation. It builds
+the plugin and tools and runs every test:
 
 ```powershell
 .\scripts\build-windows-msvc.ps1
 .\scripts\test-windows.ps1
 ```
 
-It covers both bundled models, malformed model contracts, variable packet
-sizes, resampling, bypass transitions, timestamp jumps, the failure circuit
-breakers, the realtime overload pause and retry, the filter lifecycle against
-real libobs, and loading the installed plugin the way OBS does.
+The tests cover both bundled models, malformed model contracts, variable
+packet sizes, resampling, bypass transitions, timestamp jumps, the failure
+circuit breakers, the realtime overload pause and retry, the filter lifecycle
+against real libobs, and loading the installed plugin the way OBS does.
 
 Processor timing for both models at 44.1, 48, and 96 kHz:
 
@@ -259,24 +294,6 @@ Results go to `build\quality-results\` per case, with listening WAVs and a
 report of SI-SDR, noise attenuation, level, clipping, and provenance. Existing
 results are kept unless you pass `-Overwrite`. Compare against a baseline from
 the same corpus and listen before trusting a number.
-
-## Models
-
-`models/` holds the DPDFNet ONNX files from `Ceva-IP/DPDFNet`;
-`models/manifest.json` records the source revision and SHA-256 hashes.
-
-- `dpdfnet8_48khz_hr.onnx`: default, best quality, more CPU.
-- `dpdfnet2_48khz_hr.onnx`: lighter alternative.
-
-To refresh the pinned ONNX Runtime and model files with hash checks, optionally
-rebuilding and installing:
-
-```powershell
-.\scripts\update-windows.ps1
-.\scripts\update-windows.ps1 -Build -Install
-```
-
-Pass `-OnnxRuntimeVersion latest` to try a newer ONNX Runtime.
 
 ## License
 
