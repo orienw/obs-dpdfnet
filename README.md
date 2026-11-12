@@ -44,19 +44,25 @@ Requirements: a Mac with Apple silicon, macOS 14 or later, and OBS Studio 32.0
 or later.
 
 The plugin is not notarized, so macOS blocks it until you clear the download
-flag in step 3.
+flag in step 4.
 
 1. Quit OBS.
-2. Extract the zip and copy `obs-dpdfnet.plugin` into
-   `~/Library/Application Support/obs-studio/plugins/`. Create the `plugins`
-   folder if it does not exist.
-3. In Terminal, run:
+2. OBS does not create its plugins folder. In Terminal, create it and open it
+   in Finder:
+
+   ```bash
+   mkdir -p ~/Library/Application\ Support/obs-studio/plugins
+   open ~/Library/Application\ Support/obs-studio/plugins
+   ```
+
+3. Extract the zip and drag `obs-dpdfnet.plugin` into that folder.
+4. In Terminal, run:
 
    ```bash
    xattr -dr com.apple.quarantine ~/Library/Application\ Support/obs-studio/plugins/obs-dpdfnet.plugin
    ```
 
-4. Start OBS and add the filter:
+5. Start OBS and add the filter:
    `Audio Mixer -> mic gear -> Filters -> + -> DPDFNet Noise Suppression`
 
 To verify the download, compare this hash with the SHA-256 shown next to the
