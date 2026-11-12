@@ -1120,17 +1120,19 @@ void test_overload_retry_chain(const std::filesystem::path &fixtures,
   // building the properties records the status as shown, which would hide
   // the refresh this test checks. The retry deadline starts at the trip, so
   // the overload stops as soon as the pause is logged; a slow runner must
-  // not still be overloaded when the retry runs.
+  // not still be overloaded when the retry runs. The worker thread writes
+  // the log, so on a busy runner it can trail the pause past the last packet.
   const auto overload_until_paused = [&](const char *what) {
     const size_t from = logs.size();
+    const auto paused = [&] {
+      return logs.contains("sustained realtime overload", from);
+    };
     dpdfnet_test_extra_processing_ns = 30000000;
-    bool paused = false;
-    for (int packet = 0; packet < 400 && !paused; ++packet) {
+    for (int packet = 0; packet < 400 && !paused(); ++packet)
       feed(1);
-      paused = logs.contains("sustained realtime overload", from);
-    }
     dpdfnet_test_extra_processing_ns = 0;
-    require(paused, std::string(what) + ": overload did not pause processing");
+    require(eventually(paused),
+            std::string(what) + ": overload did not pause processing");
     return from;
   };
 
