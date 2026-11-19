@@ -244,7 +244,7 @@ Compress-Archive -Path $PluginStage, (Join-Path $Staging "INSTALL.txt") -Destina
 
 # 5. Release notes. Keep reusable install instructions in README.md. The
 # "What's Changed" section is written by hand in the draft release.
-$ReadmeInstallUrl = "https://github.com/$Repo#install-a-release-build"
+$ReadmeInstallUrl = "https://github.com/$Repo#install"
 $Notes = @"
 ## Install
 
