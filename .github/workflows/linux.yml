@@ -86,7 +86,9 @@ jobs:
         run: |
           archive="onnxruntime-linux-x64-$ONNXRUNTIME_VERSION.tgz"
           curl -fsSL -o "$archive" \
-            "https://github.com/microsoft/onnxruntime/releases/download/v$ONNXRUNTIME_VERSION/$archive"
+            "https://github.com/microsoft/onnxruntime/releases/download/v$ONNXRUNTIME_VERSION/$archive" ||
+            curl -fsSL -o "$archive" \
+              "https://registry.npmmirror.com/-/binary/onnxruntime/v$ONNXRUNTIME_VERSION/$archive"
           echo "$ONNXRUNTIME_SHA256  $archive" | sha256sum -c -
           tar -xzf "$archive"
           echo "ONNXRUNTIME_ROOT=$PWD/onnxruntime-linux-x64-$ONNXRUNTIME_VERSION" >> "$GITHUB_ENV"

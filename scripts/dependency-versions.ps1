@@ -15,6 +15,12 @@ $DpdfnetKnownOnnxRuntimeHashes = @{
     "1.27.0" = "c5c81710938e68079ff1a192b04897faabe4b43830d48f39f27ecd4e16138bfc"
 }
 
+function Get-DpdfnetOnnxRuntimeMirrorUri([string]$Version) {
+    if ($DpdfnetKnownOnnxRuntimeHashes.ContainsKey($Version)) {
+        return "https://registry.npmmirror.com/-/binary/onnxruntime/v$Version/onnxruntime-win-x64-$Version.zip"
+    }
+}
+
 # OBS-Studio-<version>-Windows-x64.zip, the runtimes Windows CI tests with.
 $DpdfnetKnownObsRuntimeHashes = @{
     "32.0.0" = "96ebdcc3e5709825303803e5368b5d7ef04dfbd40c2ce6308fe06a6043066fa0"

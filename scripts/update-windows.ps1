@@ -60,14 +60,28 @@ function Get-OnnxRuntimeRelease {
 }
 
 function Update-OnnxRuntime {
-    $release = Get-OnnxRuntimeRelease -Version $OnnxRuntimeVersion
-    $version = $release.tag_name -replace "^v", ""
-    $assetName = "onnxruntime-win-x64-$version.zip"
-    $asset = @($release.assets | Where-Object { $_.name -eq $assetName })[0]
-    if (!$asset) {
-        throw "Could not find ONNX Runtime asset $assetName"
+    # A pinned version already identifies the archive and its digest. Only
+    # latest and unpinned versions need the GitHub release API to resolve them.
+    $version = $OnnxRuntimeVersion -replace "^v", ""
+    $expectedHash = $DpdfnetKnownOnnxRuntimeHashes[$version]
+    if (!$expectedHash) {
+        $release = Get-OnnxRuntimeRelease -Version $OnnxRuntimeVersion
+        $version = $release.tag_name -replace "^v", ""
+        $asset = @($release.assets | Where-Object { $_.name -eq "onnxruntime-win-x64-$version.zip" })[0]
+        if (!$asset) {
+            throw "Could not find ONNX Runtime asset onnxruntime-win-x64-$version.zip"
+        }
+        $expectedHash = $DpdfnetKnownOnnxRuntimeHashes[$version]
+        if ($asset.digest -match '^sha256:([0-9a-fA-F]{64})$') {
+            $digestHash = $Matches[1].ToLowerInvariant()
+            if ($expectedHash -and $expectedHash -ne $digestHash) {
+                throw "GitHub's digest for $($asset.name) does not match the hash pinned in dependency-versions.ps1."
+            }
+            $expectedHash = $digestHash
+        }
     }
 
+    $assetName = "onnxruntime-win-x64-$version.zip"
     $zipPath = Join-Path $ThirdParty $assetName
     $ortRoot = Join-Path $ThirdParty "onnxruntime"
     $ortVersionFile = Join-Path $ortRoot "VERSION_NUMBER"
@@ -76,19 +90,6 @@ function Update-OnnxRuntime {
         $currentVersion = (Get-Content -Raw $ortVersionFile).Trim()
     }
 
-    # Every download is checked: against the pinned hash when this version is
-    # pinned, otherwise against the SHA-256 GitHub publishes for the asset.
-    $digestHash = $null
-    if ($asset.digest -and $asset.digest.StartsWith("sha256:")) {
-        $digestHash = $asset.digest.Substring("sha256:".Length).ToLowerInvariant()
-    }
-    $expectedHash = $DpdfnetKnownOnnxRuntimeHashes[$version]
-    if ($expectedHash -and $digestHash -and $expectedHash -ne $digestHash) {
-        throw "GitHub's digest for $assetName does not match the hash pinned in dependency-versions.ps1."
-    }
-    if (!$expectedHash) {
-        $expectedHash = $digestHash
-    }
     $runtime = @{ Version = $version; Sha256 = $expectedHash }
     $needsUpdate = $Force -or ($currentVersion -ne $version)
     if (!$expectedHash -and ($needsUpdate -or $Build)) {
@@ -102,7 +103,9 @@ function Update-OnnxRuntime {
     Write-Host "Updating ONNX Runtime to $version"
     $zipHash = Get-Sha256 -Path $zipPath
     if ($Force -or !(Test-Path $zipPath) -or $zipHash -ne $expectedHash) {
-        $null = Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+        & (Join-Path $PSScriptRoot "download-archive.ps1") `
+            -Uri "https://github.com/microsoft/onnxruntime/releases/download/v$version/$assetName" `
+            -OutFile $zipPath -FallbackUri (Get-DpdfnetOnnxRuntimeMirrorUri $version)
         $zipHash = Get-Sha256 -Path $zipPath
     }
 

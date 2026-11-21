@@ -2,6 +2,8 @@
 
 This guide covers building `obs-dpdfnet` from source, running tests and benchmarks, and using custom ONNX models.
 
+CI and the Windows scripts download pinned ONNX Runtime archives from Microsoft's GitHub releases. If the download fails, they try npmmirror and verify the archive against the same SHA-256 before extracting it.
+
 ## Windows (PowerShell scripts)
 
 From PowerShell in the repository root:

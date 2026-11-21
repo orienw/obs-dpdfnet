@@ -91,7 +91,8 @@ function Invoke-DownloadZip {
         [Parameter(Mandatory = $true)][string]$Destination,
         [Parameter(Mandatory = $true)][string]$ExpectedDirectory,
         [Parameter(Mandatory = $true)][string]$ArchiveRootName,
-        [string]$ExpectedSha256 = ""
+        [string]$ExpectedSha256 = "",
+        [string]$FallbackUri
     )
 
     Assert-NoReparsePoints -Path $Destination
@@ -116,7 +117,7 @@ function Invoke-DownloadZip {
 
     if (!(Test-Path $ZipPath)) {
         Write-Host "Downloading $Uri"
-        $null = Invoke-WebRequest -Uri $Uri -OutFile $ZipPath
+        & (Join-Path $PSScriptRoot "download-archive.ps1") -Uri $Uri -OutFile $ZipPath -FallbackUri $FallbackUri
     }
 
     $ArchiveSha256 = Get-Sha256 -Path $ZipPath
@@ -284,7 +285,8 @@ $OnnxRuntimeArchiveSha256 = Invoke-DownloadZip `
     -Destination $ThirdParty `
     -ExpectedDirectory $onnxRoot `
     -ArchiveRootName $onnxBase `
-    -ExpectedSha256 $onnxExpectedHash
+    -ExpectedSha256 $onnxExpectedHash `
+    -FallbackUri (Get-DpdfnetOnnxRuntimeMirrorUri $OnnxRuntimeVersion)
 $onnxVersionFile = Join-Path $onnxRoot "VERSION_NUMBER"
 if (!(Test-Path $onnxVersionFile -PathType Leaf) -or
     (Get-Content -Raw $onnxVersionFile).Trim() -cne $OnnxRuntimeVersion) {

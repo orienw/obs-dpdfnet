@@ -53,7 +53,10 @@ jobs:
           mkdir third_party
           cd third_party
           fetch() {
-            curl -fsSL -o "$2" "$1"
+            if ! curl -fsSL -o "$2" "$1"; then
+              [ -n "${4:-}" ] || return 1
+              curl -fsSL -o "$2" "$4"
+            fi
             echo "$3  $2" | shasum -a 256 -c -
           }
           obs=https://github.com/obsproject/obs-studio
@@ -65,8 +68,10 @@ jobs:
             obs-source.zip "$OBS_SOURCE_SHA256"
           fetch "https://github.com/simd-everywhere/simde/archive/$SIMDE_COMMIT.zip" \
             simde.zip "$SIMDE_SHA256"
-          fetch "https://github.com/microsoft/onnxruntime/releases/download/v$ONNXRUNTIME_VERSION/onnxruntime-osx-arm64-$ONNXRUNTIME_VERSION.tgz" \
-            onnxruntime.tgz "$ONNXRUNTIME_SHA256"
+          archive="onnxruntime-osx-arm64-$ONNXRUNTIME_VERSION.tgz"
+          fetch "https://github.com/microsoft/onnxruntime/releases/download/v$ONNXRUNTIME_VERSION/$archive" \
+            onnxruntime.tgz "$ONNXRUNTIME_SHA256" \
+            "https://registry.npmmirror.com/-/binary/onnxruntime/v$ONNXRUNTIME_VERSION/$archive"
 
           mkdir mount
           for version in "$OBS_MINIMUM_VERSION" "$OBS_VERSION"; do

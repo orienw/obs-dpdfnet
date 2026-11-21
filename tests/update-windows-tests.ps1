@@ -8,7 +8,7 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $TestRoot "scripts"),
         (Join-Path $TestRoot "models"),
         (Join-Path $TestRoot "third_party\onnxruntime") | Out-Null
-    foreach ($Name in @("update-windows.ps1", "dependency-versions.ps1")) {
+    foreach ($Name in @("update-windows.ps1", "dependency-versions.ps1", "download-archive.ps1")) {
         Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\$Name") -Destination (Join-Path $TestRoot "scripts\$Name")
     }
     Copy-Item -LiteralPath (Join-Path $RepoRoot "VERSION") -Destination $TestRoot
@@ -26,16 +26,10 @@ try {
 
     function Invoke-RestMethod {
         param([string]$Uri)
-        if ($Uri -eq "https://api.github.com/repos/microsoft/onnxruntime/releases/tags/v$DpdfnetDefaultOnnxRuntimeVersion") {
-            return [PSCustomObject]@{
-                tag_name = "v$DpdfnetDefaultOnnxRuntimeVersion"
-                assets = @([PSCustomObject]@{ name = "onnxruntime-win-x64-$DpdfnetDefaultOnnxRuntimeVersion.zip" })
-            }
-        }
         if ($Uri -eq "https://api.github.com/repos/microsoft/onnxruntime/releases/latest") {
             return [PSCustomObject]@{
                 tag_name = "v$UnpinnedVersion"
-                assets = @([PSCustomObject]@{ name = "$FixtureBase.zip"; digest = "sha256:$FixtureHash"; browser_download_url = "https://github.com/microsoft/onnxruntime/releases/download/v$UnpinnedVersion/$FixtureBase.zip" })
+                assets = @([PSCustomObject]@{ name = "$FixtureBase.zip"; digest = "sha256:$FixtureHash" })
             }
         }
         if ($Uri -eq "https://huggingface.co/api/models/Ceva-IP/DPDFNet?blobs=true") {
@@ -83,9 +77,17 @@ Set-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot) "installed.txt") 
     Compress-Archive -LiteralPath $FixtureDir.FullName -DestinationPath $FixtureZip
     $FixtureHash = (Get-FileHash -LiteralPath $FixtureZip).Hash
     $Requests = [System.Collections.Generic.List[string]]::new()
+    $PinnedAsset = "v$DpdfnetDefaultOnnxRuntimeVersion/onnxruntime-win-x64-$DpdfnetDefaultOnnxRuntimeVersion.zip"
+    $PinnedUri = "https://github.com/microsoft/onnxruntime/releases/download/$PinnedAsset"
+    $MirrorUri = "https://registry.npmmirror.com/-/binary/onnxruntime/$PinnedAsset"
     function Invoke-WebRequest {
         param([string]$Uri, [string]$OutFile)
         $Requests.Add($Uri)
+        if ($Uri -eq $PinnedUri -and $UpstreamUnavailable) { throw "HTTP 404" }
+        if ($Uri -in @($PinnedUri, $MirrorUri)) {
+            Set-Content $OutFile "incorrect archive"
+            return
+        }
         if ($Uri -eq "https://github.com/obsproject/obs-studio/archive/refs/tags/$DpdfnetMinimumObsVersion.zip") {
             throw "Reached OBS download"
         }
@@ -108,6 +110,22 @@ Set-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot) "installed.txt") 
         }
     }
     Write-Host "PASS latest builds reuse the verified archive on fresh and cached updates"
+
+    foreach ($UpstreamUnavailable in @($true, $false)) {
+        $Requests.Clear()
+        try {
+            & (Join-Path $TestRoot "scripts\update-windows.ps1")
+            throw "Expected a checksum failure"
+        } catch {
+            if ($_.Exception.Message -notlike "ONNX Runtime hash mismatch*") { throw }
+        }
+        $ExpectedUris = @($PinnedUri)
+        if ($UpstreamUnavailable) { $ExpectedUris += $MirrorUri }
+        if (($Requests -join ',') -cne ($ExpectedUris -join ',')) {
+            throw "Unexpected archive sources: $Requests"
+        }
+    }
+    Write-Host "PASS pinned downloads use the mirror only on download failure and reject a bad checksum from either source"
 } finally {
     if (Test-Path -LiteralPath $TestRoot) {
         Remove-Item -LiteralPath $TestRoot -Recurse -Force
