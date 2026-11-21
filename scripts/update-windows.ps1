@@ -76,13 +76,6 @@ function Update-OnnxRuntime {
         $currentVersion = (Get-Content -Raw $ortVersionFile).Trim()
     }
 
-    $needsUpdate = $Force -or !(Test-Path $ortRoot) -or ($currentVersion -ne $version)
-    if (!$needsUpdate) {
-        Write-Host "ONNX Runtime $version is current."
-        return $version
-    }
-
-    Write-Host "Updating ONNX Runtime to $version"
     # Every download is checked: against the pinned hash when this version is
     # pinned, otherwise against the SHA-256 GitHub publishes for the asset.
     $digestHash = $null
@@ -96,13 +89,20 @@ function Update-OnnxRuntime {
     if (!$expectedHash) {
         $expectedHash = $digestHash
     }
-    if (!$expectedHash) {
+    $runtime = @{ Version = $version; Sha256 = $expectedHash }
+    $needsUpdate = $Force -or ($currentVersion -ne $version)
+    if (!$expectedHash -and ($needsUpdate -or $Build)) {
         throw "ONNX Runtime $version has no pinned hash and GitHub publishes no digest for $assetName. Add its SHA-256 to scripts/dependency-versions.ps1."
     }
+    if (!$needsUpdate) {
+        Write-Host "ONNX Runtime $version is current."
+        return $runtime
+    }
 
+    Write-Host "Updating ONNX Runtime to $version"
     $zipHash = Get-Sha256 -Path $zipPath
     if ($Force -or !(Test-Path $zipPath) -or $zipHash -ne $expectedHash) {
-        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+        $null = Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
         $zipHash = Get-Sha256 -Path $zipPath
     }
 
@@ -122,7 +122,7 @@ function Update-OnnxRuntime {
     }
 
     Rename-Item -Path $expandedDir -NewName "onnxruntime"
-    return $version
+    return $runtime
 }
 
 function Update-DpdfnetModels {
@@ -195,13 +195,14 @@ function Update-DpdfnetModels {
         Set-Content -Encoding ASCII -Path $manifestPath
 }
 
-$resolvedOnnxRuntimeVersion = Update-OnnxRuntime
+$runtime = Update-OnnxRuntime
 Update-DpdfnetModels
 
 if ($Build) {
     & (Join-Path $PSScriptRoot "build-windows-msvc.ps1") `
         -ObsVersion $ObsVersion `
-        -OnnxRuntimeVersion $resolvedOnnxRuntimeVersion `
+        -OnnxRuntimeVersion $runtime.Version `
+        -OnnxRuntimeSha256 $runtime.Sha256 `
         -ModelName $DefaultModelName `
         -BuildDir $BuildDir
 }
@@ -211,5 +212,5 @@ if ($Install) {
 }
 
 Write-Host "Update complete."
-Write-Host "ONNX Runtime: $resolvedOnnxRuntimeVersion"
+Write-Host "ONNX Runtime: $($runtime.Version)"
 Write-Host "Default model: $DefaultModelName"

@@ -32,6 +32,12 @@ try {
                 assets = @([PSCustomObject]@{ name = "onnxruntime-win-x64-$DpdfnetDefaultOnnxRuntimeVersion.zip" })
             }
         }
+        if ($Uri -eq "https://api.github.com/repos/microsoft/onnxruntime/releases/latest") {
+            return [PSCustomObject]@{
+                tag_name = "v$UnpinnedVersion"
+                assets = @([PSCustomObject]@{ name = "$FixtureBase.zip"; digest = "sha256:$FixtureHash"; browser_download_url = "https://github.com/microsoft/onnxruntime/releases/download/v$UnpinnedVersion/$FixtureBase.zip" })
+            }
+        }
         if ($Uri -eq "https://huggingface.co/api/models/Ceva-IP/DPDFNet?blobs=true") {
             return [PSCustomObject]@{ sha = "test-revision"; siblings = $ModelRecords }
         }
@@ -40,7 +46,7 @@ try {
 
     # Replace the compiler and installer with their directory contracts.
     Set-Content -LiteralPath (Join-Path $TestRoot "scripts\build-windows-msvc.ps1") @'
-param([string]$ObsVersion, [string]$OnnxRuntimeVersion, [string]$ModelName, [string]$BuildDir = "")
+param([string]$ObsVersion, [string]$OnnxRuntimeVersion, [string]$OnnxRuntimeSha256, [string]$ModelName, [string]$BuildDir = "")
 if (!$BuildDir) { $BuildDir = Join-Path (Split-Path $PSScriptRoot) "build\msvc" }
 $Output = Join-Path $BuildDir "Release"
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
@@ -65,6 +71,43 @@ Set-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot) "installed.txt") 
         }
         Write-Host "PASS build and install share the $(if ($Custom) { 'custom' } else { 'default' }) directory"
     }
+
+    # Run the real updater and builder through runtime extraction. Stop when the
+    # builder moves on to OBS, before it needs the compiler or an OBS install.
+    Copy-Item (Join-Path $RepoRoot "scripts\build-windows-msvc.ps1") (Join-Path $TestRoot "scripts") -Force
+    $UnpinnedVersion = "0.0.123"
+    $FixtureBase = "onnxruntime-win-x64-$UnpinnedVersion"
+    $FixtureDir = New-Item -ItemType Directory -Path (Join-Path $TestRoot $FixtureBase)
+    Set-Content (Join-Path $FixtureDir "VERSION_NUMBER") $UnpinnedVersion
+    $FixtureZip = Join-Path $TestRoot "$FixtureBase.zip"
+    Compress-Archive -LiteralPath $FixtureDir.FullName -DestinationPath $FixtureZip
+    $FixtureHash = (Get-FileHash -LiteralPath $FixtureZip).Hash
+    $Requests = [System.Collections.Generic.List[string]]::new()
+    function Invoke-WebRequest {
+        param([string]$Uri, [string]$OutFile)
+        $Requests.Add($Uri)
+        if ($Uri -eq "https://github.com/obsproject/obs-studio/archive/refs/tags/$DpdfnetMinimumObsVersion.zip") {
+            throw "Reached OBS download"
+        }
+        if ($Uri -eq "https://github.com/microsoft/onnxruntime/releases/download/v$UnpinnedVersion/$FixtureBase.zip") {
+            Copy-Item -LiteralPath $FixtureZip -Destination $OutFile
+            return
+        }
+        throw "Unexpected download request: $Uri"
+    }
+    foreach ($ExpectedRequests in @(2, 1)) {
+        $Requests.Clear()
+        try {
+            & (Join-Path $TestRoot "scripts\update-windows.ps1") -OnnxRuntimeVersion latest -Build
+            throw "Expected the build to reach the OBS download"
+        } catch {
+            if ($_.Exception.Message -ne "Reached OBS download") { throw }
+        }
+        if ($Requests.Count -ne $ExpectedRequests) {
+            throw "Unexpected requests while building the verified runtime: $Requests"
+        }
+    }
+    Write-Host "PASS latest builds reuse the verified archive on fresh and cached updates"
 } finally {
     if (Test-Path -LiteralPath $TestRoot) {
         Remove-Item -LiteralPath $TestRoot -Recurse -Force

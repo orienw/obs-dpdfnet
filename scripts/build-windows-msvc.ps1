@@ -7,7 +7,8 @@ param(
     [string]$ObsInstallDir = "C:\Program Files\obs-studio",
     [string]$Configuration = "Release",
     [string]$PluginVersion = "",
-    [string]$BuildDir = ""
+    [string]$BuildDir = "",
+    [ValidatePattern('^[0-9a-fA-F]{64}$')][string]$OnnxRuntimeSha256
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,7 +36,13 @@ if ($Configuration -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,30}[A-Za-z0-9_-])?
     throw "Configuration '$Configuration' must be a simple directory name."
 }
 
-$KnownOnnxRuntimeHashes = $DpdfnetKnownOnnxRuntimeHashes
+$onnxExpectedHash = $DpdfnetKnownOnnxRuntimeHashes[$OnnxRuntimeVersion]
+if ($OnnxRuntimeSha256) {
+    if ($onnxExpectedHash -and $onnxExpectedHash -ne $OnnxRuntimeSha256) {
+        throw "The supplied SHA-256 conflicts with the repository pin for ONNX Runtime $OnnxRuntimeVersion."
+    }
+    $onnxExpectedHash = $OnnxRuntimeSha256
+}
 $KnownObsArchiveHashes = $DpdfnetKnownObsArchiveHashes
 
 $KissArchiveSha256 = "9c2e19cc34ed910dcb509fd8ab561a523b923b6578703ace8c8f37f5a286bb25"
@@ -268,7 +275,6 @@ Remove-Item -LiteralPath $BuildProvenanceFile, $SourceCommitFile, $TestsPassedFi
 $onnxBase = "onnxruntime-win-x64-$OnnxRuntimeVersion"
 $onnxRoot = Join-Path $ThirdParty "onnxruntime"
 $onnxZip = Join-Path $ThirdParty "$onnxBase.zip"
-$onnxExpectedHash = $KnownOnnxRuntimeHashes[$OnnxRuntimeVersion]
 if (!$onnxExpectedHash) {
     Write-Warning "No pinned ONNX Runtime hash is known for version $OnnxRuntimeVersion."
 }
