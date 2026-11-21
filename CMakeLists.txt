@@ -129,6 +129,7 @@ if(DPDFNET_FETCH_KISSFFT)
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
   )
   FetchContent_MakeAvailable(kissfft)
+  set_property(TARGET kissfft PROPERTY POSITION_INDEPENDENT_CODE ON)
   # KissFFT is linked statically, so keep its headers, archive, and package
   # files out of the plugin install. It still builds as a dependency.
   set_property(DIRECTORY "${kissfft_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL ON)
