@@ -818,8 +818,8 @@ public:
                  "Processing retries automatically.";
     } else if (snapshot.processing_disabled) {
       result.severity = StatusSeverity::Error;
-      summary << "Off\nProcessing failed repeatedly. Press Reset processing to "
-                 "try again.";
+      summary << "Off\nProcessing failed repeatedly, so audio is passing "
+                 "through unprocessed. Press Reset processing to try again.";
     } else if (rate_mismatch) {
       result.severity = StatusSeverity::Error;
       summary << "Off\nResampling from " << khz(snapshot.sample_rate)

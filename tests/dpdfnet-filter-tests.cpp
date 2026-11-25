@@ -1012,6 +1012,78 @@ void test_status_transitions(const std::filesystem::path &fixtures) {
   }
 }
 
+// Three failures disable processing. The status says so and what listeners
+// hear, the properties window refreshes, audio keeps passing through, and
+// Reset processing starts over.
+void test_failure_circuit(const std::filesystem::path &fixtures,
+                          const LogCapture &logs) {
+  const size_t first_line = logs.size();
+  ObsData settings;
+  // Passes silence through and fails inference on anything else.
+  configure_custom_model(
+      settings, (fixtures / "runtime_nonfinite_spectrum_output.onnx").string());
+  ObsSource source(obs_source_create_private(
+      TEST_SOURCE_ID, "failure circuit owner", settings));
+  std::atomic<uint64_t> property_updates{0};
+  signal_handler_t *signals = obs_source_get_signal_handler(source);
+  signal_handler_connect(signals, "update_properties", count_property_update,
+                         &property_updates);
+  struct Disconnect {
+    signal_handler_t *signals;
+    std::atomic<uint64_t> *counter;
+    ~Disconnect() {
+      signal_handler_disconnect(signals, "update_properties",
+                                count_property_update, counter);
+    }
+  } disconnect{signals, &property_updates};
+  DirectFilter filter(settings, source);
+  PacketStorage storage;
+  uint64_t packet = 0;
+  const auto feed = [&] {
+    auto input =
+        storage.direct_packet(1000000000ULL + packet++ * PACKET_DURATION_NS);
+    return dpdfnet_filter_info.filter_audio(filter.get(), &input) == &input;
+  };
+
+  // Every second packet completes a hop, and each hop fails.
+  for (int packets = 0; packets < 6; ++packets)
+    feed();
+  require(eventually([&] {
+            return logs.contains("processing disabled after repeated failures",
+                                 first_line);
+          }),
+          "three failures did not disable processing");
+  require(eventually([&] { return property_updates.load() > 0; }),
+          "disabled processing did not refresh properties");
+  for (int packets = 0; packets < 4; ++packets)
+    require(feed(), "disabled processing did not pass audio through");
+
+  ObsProperties properties(dpdfnet_filter_info.get_properties(filter.get()));
+  const auto summary = [&] {
+    return std::string(obs_property_description(
+        obs_properties_get(properties, "status_summary")));
+  };
+  require(summary().rfind("Off\n", 0) == 0 &&
+              summary().find("passing through unprocessed") !=
+                  std::string::npos,
+          "status did not say that processing is off and audio passes");
+
+  obs_property_t *reset = obs_properties_get(properties, "reset_state");
+  require(reset && obs_property_button_clicked(reset, nullptr),
+          "Reset processing failed");
+  require(summary().rfind("Active\n", 0) == 0,
+          "Reset did not close the failure circuit");
+  storage.left.fill(0);
+  storage.right.fill(0);
+  for (int packets = 0; packets < 10; ++packets)
+    feed();
+  ObsProperties after(dpdfnet_filter_info.get_properties(filter.get()));
+  require(std::string(obs_property_description(
+                          obs_properties_get(after, "status_summary")))
+                  .rfind("Active\n", 0) == 0,
+          "processing did not stay on after Reset");
+}
+
 void test_model_delay_readout(const std::filesystem::path &fixtures) {
   for (bool delayed : {false, true}) {
     ObsData settings;
@@ -1464,6 +1536,7 @@ int main(int argc, char **argv) {
     test_obs_lifecycle(model.string());
     test_failed_inference_counts_toward_load(argv[2], logs);
     test_status_transitions(argv[2]);
+    test_failure_circuit(argv[2], logs);
     test_model_delay_readout(argv[2]);
     test_output_keeps_capture_timestamps(argv[2]);
     test_overload_retry_chain(argv[2], logs);
