@@ -2042,6 +2042,12 @@ void test_resampled_failure_refresh(
     if (attempt < 3) {
       require(result.resampler_refresh_needed,
               "retryable resampled failure did not request fresh resamplers");
+      // A packet that arrives before the rebuild passes through quietly.
+      packet.timestamp += 20'000'000;
+      const auto waiting = processor.process(packet);
+      require(waiting.disposition == DpdfnetDisposition::Passthrough &&
+                  waiting.event == DpdfnetEvent::None,
+              "a rebuild after a failure was reported as a rate mismatch");
       const auto state = processor.state();
       processor.replace_resamplers(prepare_dpdfnet_resamplers(
           sample_rate, state.model_rate, state.hop_size));

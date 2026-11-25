@@ -859,8 +859,10 @@ DpdfnetProcessResult DpdfnetProcessor::failure_result(const char *message) {
   if (opened)
     disable_reason_ = DpdfnetDisableReason::RepeatedProcessingFailures;
   const bool needs_fresh_resamplers = resample_path_;
-  if (needs_fresh_resamplers)
+  if (needs_fresh_resamplers) {
     resamplers_valid_ = false;
+    rate_warning_reported_ = true;
+  }
   reset_audio_state();
 
   DpdfnetProcessResult result;
