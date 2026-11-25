@@ -1808,6 +1808,220 @@ void test_circuit_breaker(const std::filesystem::path &fixture_directory) {
           "Reset did not retry inference");
 }
 
+// A fault that takes several hops to develop must still open the circuit. The
+// hops that succeed between two failures do not clear the count.
+void test_delayed_failure_opens_circuit(const std::filesystem::path &fixtures) {
+  // Fails on its seventh hop after every reset.
+  DpdfnetProcessor processor = make_processor(
+      (fixtures / "runtime_delayed_nonfinite_spectrum_output.onnx").string());
+  std::vector<float> data(960, 0.1f);
+  DpdfnetAudioPacket packet;
+  packet.data[0] = data.data();
+  packet.frames = 960;
+  unsigned reported = 0;
+  bool opened = false;
+  for (uint64_t index = 0; index < 40 && !opened; ++index) {
+    packet.timestamp = NS_PER_SECOND + index * 20'000'000;
+    const auto result = processor.process(packet);
+    reported += result.event == DpdfnetEvent::ProcessingFailure;
+    opened = result.event == DpdfnetEvent::CircuitOpened;
+  }
+  require(opened && processor.snapshot().processing_disabled,
+          "a fault that develops over several hops never opened the circuit");
+  require(reported == 1, "a repeating fault was reported more than once");
+}
+
+// One failure is forgotten after ten seconds of clean audio, and not before.
+void test_failure_count_recovery(const std::filesystem::path &fixtures) {
+  // Passes silence through and fails inference on anything else.
+  DpdfnetProcessor processor = make_processor(
+      (fixtures / "runtime_nonfinite_spectrum_output.onnx").string());
+  std::vector<float> silence(960, 0.0f);
+  std::vector<float> tone(960, 0.1f);
+  DpdfnetAudioPacket packet;
+  packet.frames = 960;
+  uint64_t index = 0;
+  const auto feed = [&](const std::vector<float> &data) {
+    packet.data[0] = data.data();
+    packet.timestamp = NS_PER_SECOND + index++ * 20'000'000;
+    return processor.process(packet);
+  };
+  require(feed(tone).event == DpdfnetEvent::ProcessingFailure,
+          "the failing packet did not fail inference");
+  // The first packet after a failure fills the window and yields one hop.
+  for (int packets = 0; packets < 450; ++packets)
+    feed(silence);
+  require(processor.state().consecutive_failures == 1,
+          "nine clean seconds cleared a failure");
+  for (int packets = 0; packets < 51; ++packets)
+    feed(silence);
+  require(processor.state().consecutive_failures == 0,
+          "ten clean seconds did not clear a failure");
+  require(feed(tone).event == DpdfnetEvent::ProcessingFailure,
+          "a failure after recovery was not reported");
+}
+
+// Two failures less than ten clean seconds apart stay on the count, so a
+// third opens the circuit.
+void test_spaced_failures_open_circuit(const std::filesystem::path &fixtures) {
+  // Passes silence through and fails inference on anything else.
+  DpdfnetProcessor processor = make_processor(
+      (fixtures / "runtime_nonfinite_spectrum_output.onnx").string());
+  std::vector<float> silence(960, 0.0f);
+  std::vector<float> tone(960, 0.1f);
+  DpdfnetAudioPacket packet;
+  packet.frames = 960;
+  uint64_t index = 0;
+  const auto feed = [&](const std::vector<float> &data) {
+    packet.data[0] = data.data();
+    packet.timestamp = NS_PER_SECOND + index++ * 20'000'000;
+    return processor.process(packet);
+  };
+  require(feed(tone).event == DpdfnetEvent::ProcessingFailure,
+          "the first failing packet did not fail inference");
+  for (int packets = 0; packets < 250; ++packets)
+    feed(silence);
+  require(feed(tone).event == DpdfnetEvent::None &&
+              processor.state().consecutive_failures == 2,
+          "a second failure five seconds later was not counted");
+  for (int packets = 0; packets < 450; ++packets)
+    feed(silence);
+  require(feed(tone).event == DpdfnetEvent::CircuitOpened,
+          "a third failure nine seconds later did not open the circuit");
+}
+
+// Only hops the model ran count toward the clean run. During an overload
+// pause the audio keeps flowing without it and proves nothing.
+void test_paused_hops_do_not_clear_failures(
+    const std::filesystem::path &fixtures) {
+  // Passes silence through and fails inference on anything else.
+  DpdfnetProcessor processor = make_processor(
+      (fixtures / "runtime_nonfinite_spectrum_output.onnx").string());
+  std::vector<float> silence(960, 0.0f);
+  std::vector<float> tone(960, 0.1f);
+  DpdfnetAudioPacket packet;
+  packet.frames = 960;
+  uint64_t index = 0;
+  const auto feed = [&](const std::vector<float> &data) {
+    packet.data[0] = data.data();
+    packet.timestamp = NS_PER_SECOND + index++ * 20'000'000;
+    return processor.process(packet);
+  };
+  for (int packets = 0; packets < 4; ++packets)
+    feed(silence);
+  require(processor.disable_for_realtime_overload("test overload"),
+          "overload pause did not open");
+  // The fade-out still runs the model, which fails and then stays stopped.
+  require(feed(tone).event == DpdfnetEvent::ProcessingFailure,
+          "the fade-out did not fail inference");
+  for (int packets = 0; packets < 510; ++packets)
+    feed(silence);
+  require(processor.state().consecutive_failures == 1,
+          "hops without the model cleared a failure");
+}
+
+// Output that grows away from the input is a fault. It is stopped at 8 times
+// the input, and repeating it opens the circuit.
+void test_runaway_output_opens_circuit(const std::filesystem::path &fixtures) {
+  // Triples its gain on every hop after a reset.
+  DpdfnetProcessor processor = make_processor(
+      (fixtures / "runtime_growing_spectrum_output.onnx").string());
+  // One hop per packet, so every hop before the refused one is heard.
+  std::vector<float> data(480, 0.1f);
+  DpdfnetAudioPacket packet;
+  packet.data[0] = data.data();
+  packet.frames = 480;
+  float loudest = 0.0f;
+  bool opened = false;
+  for (uint64_t index = 0; index < 40 && !opened; ++index) {
+    packet.timestamp = NS_PER_SECOND + index * 10'000'000;
+    const auto result = processor.process(packet);
+    if (result.disposition == DpdfnetDisposition::Processed) {
+      for (uint32_t frame = 0; frame < result.frames; ++frame)
+        loudest = std::max(loudest, std::fabs(result.data[0][frame]));
+    }
+    if (result.event == DpdfnetEvent::ProcessingFailure)
+      require(std::string(result.message.data()).find("exceeded its input") !=
+                  std::string::npos,
+              "runaway output failed for another reason");
+    opened = result.event == DpdfnetEvent::CircuitOpened;
+  }
+  require(opened && processor.snapshot().processing_disabled,
+          "runaway output never opened the circuit");
+  // The gain reaches 3 before the hop at 9 is refused.
+  require(loudest > 0.2f && loudest < 0.81f,
+          "runaway output peaked at " + std::to_string(loudest) +
+              " for an input of 0.1");
+}
+
+// With silent input there is nothing to compare the output with, so only
+// loud output is a fault. A quiet residual is the model's own business.
+void test_output_check_on_silent_input(const std::filesystem::path &fixtures) {
+  std::vector<float> silence(960, 0.0f);
+  DpdfnetAudioPacket packet;
+  packet.data[0] = silence.data();
+  packet.frames = 960;
+  // A tone at 10 in one bin, about -35 dBFS, whatever the input.
+  DpdfnetProcessor quiet =
+      make_processor((fixtures / "valid_constant_tone.onnx").string());
+  // The same tone at 1000, about 5 dB over full scale.
+  DpdfnetProcessor loud =
+      make_processor((fixtures / "runtime_loud_tone_output.onnx").string());
+  for (uint64_t index = 0; index < 10; ++index) {
+    packet.timestamp = NS_PER_SECOND + index * 20'000'000;
+    require(quiet.process(packet).event == DpdfnetEvent::None,
+            "a quiet residual on silent input was treated as a fault");
+  }
+  packet.timestamp = NS_PER_SECOND;
+  const auto result = loud.process(packet);
+  require(result.event == DpdfnetEvent::ProcessingFailure &&
+              result.disposition == DpdfnetDisposition::Passthrough &&
+              std::string(result.message.data()).find("exceeded its input") !=
+                  std::string::npos,
+          "loud output on silent input was not refused");
+}
+
+// A model with an output delay still emits a burst after its input has gone
+// silent. The comparison looks back far enough to see where it came from.
+void test_output_check_allows_delayed_output(
+    const std::filesystem::path &fixtures) {
+  // Returns its input four hops late.
+  DpdfnetProcessor processor =
+      make_processor((fixtures / "valid_delayed_identity.onnx").string());
+  std::vector<float> burst(960, 0.5f);
+  std::vector<float> silence(960, 0.0f);
+  DpdfnetAudioPacket packet;
+  packet.frames = 960;
+  for (uint64_t index = 0; index < 40; ++index) {
+    packet.data[0] = index < 5 ? burst.data() : silence.data();
+    packet.timestamp = NS_PER_SECOND + index * 20'000'000;
+    require(processor.process(packet).event == DpdfnetEvent::None,
+            "delayed output after the input went silent was treated as a "
+            "fault");
+  }
+}
+
+// Audio far outside a microphone's range must not look like a fault: levels
+// above full scale, clicks, a burst cut to digital silence, and near silence.
+void test_output_check_passes_stress_audio(const std::string &model_path) {
+  DpdfnetProcessor processor = make_processor(model_path);
+  std::vector<float> signal(4 * 48000, 0.0f);
+  std::mt19937 rng(2718);
+  std::normal_distribution<float> noise(0.0f, 1.0f);
+  for (size_t i = 0; i < 48000; ++i)
+    signal[i] = 3.0f * noise(rng);
+  for (size_t i = 48000; i < 2 * 48000; i += 4800)
+    signal[i] = 1.0f;
+  for (size_t i = 2 * 48000; i < 2 * 48000 + 9600; ++i)
+    signal[i] = 0.3f * noise(rng);
+  for (size_t i = 3 * 48000; i < 4 * 48000; ++i)
+    signal[i] = 1e-4f * noise(rng);
+  // process_signal fails on any packet the processor passes through.
+  process_signal(processor, signal);
+  require(processor.state().consecutive_failures == 0,
+          "stress audio was counted as a processing failure");
+}
+
 void test_resampled_failure_refresh(
     const std::filesystem::path &fixture_directory) {
   constexpr uint32_t sample_rate = 44100;
@@ -2010,6 +2224,41 @@ int main(int argc, char **argv) {
            passed;
   passed = run_test("processing circuit breaker",
                     [&] { test_circuit_breaker(fixtures); }) &&
+           passed;
+  passed = run_test("delayed failure opens the circuit",
+                    [&] { test_delayed_failure_opens_circuit(fixtures); }) &&
+           passed;
+  passed = run_test("failure count recovery",
+                    [&] { test_failure_count_recovery(fixtures); }) &&
+           passed;
+  passed = run_test("spaced failures open the circuit",
+                    [&] { test_spaced_failures_open_circuit(fixtures); }) &&
+           passed;
+  passed = run_test("paused hops do not clear failures",
+                    [&] {
+                      test_paused_hops_do_not_clear_failures(fixtures);
+                    }) &&
+           passed;
+  passed = run_test("output check on silent input",
+                    [&] { test_output_check_on_silent_input(fixtures); }) &&
+           passed;
+  passed = run_test("output check allows delayed output",
+                    [&] {
+                      test_output_check_allows_delayed_output(fixtures);
+                    }) &&
+           passed;
+  passed = run_test("runaway output opens the circuit",
+                    [&] { test_runaway_output_opens_circuit(fixtures); }) &&
+           passed;
+  passed = run_test("DPDFNet8 output check on stress audio",
+                    [&] {
+                      test_output_check_passes_stress_audio(quality_model);
+                    }) &&
+           passed;
+  passed = run_test("DPDFNet2 output check on stress audio",
+                    [&] {
+                      test_output_check_passes_stress_audio(low_cpu_model);
+                    }) &&
            passed;
   passed = run_test("resampled failure refresh",
                     [&] { test_resampled_failure_refresh(fixtures); }) &&

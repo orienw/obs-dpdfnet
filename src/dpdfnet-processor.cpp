@@ -27,6 +27,16 @@ constexpr size_t RESAMPLE_BOUND_SLACK = 256;
 // the shorter one.
 constexpr double PAUSE_FADE_OUT_SECONDS = 0.1;
 constexpr double RESUME_FADE_IN_SECONDS = 0.2;
+// A failure stays on the count until the model has run cleanly for this long,
+// so a fault that takes several hops to develop still opens the circuit.
+constexpr double FAILURE_RECOVERY_SECONDS = 10.0;
+// A working model does not amplify: measured by the norm of the spectrum, the
+// bundled ones stay under 0.97 times their loudest recent input on speech and
+// on stress signals. Output this far above the input, and louder than -20
+// dBFS, is a broken model or runtime. The norm of a spectrum is about half the
+// FFT size times the RMS level of its frame.
+constexpr double MAX_MODEL_GAIN = 8.0;
+constexpr double LOUD_NORM_PER_FFT_SAMPLE = 0.05;
 
 #if defined(_M_X64) || defined(__x86_64__)
 constexpr unsigned int MXCSR_FLUSH_ZERO = 0x8000;
@@ -217,6 +227,15 @@ size_t lfe_channel_for(size_t channels) {
     return DPDFNET_MAX_AUDIO_PLANES;
   }
 }
+
+// The squared norm of an interleaved spectrum. A double holds the square of
+// any finite float, so a runaway value cannot overflow the sum.
+double spectrum_energy(const float *spec, size_t size) {
+  double energy = 0.0;
+  for (size_t i = 0; i < size; ++i)
+    energy += static_cast<double>(spec[i]) * spec[i];
+  return energy;
+}
 } // namespace
 
 float dpdfnet_db_to_amp(double db) {
@@ -380,14 +399,16 @@ DpdfnetModelBundle DpdfnetProcessor::replace_model(DpdfnetModelBundle bundle) {
   noisy_history_offset_ = 0;
   warmup_hops_ = model_ ? model_->output_delay_hops() : 0;
   bridge_hops_ = 0;
-  const auto fade_hops = [this](double seconds) {
+  input_energies_.fill(0.0);
+  const auto hops_in = [this](double seconds) {
     return model_ ? std::max(1, static_cast<int>(std::lround(
                                     seconds * model_->sample_rate() /
                                     model_->hop_size())))
                   : 1;
   };
-  fade_in_hops_ = fade_hops(RESUME_FADE_IN_SECONDS);
-  fade_out_hops_ = fade_hops(PAUSE_FADE_OUT_SECONDS);
+  fade_in_hops_ = hops_in(RESUME_FADE_IN_SECONDS);
+  fade_out_hops_ = hops_in(PAUSE_FADE_OUT_SECONDS);
+  recovery_hops_ = static_cast<size_t>(hops_in(FAILURE_RECOVERY_SECONDS));
   depth_steps_ = fade_in_hops_ * fade_out_hops_;
   emitted_since_reset_ = false;
   return old;
@@ -500,6 +521,7 @@ void DpdfnetProcessor::reset_audio_state(bool reset_model) {
     noisy_history_offset_ = 0;
     warmup_hops_ = model_ ? model_->output_delay_hops() : 0;
     bridge_hops_ = 0;
+    input_energies_.fill(0.0);
     depth_steps_ = disable_reason_ == DpdfnetDisableReason::RealtimeOverload
                        ? 0
                        : fade_in_hops_ * fade_out_hops_;
@@ -654,6 +676,8 @@ void DpdfnetProcessor::process_available_hops(size_t &processed_hops,
   while (realtime_.input_mono.size() >= window_size) {
     realtime_.input_mono.peek(realtime_.frame.data(), window_size);
     stft_->analysis(realtime_.frame, noisy_spec);
+    input_energies_[input_energy_index_] = spectrum_energy(noisy_spec, spec_n);
+    input_energy_index_ = (input_energy_index_ + 1) % input_energies_.size();
     // A paused hop steps the depth down first, so the model runs only while
     // its output still counts.
     if (paused) {
@@ -665,6 +689,14 @@ void DpdfnetProcessor::process_available_hops(size_t &processed_hops,
     if (run_model) {
       ++inference_hops;
       model_->enhance();
+      const double loudest_input =
+          *std::max_element(input_energies_.begin(), input_energies_.end());
+      const double loud_norm =
+          LOUD_NORM_PER_FFT_SAMPLE * static_cast<double>(window_size);
+      if (spectrum_energy(enhanced_spec, spec_n) >
+          std::max(MAX_MODEL_GAIN * MAX_MODEL_GAIN * loudest_input,
+                   loud_norm * loud_norm))
+        throw std::runtime_error("DPDFNet model output far exceeded its input");
     }
     float *delayed_spec = realtime_.noisy_history.empty()
                               ? noisy_spec
@@ -819,6 +851,7 @@ DpdfnetProcessor::pop_output_packet(size_t processed_hops) {
 
 DpdfnetProcessResult DpdfnetProcessor::failure_result(const char *message) {
   ++consecutive_failures_;
+  healthy_hops_ = 0;
   std::snprintf(last_error_.data(), last_error_.size(), "%s", message);
   const bool report = !process_error_reported_;
   process_error_reported_ = true;
@@ -904,6 +937,7 @@ bool DpdfnetProcessor::resume_after_overload() {
   if (model_ && depth_steps_ == 0) {
     model_->reset();
     bridge_hops_ = model_->output_delay_hops();
+    input_energies_.fill(0.0);
   }
   return true;
 }
@@ -998,9 +1032,12 @@ DpdfnetProcessor::process_packet(const DpdfnetAudioPacket &audio) {
   size_t inference_hops = 0;
   try {
     process_available_hops(processed_hops, inference_hops);
-    if (processed_hops) {
-      consecutive_failures_ = 0;
-      process_error_reported_ = false;
+    if (consecutive_failures_) {
+      healthy_hops_ += inference_hops;
+      if (healthy_hops_ >= recovery_hops_) {
+        consecutive_failures_ = 0;
+        process_error_reported_ = false;
+      }
     }
   } catch (const std::exception &ex) {
     // The work done before the failure still took time on the audio thread.

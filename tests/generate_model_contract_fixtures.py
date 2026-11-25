@@ -138,6 +138,18 @@ CASES = (
         "runtime_nonfinite_spectrum_output",
         {"nonfinite_nonzero_spectrum": True},
     ),
+    Case(
+        "runtime_delayed_nonfinite_spectrum_output",
+        {"nonfinite_after_hops": 6},
+    ),
+    Case(
+        "runtime_growing_spectrum_output",
+        {"gain_per_hop": 3.0},
+    ),
+    Case(
+        "runtime_loud_tone_output",
+        {"output_tone": True, "tone_level": 1000.0},
+    ),
 )
 
 
@@ -168,6 +180,9 @@ def make_fixture(path: Path, **options) -> None:
     output_scale = options.get("output_scale")
     input_count = options.get("input_count", 2)
     output_count = options.get("output_count", 2)
+    nonfinite_after_hops = options.get("nonfinite_after_hops")
+    gain_per_hop = options.get("gain_per_hop")
+    counts_hops = bool(nonfinite_after_hops or gain_per_hop)
 
     if options.get("arbitrary_names"):
         spec_in, state_in = "spectral_data", "memory_in"
@@ -243,16 +258,47 @@ def make_fixture(path: Path, **options) -> None:
                 [spec_out],
             ),
         ]
+    elif counts_hops:
+        # The state counts the hops since a reset, so the fault takes several
+        # of them to develop.
+        one = helper.make_tensor("one", element_type, [1], [1.0])
+        nodes = [
+            helper.make_node("Constant", [], ["one"], value=one),
+            helper.make_node("Add", [state_in, "one"], [state_out]),
+        ]
+        if nonfinite_after_hops:
+            last = helper.make_tensor(
+                "last_finite", element_type, [1], [nonfinite_after_hops - 1.0]
+            )
+            nodes.extend([
+                helper.make_node("Constant", [], ["last_finite"], value=last),
+                helper.make_node("Greater", [state_in, "last_finite"], ["late"]),
+                constant_node(
+                    "nonfinite_runtime", "nan_spectrum", element_type, spec_shape
+                ),
+                helper.make_node(
+                    "Where", ["late", "nan_spectrum", spec_in], [spec_out]
+                ),
+            ])
+        else:
+            base = helper.make_tensor(
+                "gain_per_hop", element_type, [1], [gain_per_hop]
+            )
+            nodes.extend([
+                helper.make_node("Constant", [], ["gain_per_hop"], value=base),
+                helper.make_node("Pow", ["gain_per_hop", state_in], ["gain"]),
+                helper.make_node("Mul", [spec_in, "gain"], [spec_out]),
+            ])
     elif options.get("output_tone"):
         # A 1 kHz bin at a fixed level, whatever the input.
         values = [0.0] * spectrum_size
-        values[2 * 20] = 10.0
+        values[2 * 20] = options.get("tone_level", 10.0)
         tone = helper.make_tensor("tone", element_type, list(spec_shape), values)
         nodes = [helper.make_node("Constant", [], [spec_out], value=tone)]
     else:
         nodes = [helper.make_node("Identity", [spec_in], [spec_out])]
 
-    if output_count >= 2 and not delay_hops:
+    if output_count >= 2 and not delay_hops and not counts_hops:
         if options.get("doubled_state"):
             nodes.append(helper.make_node(
                 "Concat", [state_in, state_in], [state_out], axis=0

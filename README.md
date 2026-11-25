@@ -84,7 +84,8 @@ shasum -a 256 obs-dpdfnet-<version>-macos-arm64.zip
 ## Behavior and diagnostics
 
 - **50 ms latency:** With the bundled models, the filter delays audio by 50 ms (40 ms model + 10 ms STFT overlap). Original audio in the mix, bypass, and timestamps stay aligned so OBS keeps audio in sync with video. Audio monitoring hears the delay.
-- **CPU overload fallback:** If your CPU cannot keep up in real time, the filter smoothly fades out suppression (100 ms out, 200 ms back in) while keeping audio passing at the same delay. It reports the pause in `Status` and retries automatically (after 10 s, 30 s, then every 60 s). Switch to `DPDFNet2` or reduce system load if pauses recur. Repeated failures disable processing until you press `Reset processing`.
+- **CPU overload fallback:** If your CPU cannot keep up in real time, the filter smoothly fades out suppression (100 ms out, 200 ms back in) while keeping audio passing at the same delay. It reports the pause in `Status` and retries automatically (after 10 s, 30 s, then every 60 s). Switch to `DPDFNet2` or reduce system load if pauses recur.
+- **Processing failures:** If the model fails, or its output is far louder than its input, that audio passes through unprocessed and the filter tries again. Three failures without ten clean seconds between them disable processing until you press `Reset processing`.
 - **Status line:** Shows what the filter is doing and what listeners hear. Pauses and recovery update automatically; press `Refresh` to update processing load and diagnostics.
 
 <details>

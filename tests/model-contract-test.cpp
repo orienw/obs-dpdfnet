@@ -78,6 +78,9 @@ constexpr ContractCase kCases[] = {
      "DPDFNet model produced non-finite state output"},
     {"runtime_nonfinite_spectrum_output.onnx",
      "DPDFNet model produced non-finite spectrum output"},
+    {"runtime_delayed_nonfinite_spectrum_output.onnx", nullptr},
+    {"runtime_growing_spectrum_output.onnx", nullptr},
+    {"runtime_loud_tone_output.onnx", nullptr},
 };
 
 void run_model(const std::filesystem::path &path) {

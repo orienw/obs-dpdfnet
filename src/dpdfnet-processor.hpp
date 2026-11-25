@@ -212,6 +212,9 @@ private:
   static constexpr uint32_t MAX_AUDIO_PACKET_FRAMES =
       DPDFNET_MAX_REALTIME_PACKET_FRAMES;
   static constexpr unsigned MAX_CONSECUTIVE_FAILURES = 3;
+  // How far back the model's output is compared with its input. It covers the
+  // longest output delay a model may declare, with room for its filter taps.
+  static constexpr size_t GAIN_WINDOW_HOPS = 32;
   static constexpr uint64_t NS_PER_SECOND = 1000000000ULL;
   // OBS smooths audio timestamps that deviate by less than this
   // (TS_SMOOTHING_THRESHOLD), but only after filters have run, so the filter
@@ -264,6 +267,12 @@ private:
   DpdfnetDisableReason disable_reason_ = DpdfnetDisableReason::None;
   bool capacity_recovery_pending_ = false;
   unsigned consecutive_failures_ = 0;
+  // Hops the model ran since the last failure, and how many clear it.
+  size_t healthy_hops_ = 0;
+  size_t recovery_hops_ = 1;
+  // The squared norm of the input spectrum of each recent hop.
+  std::array<double, GAIN_WINDOW_HOPS> input_energies_ = {};
+  size_t input_energy_index_ = 0;
   uint64_t oversized_packets_ = 0;
   uint64_t capacity_failures_ = 0;
   uint64_t timestamp_discontinuities_ = 0;

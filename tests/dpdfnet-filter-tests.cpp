@@ -974,7 +974,8 @@ void test_status_transitions(const std::filesystem::path &fixtures) {
       const auto before = property_updates.load();
       storage.left.fill(0);
       storage.right.fill(0);
-      for (uint64_t packet = 2; packet < 102; ++packet) {
+      // A failure clears after ten seconds of clean audio.
+      for (uint64_t packet = 2; packet < 1102; ++packet) {
         auto input = storage.direct_packet(1000000000ULL +
                                             packet * PACKET_DURATION_NS);
         dpdfnet_filter_info.filter_audio(filter.get(), &input);
