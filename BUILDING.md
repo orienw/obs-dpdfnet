@@ -25,7 +25,7 @@ To refresh ONNX Runtime and verify the bundled models, optionally rebuilding and
 ```
 
 Pass `-OnnxRuntimeVersion latest` to try a newer ONNX Runtime release.
-The updater restores missing or mismatched bundled models from the checkout's commit, or from the matching plugin tag in a release source archive.
+The updater restores missing bundled models from the checkout's commit, or from the matching plugin tag in a release source archive. If a local model differs, the updater stops before building. Update the manifest digest for an intentional change or pass `-Force` to restore the bundled export.
 
 ## Manual CMake builds
 

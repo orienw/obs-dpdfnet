@@ -153,9 +153,13 @@ function Update-DpdfnetModels {
 
         if ($expectedHash -notmatch '^[a-fA-F0-9]{64}$') { throw "Missing SHA-256 for $modelName" }
         $modelPath = Join-Path $Models "$modelName.onnx"
-        if (!$Force -and (Get-Sha256 $modelPath) -eq $expectedHash) {
+        $localHash = Get-Sha256 $modelPath
+        if ($localHash -eq $expectedHash -and ($bundled -or !$Force)) {
             Write-Host "$modelName is current."
             continue
+        }
+        if ($bundled -and $localHash -and !$Force) {
+            throw "Local model $modelName differs from models/manifest.json. Update the digest for an intentional change or use -Force to restore the bundled export."
         }
 
         Write-Host "Downloading $modelName"

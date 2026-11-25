@@ -76,13 +76,15 @@ Set-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot) "installed.txt") 
         if ($Uri -cne $ExpectedModelUri) { throw "Unexpected model source: $Uri" }
         Set-Content -LiteralPath $OutFile $ModelResponse
     }
-    foreach ($Missing in @($true, $false)) {
-        if ($Missing) { Remove-Item -LiteralPath $ModelPath } else { Set-Content $ModelPath "stock model" }
-        $ModelResponse = "model $DpdfnetDefaultModelName"
+    Set-Content $ModelPath "local export"
+    try {
         & (Join-Path $TestRoot "scripts\update-windows.ps1")
-        if ((Get-FileHash $ModelPath).Hash -ne $Entries[0].sha256) { throw "Did not restore the bundled export" }
+        throw "Expected a local model mismatch"
+    } catch {
+        if ($_.Exception.Message -notlike "Local model * differs from models/manifest.json.*") { throw }
     }
-    Set-Content $ModelPath "previous file"
+    if ((Get-Content $ModelPath) -cne "local export") { throw "Updater replaced a modified export" }
+    Remove-Item -LiteralPath $ModelPath
     $ModelResponse = "incorrect download"
     try {
         & (Join-Path $TestRoot "scripts\update-windows.ps1")
@@ -90,9 +92,11 @@ Set-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot) "installed.txt") 
     } catch {
         if ($_.Exception.Message -notlike "Model hash mismatch*") { throw }
     }
-    if ((Get-Content $ModelPath) -cne "previous file") { throw "Invalid download replaced an existing file" }
+    if (Test-Path $ModelPath) { throw "Updater installed an invalid download" }
+    $ModelResponse = "model $DpdfnetDefaultModelName"
+    & (Join-Path $TestRoot "scripts\update-windows.ps1")
+    if ((Get-FileHash $ModelPath).Hash -ne $Entries[0].sha256) { throw "Did not restore the bundled export" }
     if ((Get-FileHash $ManifestPath).Hash -ne $ManifestHash) { throw "Updater modified the release manifest" }
-    Set-Content $ModelPath "model $DpdfnetDefaultModelName"
     Write-Host "PASS bundled models use the plugin release and preserve provenance"
 
     # Run the real updater and builder through runtime extraction. Stop when the
@@ -124,6 +128,10 @@ Set-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot) "installed.txt") 
             Copy-Item -LiteralPath $FixtureZip -Destination $OutFile
             return
         }
+        if ($Uri -ceq $ExpectedModelUri) {
+            Set-Content -LiteralPath $OutFile $ModelResponse
+            return
+        }
         throw "Unexpected download request: $Uri"
     }
     foreach ($ExpectedRequests in @(2, 1)) {
@@ -139,6 +147,16 @@ Set-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot) "installed.txt") 
         }
     }
     Write-Host "PASS latest builds reuse the verified archive on fresh and cached updates"
+
+    Set-Content $ModelPath "local export"
+    foreach ($ExpectedRequests in @(2, 1)) {
+        $Requests.Clear()
+        & (Join-Path $TestRoot "scripts\update-windows.ps1") -OnnxRuntimeVersion latest -Force
+        if ($Requests.Count -ne $ExpectedRequests -or (Get-FileHash $ModelPath).Hash -ne $Entries[0].sha256) {
+            throw "Forced update did not restore only the modified model: $Requests"
+        }
+    }
+    Write-Host "PASS forced updates restore modified bundled models and reuse verified ones"
 
     foreach ($UpstreamUnavailable in @($true, $false)) {
         $Requests.Clear()
