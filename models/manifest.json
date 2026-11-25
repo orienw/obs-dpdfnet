@@ -1,20 +1,22 @@
 {
-    "updatedAt":  "2026-05-30T03:56:40.3253535Z",
-    "source":  "Ceva-IP/DPDFNet",
-    "revision":  "e3efebcb54d75b76681ad74f8c65ff8ae175cbfb",
-    "defaultModel":  "dpdfnet8_48khz_hr",
-    "models":  [
-                   {
-                       "name":  "dpdfnet8_48khz_hr",
-                       "file":  "onnx/dpdfnet8_48khz_hr.onnx",
-                       "sha256":  "7b3afbb260a08fe9af3d16e3bda992971be1e7e951d1dee7c2d235f5c43f5631",
-                       "size":  14857107
-                   },
-                   {
-                       "name":  "dpdfnet2_48khz_hr",
-                       "file":  "onnx/dpdfnet2_48khz_hr.onnx",
-                       "sha256":  "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
-                       "size":  10493337
-                   }
-               ]
+  "updatedAt": "2026-11-25T06:18:39Z",
+  "source": "Ceva-IP/DPDFNet",
+  "revision": "e3efebcb54d75b76681ad74f8c65ff8ae175cbfb",
+  "defaultModel": "dpdfnet8_48khz_hr",
+  "models": [
+    {
+      "name": "dpdfnet8_48khz_hr",
+      "file": "onnx/dpdfnet8_48khz_hr.onnx",
+      "sha256": "c129dbe529628d7c549aa73ae01dc515f20bc976d719e2b2f605d5a3e0df251b",
+      "size": 14747607,
+      "upstreamSha256": "7b3afbb260a08fe9af3d16e3bda992971be1e7e951d1dee7c2d235f5c43f5631"
+    },
+    {
+      "name": "dpdfnet2_48khz_hr",
+      "file": "onnx/dpdfnet2_48khz_hr.onnx",
+      "sha256": "bcbf1881459aeecf5a3a0a570f6b3de2e0afe015c15fec79b7496117986f2a37",
+      "size": 10448025,
+      "upstreamSha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b"
+    }
+  ]
 }

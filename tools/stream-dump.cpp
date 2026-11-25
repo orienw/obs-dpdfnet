@@ -35,9 +35,9 @@ void write_f32(const char *path, const std::vector<float> &samples) {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 4) {
+  if (argc != 4 && argc != 5) {
     std::cerr << "usage: dpdfnet-stream-dump <model.onnx> <input.f32> "
-                 "<output.f32>\n";
+                 "<output.f32> [state-snapshots.f32]\n";
     return 2;
   }
 
@@ -45,6 +45,13 @@ int main(int argc, char **argv) {
     const std::vector<float> input = read_f32(argv[2]);
     DpdfnetProcessor processor;
     auto model = prepare_dpdfnet_model(argv[1]);
+    // The processor owns this model for the rest of the dump.
+    const auto &active_model = *model.model;
+    std::ofstream snapshots;
+    if (argc == 5) {
+      snapshots.exceptions(std::ios::badbit | std::ios::failbit);
+      snapshots.open(argv[4], std::ios::binary);
+    }
     const uint32_t sample_rate =
         static_cast<uint32_t>(model.model->sample_rate());
     processor.set_format(sample_rate, 1);
@@ -57,6 +64,7 @@ int main(int argc, char **argv) {
     std::vector<float> padding(1024, 0.0f);
     size_t offset = 0;
     size_t packet_index = 0;
+    size_t processed_hops = 0;
     uint64_t timestamp = NS_PER_SECOND;
     while (output.size() < input.size() && packet_index < 100000) {
       const uint32_t requested =
@@ -75,6 +83,14 @@ int main(int argc, char **argv) {
         throw std::runtime_error(result.message.data());
       if (result.disposition == DpdfnetDisposition::Passthrough)
         throw std::runtime_error("processor unexpectedly passed through");
+      const size_t next_hop = processed_hops + result.processed_hops;
+      if (snapshots.is_open() && processed_hops / 100 != next_hop / 100) {
+        const auto &state = active_model.recurrent_state();
+        snapshots.write(reinterpret_cast<const char *>(state.data()),
+                        static_cast<std::streamsize>(state.size() *
+                                                     sizeof(float)));
+      }
+      processed_hops = next_hop;
       if (result.disposition == DpdfnetDisposition::Processed)
         output.insert(output.end(), result.data[0],
                       result.data[0] + result.frames);

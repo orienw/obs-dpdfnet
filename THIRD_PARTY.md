@@ -6,7 +6,8 @@ directory.
 
 ## Bundled Artifacts
 
-- DPDFNet ONNX models from `Ceva-IP/DPDFNet`, Apache-2.0.
+- DPDFNet ONNX models derived from `Ceva-IP/DPDFNet`, Apache-2.0.
+  - Modified by obs-dpdfnet to retain frequency-major features between recurrent blocks and declare the four-hop model delay. The trained weights are preserved.
   - Source: `https://huggingface.co/Ceva-IP/DPDFNet`
   - Bundled files:
     - `models/dpdfnet8_48khz_hr.onnx`

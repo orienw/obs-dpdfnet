@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
   # The Windows workflow calls this for a release tag and publishes the zip.
   workflow_call:
 
@@ -178,6 +179,10 @@ jobs:
           for model in dpdfnet8_48khz_hr dpdfnet2_48khz_hr; do
             build/dpdfnet-processor-benchmark "models/$model.onnx" 48000
           done
+
+      - name: Compare release models with the pinned Ceva exports
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+        run: python3 tests/compare-bundled-models.py build build/model-comparison
 
       - name: Package release candidate
         if: github.event_name == 'push'

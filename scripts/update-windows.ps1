@@ -129,73 +129,56 @@ function Update-OnnxRuntime {
 }
 
 function Update-DpdfnetModels {
-    $repo = Invoke-RestMethod -Uri "https://huggingface.co/api/models/Ceva-IP/DPDFNet?blobs=true"
-    $records = @()
-
+    $manifest = Get-Content -Raw -LiteralPath (Join-Path $Models "manifest.json") | ConvertFrom-Json
+    $upstream = $null
     foreach ($modelName in $ModelNames) {
-        $repoFile = "onnx/$modelName.onnx"
-        $sibling = @($repo.siblings | Where-Object { $_.rfilename -eq $repoFile })[0]
-        if (!$sibling) {
-            throw "Could not find $repoFile in Ceva-IP/DPDFNet"
-        }
-
-        $expectedHash = $sibling.lfs.sha256.ToLowerInvariant()
-        $modelPath = Join-Path $Models "$modelName.onnx"
-        $currentHash = Get-Sha256 -Path $modelPath
-
-        if ($Force -or !(Test-Path $modelPath) -or ($currentHash -ne $expectedHash)) {
-            Write-Host "Downloading $modelName"
-            $tmpPath = "$modelPath.download"
-            Invoke-WebRequest `
-                -Uri "https://huggingface.co/Ceva-IP/DPDFNet/resolve/$($repo.sha)/$repoFile" `
-                -OutFile $tmpPath
-
-            $downloadHash = Get-Sha256 -Path $tmpPath
-            if ($downloadHash -ne $expectedHash) {
-                Remove-Item -Force $tmpPath -ErrorAction SilentlyContinue
-                throw "Model hash mismatch for $modelName. Expected $expectedHash, got $downloadHash"
+        $bundled = $DpdfnetDefaultModelNames -contains $modelName
+        if ($bundled) {
+            $entry = @($manifest.models | Where-Object { $_.name -eq $modelName })
+            if ($entry.Count -ne 1) {
+                throw "Missing bundled digest for $modelName in models/manifest.json"
             }
-
-            Move-Item -Force $tmpPath $modelPath
+            $expectedHash = $entry[0].sha256
         } else {
+            # Explicit additional models still come from Ceva's model repository.
+            if (!$upstream) {
+                $upstream = Invoke-RestMethod -Uri "https://huggingface.co/api/models/Ceva-IP/DPDFNet?blobs=true"
+            }
+            $repoFile = "onnx/$modelName.onnx"
+            $sibling = @($upstream.siblings | Where-Object { $_.rfilename -eq $repoFile })[0]
+            if (!$sibling) { throw "Could not find $repoFile in Ceva-IP/DPDFNet" }
+            $expectedHash = $sibling.lfs.sha256
+            $uri = "https://huggingface.co/Ceva-IP/DPDFNet/resolve/$($upstream.sha)/$repoFile"
+        }
+
+        if ($expectedHash -notmatch '^[a-fA-F0-9]{64}$') { throw "Missing SHA-256 for $modelName" }
+        $modelPath = Join-Path $Models "$modelName.onnx"
+        if (!$Force -and (Get-Sha256 $modelPath) -eq $expectedHash) {
             Write-Host "$modelName is current."
+            continue
         }
 
-        $records += [PSCustomObject]@{
-            name = $modelName
-            file = $repoFile
-            sha256 = $expectedHash
-            size = $sibling.size
+        Write-Host "Downloading $modelName"
+        if ($bundled) {
+            $ref = "v$DpdfnetDefaultPluginVersion"
+            if ((Test-Path -LiteralPath (Join-Path $Root ".git")) -and (Get-Command git -ErrorAction SilentlyContinue)) {
+                $ref = git -C $Root rev-parse HEAD
+                if ($LASTEXITCODE -ne 0) { throw "Could not identify the model source commit" }
+            }
+            $uri = "https://raw.githubusercontent.com/orienw/obs-dpdfnet/$ref/models/$modelName.onnx"
+        }
+        $tmpPath = "$modelPath.$([guid]::NewGuid()).download"
+        try {
+            Invoke-WebRequest -Uri $uri -OutFile $tmpPath
+            $actualHash = Get-Sha256 $tmpPath
+            if (!$actualHash -or $actualHash -ne $expectedHash) {
+                throw "Model hash mismatch for $modelName. Expected $expectedHash, got $actualHash"
+            }
+            Move-Item -Force -LiteralPath $tmpPath -Destination $modelPath
+        } finally {
+            if (Test-Path -LiteralPath $tmpPath) { Remove-Item -LiteralPath $tmpPath -Force }
         }
     }
-
-    # The manifest is tracked. Rewrite it only when the models it describes
-    # change, so checking current models leaves the working tree clean. The
-    # revision and timestamp record when the files last changed.
-    $manifestPath = Join-Path $Models "manifest.json"
-    $describe = {
-        param($DefaultModel, $ModelRecords)
-        (@($DefaultModel) + @($ModelRecords | ForEach-Object {
-            "$($_.name)|$($_.file)|$($_.sha256)|$($_.size)"
-        })) -join "`n"
-    }
-    if (Test-Path $manifestPath) {
-        $current = Get-Content -Raw $manifestPath | ConvertFrom-Json
-        if ((& $describe $current.defaultModel $current.models) -ceq
-            (& $describe $DefaultModelName $records)) {
-            Write-Host "Model manifest is current."
-            return
-        }
-    }
-
-    [PSCustomObject]@{
-        updatedAt = (Get-Date).ToUniversalTime().ToString("o")
-        source = "Ceva-IP/DPDFNet"
-        revision = $repo.sha
-        defaultModel = $DefaultModelName
-        models = $records
-    } | ConvertTo-Json -Depth 5 |
-        Set-Content -Encoding ASCII -Path $manifestPath
 }
 
 $runtime = Update-OnnxRuntime

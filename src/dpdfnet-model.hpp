@@ -32,6 +32,11 @@ public:
   float *input_spectrum() { return in_spec_.data(); }
   float *output_spectrum() { return out_spec_.data(); }
   size_t spectrum_size() const { return in_spec_.size(); }
+  const std::vector<float> &recurrent_state() const {
+    if (use_initial_state_)
+      return initial_state_;
+    return parity_ == 0 ? state_a_ : state_b_;
+  }
 
   int sample_rate() const { return sample_rate_; }
   int n_fft() const { return n_fft_; }

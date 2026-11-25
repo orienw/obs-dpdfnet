@@ -23,6 +23,12 @@ try {
             size = (Get-Item -LiteralPath $Path).Length
         }
     })
+    $ManifestPath = Join-Path $TestRoot "models\manifest.json"
+    $Entries = @(foreach ($Model in $ModelRecords) {
+        @{ name = [IO.Path]::GetFileNameWithoutExtension($Model.rfilename); sha256 = $Model.lfs.sha256 }
+    })
+    @{ revision = "pinned"; models = $Entries } | ConvertTo-Json -Depth 4 | Set-Content $ManifestPath
+    $ManifestHash = (Get-FileHash $ManifestPath).Hash
 
     function Invoke-RestMethod {
         param([string]$Uri)
@@ -31,9 +37,6 @@ try {
                 tag_name = "v$UnpinnedVersion"
                 assets = @([PSCustomObject]@{ name = "$FixtureBase.zip"; digest = "sha256:$FixtureHash" })
             }
-        }
-        if ($Uri -eq "https://huggingface.co/api/models/Ceva-IP/DPDFNet?blobs=true") {
-            return [PSCustomObject]@{ sha = "test-revision"; siblings = $ModelRecords }
         }
         throw "Unexpected download request: $Uri"
     }
@@ -65,6 +68,32 @@ Set-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot) "installed.txt") 
         }
         Write-Host "PASS build and install share the $(if ($Custom) { 'custom' } else { 'default' }) directory"
     }
+
+    $ModelPath = Join-Path $TestRoot "models\$DpdfnetDefaultModelName.onnx"
+    $ExpectedModelUri = "https://raw.githubusercontent.com/orienw/obs-dpdfnet/v$DpdfnetDefaultPluginVersion/models/$DpdfnetDefaultModelName.onnx"
+    function Invoke-WebRequest {
+        param([string]$Uri, [string]$OutFile)
+        if ($Uri -cne $ExpectedModelUri) { throw "Unexpected model source: $Uri" }
+        Set-Content -LiteralPath $OutFile $ModelResponse
+    }
+    foreach ($Missing in @($true, $false)) {
+        if ($Missing) { Remove-Item -LiteralPath $ModelPath } else { Set-Content $ModelPath "stock model" }
+        $ModelResponse = "model $DpdfnetDefaultModelName"
+        & (Join-Path $TestRoot "scripts\update-windows.ps1")
+        if ((Get-FileHash $ModelPath).Hash -ne $Entries[0].sha256) { throw "Did not restore the bundled export" }
+    }
+    Set-Content $ModelPath "previous file"
+    $ModelResponse = "incorrect download"
+    try {
+        & (Join-Path $TestRoot "scripts\update-windows.ps1")
+        throw "Expected model checksum failure"
+    } catch {
+        if ($_.Exception.Message -notlike "Model hash mismatch*") { throw }
+    }
+    if ((Get-Content $ModelPath) -cne "previous file") { throw "Invalid download replaced an existing file" }
+    if ((Get-FileHash $ManifestPath).Hash -ne $ManifestHash) { throw "Updater modified the release manifest" }
+    Set-Content $ModelPath "model $DpdfnetDefaultModelName"
+    Write-Host "PASS bundled models use the plugin release and preserve provenance"
 
     # Run the real updater and builder through runtime extraction. Stop when the
     # builder moves on to OBS, before it needs the compiler or an OBS install.

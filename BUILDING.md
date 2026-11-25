@@ -17,7 +17,7 @@ From PowerShell in the repository root:
 
 The scripts download build inputs into `third_party/`, build into `build/`, and install into `%ProgramData%\obs-studio\plugins\obs-dpdfnet`. Restart OBS afterwards.
 
-To refresh the pinned ONNX Runtime and model files (with hash checks), optionally rebuilding and installing:
+To refresh ONNX Runtime and verify the bundled models, optionally rebuilding and installing:
 
 ```powershell
 .\scripts\update-windows.ps1
@@ -25,6 +25,7 @@ To refresh the pinned ONNX Runtime and model files (with hash checks), optionall
 ```
 
 Pass `-OnnxRuntimeVersion latest` to try a newer ONNX Runtime release.
+The updater restores missing or mismatched bundled models from the checkout's commit, or from the matching plugin tag in a release source archive.
 
 ## Manual CMake builds
 
@@ -143,10 +144,18 @@ Results are written per case under `build\quality-results\`, including listening
 
 ## Models
 
-[models/](models/) contains the bundled DPDFNet ONNX files from `Ceva-IP/DPDFNet`; [models/manifest.json](models/manifest.json) records the source revision and SHA-256 hashes.
+[models/](models/) contains the bundled FP32 models derived from Ceva's 48 kHz ONNX exports. The plugin keeps frequency bins and channels in one layout across adjacent DPRNN blocks. The trained weights are preserved. [models/manifest.json](models/manifest.json) identifies the Hugging Face revision, upstream file and digest (`upstreamSha256`), and bundled digest (`sha256`).
 
 - `dpdfnet8_48khz_hr.onnx` — default, best quality, higher CPU usage.
 - `dpdfnet2_48khz_hr.onnx` — lighter CPU alternative.
+
+To reproduce a bundled model, install `onnx==1.21.0` in a Python environment and pass the pinned upstream file to the converter:
+
+```bash
+python scripts/optimize-model.py upstream/dpdfnet8_48khz_hr.onnx models/dpdfnet8_48khz_hr.onnx
+```
+
+Release builds compare the original and bundled models on a pinned Ceva noisy-speech recording, check audio and recurrent-state snapshots byte for byte, and report median and p99 processor timing. To run the same check locally, build the stream dump and processor benchmark and run `python tests/compare-bundled-models.py <binary-directory> <work-directory> --regenerate`. On Windows include the OBS runtime's `bin/64bit` directory on `PATH`.
 
 ### Custom models
 
